@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Chitti{% endblock %}</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { max-width: 960px; margin: 0 auto; padding: 2rem 1rem; background: #111827; color: #e5e7eb; }
+    a { color: #93c5fd; } input, textarea, button, select { font: inherit; border-radius: .4rem; border: 1px solid #4b5563; padding: .65rem; background: #1f2937; color: inherit; }
+    button { cursor: pointer; background: #2563eb; border: 0; } button.secondary { background: #4b5563; }
+    form { display: grid; gap: .75rem; } .card { background: #1f2937; border-radius: .6rem; padding: 1rem; margin: 1rem 0; }
+    .error { color: #fca5a5; } .muted { color: #9ca3af; } .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+    .chat { min-height: 8rem; white-space: pre-wrap; } ul { padding-left: 1.25rem; }
+  </style>
+</head>
+<body>
+  {% block body %}{% endblock %}
+</body>
+</html>

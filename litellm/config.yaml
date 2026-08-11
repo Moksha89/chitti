@@ -1,0 +1,53 @@
+model_list:
+  - model_name: chitti-chat
+    litellm_params:
+      model: openai/glm-5.2
+      api_base: https://api.z.ai/api/coding/paas/v4
+      api_key: os.environ/GLM_CODING_API_KEY
+      max_budget: 25
+      budget_duration: 1d
+  - model_name: planner
+    litellm_params:
+      model: openai/glm-5.2
+      api_base: https://api.z.ai/api/coding/paas/v4
+      api_key: os.environ/GLM_CODING_API_KEY
+      max_budget: 25
+      budget_duration: 1d
+  - model_name: coder
+    litellm_params:
+      model: openai/glm-5.2
+      api_base: https://api.z.ai/api/coding/paas/v4
+      api_key: os.environ/GLM_CODING_API_KEY
+      max_budget: 25
+      budget_duration: 1d
+  - model_name: bulk
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_base: https://api.deepseek.com
+      api_key: os.environ/DEEPSEEK_API_KEY
+      max_budget: 10
+      budget_duration: 1d
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 120
+  json_logs: true
+  set_verbose: false
+  success_callback: ["prometheus"]
+  failure_callback: ["prometheus"]
+  max_budget: 35
+  budget_duration: 1d
+
+router_settings:
+  routing_strategy: simple-shuffle
+  provider_budget_config:
+    openai:
+      budget_limit: 25
+      time_period: 1d
+    deepseek:
+      budget_limit: 10
+      time_period: 1d
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  fail_closed_budget_enforcement: true
