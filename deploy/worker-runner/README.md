@@ -37,7 +37,7 @@ necessary because a leaked quota image would eventually consume the host disk.
 
 The frontend-build policy is intentionally conservative for this no-swap host:
 
-- `2g` memory and `2` CPUs: enough for the fixture's Next.js/R3F build while
+- `2g` memory and `1` CPU: enough for the fixture's Next.js/R3F build while
   leaving headroom for PostgreSQL, Redis, LiteLLM, Caddy, and Chitti.
 - `4 GiB` disk-backed workspace: enough for the checked-in dependency tree and
   `.next` output without putting build pages in RAM.

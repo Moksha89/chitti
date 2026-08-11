@@ -38,7 +38,7 @@ async def main() -> None:
     try:
         bounded = WorkerLimits(
             memory="2g",
-            cpus=2.0,
+            cpus=1.0,
             pids=512,
             artifact_bytes=100 * 1024 * 1024,
             output_bytes=1024 * 1024,
