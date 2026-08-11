@@ -393,22 +393,27 @@ class DockerSandboxDispatcher:
                     await compact_history()
                     continue
                 if route == REVIEWER_ROUTE:
-                    messages.extend(
-                        _tool_rejection_exchange(
-                            completion,
-                            "TOOL FAILURE: reviewer responses cannot invoke worker tools.",
-                        )
-                    )
-                    messages.append(
+                    diagnosis = completion.content.strip()
+                    messages = [
+                        {"role": "system", "content": stable},
                         {
                             "role": "user",
                             "content": (
-                                "Diagnosis received. Return to the coder route and make "
-                                "one corrective attempt using that diagnosis."
+                                f"STARTER WORKSPACE:\n{starter_context}\n"
+                                f"PLAN:\n{revision.brief}\n{revision.document.summary}\n"
+                                f"BELIEFS:\n{json.dumps(beliefs)}\n"
+                                f"TASK {task.id}: {task.title}\n{task.description}\n"
+                                f"DONE CONDITION: {task.done_condition}\n"
+                                "A reviewer diagnosed the previous failure:\n"
+                                f"{diagnosis or 'No diagnosis was returned.'}\n"
+                                "Make one corrective attempt using the available coder "
+                                "tool."
                             ),
-                        }
-                    )
+                        },
+                    ]
                     route = CODER_ROUTE
+                    failures = 0
+                    nonproductive_turns = 0
                     continue
                 native_call: ModelToolCall | None = None
                 if completion.tool_calls:
@@ -489,11 +494,15 @@ class DockerSandboxDispatcher:
                     await record_nonproductive(result_text)
                     if failures >= 2 and route == CODER_ROUTE:
                         route = REVIEWER_ROUTE
+                        messages = _reviewer_diagnosis_messages(
+                            task.title, task.description, tool, result_text
+                        )
                         await self._event(
                             run_id, "model_route_switched",
                             "switched to reviewer after two failures on the same task",
                             task_id=task.id,
                         )
+                        continue
                 messages.extend(
                     _tool_exchange(completion, result_text[:16000], native_call)
                 )
@@ -1790,6 +1799,28 @@ def _model_system_prompt() -> str:
         "confirm that out/index.html exists; a project that cannot produce a "
         "complete static export is not promotable."
     )
+
+
+def _reviewer_diagnosis_messages(
+    task_title: str, task_description: str, tool: str, failure: str
+) -> list[dict[str, object]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Diagnose the worker failure in plain text. Do not call tools and do "
+                "not return JSON. Explain the likely correction briefly so the coder "
+                "can make one corrective attempt."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"TASK: {task_title}\n{task_description}\n"
+                f"ATTEMPTED TOOL: {tool}\nFAILURE:\n{failure}"
+            ),
+        },
+    ]
 
 
 def _starter_context(workspace: Path) -> str:
