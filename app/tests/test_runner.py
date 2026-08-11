@@ -2,7 +2,10 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from chitti import runner
+from chitti.previews import build_manifest, copy_export
 
 
 class _Result:
@@ -165,3 +168,24 @@ def test_preview_failure_event_is_not_duplicated() -> None:
             "detail": "approved preview staging output is missing",
         }
     ]
+
+
+def test_publish_verifies_manifest_from_destination_after_copy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "index.html").write_text("approved")
+    destination = tmp_path / "destination"
+    approved = build_manifest(source)
+    real_copy_export = copy_export
+
+    def copy_then_alter(source_path, destination_path):
+        result = real_copy_export(source_path, destination_path)
+        (destination_path / "index.html").write_text("altered")
+        return result
+
+    monkeypatch.setattr(runner, "copy_export", copy_then_alter)
+
+    with pytest.raises(RuntimeError, match="changed while publishing"):
+        runner._copy_and_verify_export(source, destination, approved)

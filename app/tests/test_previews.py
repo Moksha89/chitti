@@ -164,8 +164,8 @@ def test_authenticated_preview_serves_entry_and_nested_asset(
     )
     auth.initialize()
     auth.must_change_password = False
-    token, _ = auth.create_session("akirah")
-    monkeypatch.setattr(app.state, "auth", auth)
+    token, _ = auth.create_session("test-user")
+    monkeypatch.setattr(app.state, "auth", auth, raising=False)
     monkeypatch.setattr(app.state, "database", _PreviewDatabase(), raising=False)
     monkeypatch.setattr(
         app.state,

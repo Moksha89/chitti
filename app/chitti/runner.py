@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from .db import Database
 from .previews import (
+    ExportManifest,
     build_manifest,
     copy_export,
     manifest_from_json,
@@ -38,6 +39,16 @@ TERMINAL_PREVIEW_FAILURES = frozenset(
         PREVIEW_STAGING_MISSING,
     }
 )
+
+
+def _copy_and_verify_export(
+    source: Path, destination: Path, approved: ExportManifest
+) -> ExportManifest:
+    copy_export(source, destination)
+    landed = build_manifest(destination)
+    if landed != approved:
+        raise RuntimeError("preview export changed while publishing")
+    return landed
 
 
 async def next_queued_run(database: Database) -> Mapping[str, object] | None:
@@ -292,9 +303,9 @@ async def _publish_one_preview(
         identifier = preview_id()
         destination = preview_root / identifier
         try:
-            landed = await asyncio.to_thread(copy_export, staging, destination)
-            if landed != manifest:
-                raise RuntimeError("preview export changed while publishing")
+            landed = await asyncio.to_thread(
+                _copy_and_verify_export, staging, destination, manifest
+            )
             expires_at = datetime.now(UTC) + timedelta(
                 hours=int(settings.preview_ttl_hours)
             )
