@@ -4,7 +4,7 @@
 <div class="shell">
   <aside class="sidebar">
     <div class="brand"><div class="brand-mark">C/</div><div><div class="brand-name">Chitti</div><div class="brand-sub">mission control</div></div></div>
-    <div><div class="nav-label">Workspace</div><nav class="nav" aria-label="Workspace navigation"><a class="nav-item active" href="/"><span>Command center</span><span class="nav-status">●</span></a><span class="nav-item"><span>Projects</span><span class="nav-status">—</span></span>{% if plans %}<a class="nav-item" href="/plans/{{ plans[0].id }}"><span>Plans &amp; tasks</span><span class="nav-status">●</span></a>{% else %}<span class="nav-item"><span>Plans &amp; tasks</span><span class="nav-status">—</span></span>{% endif %}<span class="nav-item"><span>Agent fabric</span><span class="nav-status">—</span></span></nav></div>
+    <div><div class="nav-label">Workspace</div><nav class="nav" aria-label="Workspace navigation"><a class="nav-item active" href="/"><span>Command center</span><span class="nav-status">●</span></a><a class="nav-item" href="/workspace"><span>Runs / workspace</span><span class="nav-status">●</span></a><span class="nav-item"><span>Projects</span><span class="nav-status">—</span></span>{% if plans %}<a class="nav-item" href="/plans/{{ plans[0].id }}"><span>Plans &amp; tasks</span><span class="nav-status">●</span></a>{% else %}<span class="nav-item"><span>Plans &amp; tasks</span><span class="nav-status">—</span></span>{% endif %}<span class="nav-item"><span>Agent fabric</span><span class="nav-status">—</span></span></nav></div>
     <div class="sidebar-foot">PHASE 1 / TALK + REMEMBER<br>WORKER SYSTEMS NOT YET ACTIVE</div>
   </aside>
   <main class="main">

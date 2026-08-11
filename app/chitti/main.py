@@ -1,8 +1,10 @@
+import asyncio
 import json
 import logging
 import mimetypes
 import os
 import re
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -45,6 +47,8 @@ logging.basicConfig(
 
 SESSION_COOKIE = "chitti_session"
 CSRF_FIELD = "csrf_token"
+RUN_EVENT_POLL_SECONDS = 1.0
+RUN_EVENT_HEARTBEAT_SECONDS = 15.0
 
 
 class ChatRequest(BaseModel):
@@ -370,6 +374,82 @@ def project_from_brief(
     return value or None
 
 
+def _run_status(detail: dict[str, object]) -> str:
+    events = cast(list[dict[str, object]], detail.get("events", []))
+    if not events:
+        return "queued"
+    return str(events[-1].get("status", "queued"))
+
+
+def _prepare_workspace_run(detail: dict[str, object]) -> dict[str, object]:
+    operations = []
+    artifacts = cast(list[dict[str, object]], detail.get("artifacts", []))
+    output_artifacts: dict[tuple[int, str], int] = {}
+    for artifact in artifacts:
+        operation_id = artifact.get("operation_id")
+        kind = str(artifact.get("kind", ""))
+        if operation_id is not None and kind in {"stdout", "stderr"}:
+            output_artifacts[(int(str(operation_id)), kind)] = int(str(artifact["id"]))
+    for operation in cast(list[dict[str, object]], detail.get("operations", [])):
+        item = dict(operation)
+        item["stdout_preview"] = str(operation.get("stdout", ""))[-4000:]
+        item["stderr_preview"] = str(operation.get("stderr", ""))[-4000:]
+        operation_id = int(str(operation["id"]))
+        item["stdout_artifact_id"] = output_artifacts.get((operation_id, "stdout"))
+        item["stderr_artifact_id"] = output_artifacts.get((operation_id, "stderr"))
+        operations.append(item)
+    detail["operations"] = operations
+    detail["latest_status"] = _run_status(detail)
+    run = cast(dict[str, object], detail["run"])
+    created_at = run.get("created_at")
+    if isinstance(created_at, datetime):
+        detail["elapsed_seconds"] = max(
+            0, int((datetime.now(created_at.tzinfo) - created_at).total_seconds())
+        )
+    else:
+        detail["elapsed_seconds"] = 0
+    calls = cast(list[dict[str, object]], detail.get("model_calls", []))
+    detail["model_call_count"] = len(calls)
+    total_tokens = int(str(detail.get("token_totals", 0)))
+    reasoning_tokens = int(str(detail.get("reasoning_token_totals", 0)))
+    detail["reasoning_share"] = (
+        (reasoning_tokens / total_tokens * 100) if total_tokens else 0.0
+    )
+    detail["screenshots"] = [
+        artifact for artifact in artifacts if artifact.get("kind") == "screenshot"
+    ]
+    detail["browser_errors"] = next(
+        (artifact for artifact in artifacts if artifact.get("kind") == "browser_evidence"),
+        None,
+    )
+    return detail
+
+
+async def _run_event_stream(
+    request: Request,
+    manager: WorkerRunManager,
+    run_id: int,
+    cursor: int,
+) -> AsyncIterator[str]:
+    last_heartbeat = time.monotonic()
+    while True:
+        if await request.is_disconnected():
+            return
+        events = await manager.events(run_id)
+        pending = [event for event in events if int(str(event["id"])) > cursor]
+        for event in pending:
+            event_id = int(str(event["id"]))
+            cursor = event_id
+            payload = json.dumps(event, default=str, separators=(",", ":"))
+            yield f"id: {event_id}\nevent: run\ndata: {payload}\n\n"
+            last_heartbeat = time.monotonic()
+        now = time.monotonic()
+        if now - last_heartbeat >= RUN_EVENT_HEARTBEAT_SECONDS:
+            yield ": heartbeat\n\n"
+            last_heartbeat = now
+        await asyncio.sleep(RUN_EVENT_POLL_SECONDS)
+
+
 
 
 @app.get("/", response_class=HTMLResponse, response_model=None)
@@ -384,6 +464,134 @@ async def dashboard(request: Request) -> HTMLResponse | RedirectResponse:
         request=request,
         name="dashboard.html",
         context=await dashboard_context(request, session),
+    )
+
+
+@app.get("/workspace/runs/{run_id}", response_class=HTMLResponse, response_model=None)
+async def workspace_run_page(
+    run_id: int, request: Request
+) -> HTMLResponse | RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    if auth_manager(request).must_change_password:
+        return RedirectResponse("/change-password", status_code=303)
+    manager: WorkerRunManager = request.app.state.worker_manager
+    run = await manager.detail(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="worker run not found")
+    run = _prepare_workspace_run(run)
+    database: Database = request.app.state.database
+    async with database.sessions() as db_session:
+        run_record = cast(dict[str, object], run["run"])
+        revision = await revision_by_id(db_session, int(str(run_record["revision_id"])))
+        if revision is None:
+            raise HTTPException(status_code=404, detail="plan revision not found")
+        run_rows = await db_session.execute(
+            text(
+                "SELECT r.id, r.revision_id, r.created_at, p.project, p.revision "
+                "FROM worker_runs r JOIN plan_revisions p ON p.id = r.revision_id "
+                "ORDER BY r.id DESC"
+            )
+        )
+        run_links = []
+        for row in run_rows.mappings():
+            linked = await manager.detail(int(row["id"]))
+            run_links.append(
+                {
+                    **dict(row),
+                    "status": _run_status(linked) if linked else "queued",
+                    "is_open": int(row["id"]) == run_id,
+                }
+            )
+        task_events = await db_session.execute(
+            text(
+                "SELECT task_id, status FROM plan_task_events "
+                "WHERE revision_id = :revision ORDER BY id"
+            ),
+            {"revision": revision.id},
+        )
+        task_statuses: dict[str, str] = {}
+        for event in task_events:
+            task_statuses[str(event.task_id)] = str(event.status)
+        promotion_result = await db_session.execute(
+            text(
+                "SELECT m.id AS manifest_id, m.digest, m.total_bytes, "
+                "a.id AS approval_id, a.decision, p.preview_id, p.expires_at "
+                "FROM export_manifests m "
+                "LEFT JOIN promotion_approvals a ON a.manifest_id = m.id "
+                "LEFT JOIN previews p ON p.manifest_id = m.id "
+                "WHERE m.run_id = :run_id"
+            ),
+            {"run_id": run_id},
+        )
+        run["promotion"] = promotion_result.mappings().one_or_none()
+        reviewer_result = await db_session.execute(
+            text(
+                "SELECT p.content FROM worker_artifacts a "
+                "JOIN worker_artifact_payloads p ON p.artifact_id = a.id "
+                "WHERE a.run_id = :run_id AND a.kind = 'reviewer_report' "
+                "ORDER BY a.id DESC LIMIT 1"
+            ),
+            {"run_id": run_id},
+        )
+        reviewer_payload = reviewer_result.scalar_one_or_none()
+        if reviewer_payload is not None:
+            try:
+                run["reviewer_verdict"] = json.loads(reviewer_payload)
+            except (TypeError, json.JSONDecodeError):
+                run["reviewer_verdict"] = {"verdict": "invalid"}
+    current_task = next(
+        (
+            task.id
+            for task in revision.document.tasks
+            if task_statuses.get(task.id) == "running"
+        ),
+        None,
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="workspace.html",
+        context={
+            "csrf_token": session.csrf_token,
+            "revision": revision,
+            "run": run,
+            "run_links": run_links,
+            "task_statuses": task_statuses,
+            "current_task": current_task,
+        },
+    )
+
+
+@app.get("/workspace")
+async def workspace_index(request: Request) -> RedirectResponse:
+    current_session(request)
+    database: Database = request.app.state.database
+    async with database.sessions() as session:
+        result = await session.execute(
+            text("SELECT id FROM worker_runs ORDER BY id DESC LIMIT 1")
+        )
+        run_id = result.scalar_one_or_none()
+    if run_id is None:
+        return RedirectResponse("/", status_code=303)
+    return RedirectResponse(f"/workspace/runs/{int(run_id)}", status_code=303)
+
+
+@app.get("/workspace/runs/{run_id}/events")
+async def workspace_run_events(run_id: int, request: Request) -> StreamingResponse:
+    current_session(request)
+    manager: WorkerRunManager = request.app.state.worker_manager
+    if await manager.detail(run_id) is None:
+        raise HTTPException(status_code=404, detail="worker run not found")
+    try:
+        cursor = max(0, int(request.headers.get("Last-Event-ID", "0")))
+    except ValueError:
+        cursor = 0
+    return StreamingResponse(
+        _run_event_stream(request, manager, run_id, cursor),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

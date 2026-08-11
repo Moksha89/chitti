@@ -1751,7 +1751,7 @@ class WorkerRunManager:
                 return None
             events = await session.execute(
                 text(
-                    "SELECT status, detail, operation_index, task_id, created_at "
+                    "SELECT id, status, detail, operation_index, task_id, created_at "
                     "FROM worker_run_events WHERE run_id = :run_id ORDER BY id"
                 ),
                 {"run_id": run_id},
@@ -1793,6 +1793,17 @@ class WorkerRunManager:
                 ),
                 "cost_total_usd": sum(float(row["cost_usd"]) for row in model_call_rows),
             }
+
+    async def events(self, run_id: int) -> list[dict[str, object]]:
+        async with self.database.sessions() as session:
+            result = await session.execute(
+                text(
+                    "SELECT id, status, detail, operation_index, task_id, created_at "
+                    "FROM worker_run_events WHERE run_id = :run_id ORDER BY id"
+                ),
+                {"run_id": run_id},
+            )
+            return [dict(row._mapping) for row in result]
 
 def _confined_path(workspace: Path, requested: str) -> Path:
     if not requested or "\x00" in requested:
