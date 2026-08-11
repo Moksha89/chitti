@@ -480,12 +480,7 @@ class DockerSandboxDispatcher:
                 "build": ("next-build", ("sh", "-c", "npm run build"), "none"),
                 "test": (
                     "run-tests",
-                    (
-                        "node",
-                        "-e",
-                        "const p=require('./package.json'); "
-                        "if (!p.dependencies.next) process.exit(1)",
-                    ),
+                    ("sh", "-c", "CHITTI_MODEL_LOOP=1 npm test"),
                     "none",
                 ),
             }
@@ -1205,7 +1200,9 @@ def _model_system_prompt() -> str:
         " Browser capture runs with no network: do not use remote assets, Drei "
         "Environment presets, remote fonts, external URLs, or runtime fetches. "
         "Use local geometry, lights, CSS, and ASCII text so the page renders "
-        "offline inside the cage."
+        "offline inside the cage. Replace the starter's fixture copy and "
+        "placeholder content with original task-specific copy; do not claim "
+        "inherited fixture text as authored work."
     )
 
 
@@ -1269,9 +1266,7 @@ def fixed_operations(revision: PlanRevision) -> tuple[FixedOperation, ...]:
             "python3", "/opt/next_screenshot.py",
         )),
         FixedOperation(first.id, "run-tests", (
-            "node", "-e", "const p=require('./package.json'); "
-            "if (!p.dependencies.next || !p.dependencies['@react-three/fiber'] || "
-            "!p.dependencies['@react-three/drei']) process.exit(1)",
+            "npm", "test",
         )),
         FixedOperation(first.id, "git-diff", (
                 "sh", "-c", "cd /workspace && git -c safe.directory=/workspace "

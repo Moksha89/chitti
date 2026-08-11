@@ -55,6 +55,53 @@ try:
                                 "text": body_text[:2000],
                             }
                         )
+                    layout_errors = page.evaluate(
+                        """() => {
+                          const errors = [];
+                          const viewport = document.documentElement.clientWidth;
+                          if (document.documentElement.scrollWidth > viewport + 1) {
+                            errors.push({
+                              kind: "document-overflow",
+                              scrollWidth: document.documentElement.scrollWidth,
+                              viewportWidth: viewport,
+                            });
+                          }
+                          for (const element of document.querySelectorAll(
+                            "h1,h2,h3,h4,p,button,a,li,span"
+                          )) {
+                            const rect = element.getBoundingClientRect();
+                            const style = getComputedStyle(element);
+                            const text = (element.innerText || "").trim();
+                            if (!text || style.visibility === "hidden") continue;
+                            if (
+                              element.scrollWidth > element.clientWidth + 1 ||
+                              rect.left < -1 ||
+                              rect.right > viewport + 1
+                            ) {
+                              errors.push({
+                                kind: "text-overflow",
+                                tag: element.tagName.toLowerCase(),
+                                text: text.slice(0, 160),
+                                left: Math.round(rect.left),
+                                right: Math.round(rect.right),
+                                elementWidth: Math.round(rect.width),
+                                scrollWidth: element.scrollWidth,
+                                clientWidth: element.clientWidth,
+                              });
+                            }
+                          }
+                          return errors.slice(0, 50);
+                        }"""
+                    )
+                    browser_errors.extend(
+                        {
+                            "kind": "layout",
+                            "viewport_width": width,
+                            "name": name,
+                            **error,
+                        }
+                        for error in layout_errors
+                    )
                     break
                 except Exception:
                     if time.monotonic() >= deadline:
