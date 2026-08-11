@@ -6,6 +6,7 @@ script="${repo_root}/deploy/deploy-main.sh"
 remote_wrapper="${repo_root}/deploy/deploy-remote.sh"
 
 [[ "$(tail -n 1 "${script}")" == 'echo "${DEPLOY_COMPLETION_MARKER}"' ]]
+[[ "$(sed -n '3p' "${script}")" == 'exec </dev/null' ]]
 grep -Fq 'DEPLOY_COMPLETION_MARKER="CHITTI_DEPLOY_COMPLETE"' "${script}"
 grep -Fq 'docker run --rm -i --entrypoint python "${runner_image}" -c \' "${script}"
 grep -Fq '< <(printf '\''%s'\'' "${gateway_models}")' "${script}"

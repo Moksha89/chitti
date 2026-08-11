@@ -30,9 +30,12 @@ deploy/deploy-remote.sh root@host /path/to/ssh-key
 
 The wrapper gives the script a closed stdin, captures its output, and fails if
 the script exits non-zero or does not print `CHITTI_DEPLOY_COMPLETE` as its
-final line. The deploy script gives its stdin-consuming gateway assertion an
-explicit process-substitution input, so it cannot consume the script body even
-if an operator invokes the script through an unusual transport.
+final line. The deploy script detaches its stdin before doing any work and
+gives its stdin-consuming gateway assertion an explicit process-substitution
+input, so no child can consume the script body. This intentionally makes
+streaming the deployment script through `bash -s` unsupported: the script body
+will be cut when it detaches stdin, and the required completion marker makes
+that failure loud instead of silently accepting a truncated deployment.
 
 The deployment recreates the LiteLLM gateway and verifies its authenticated
 loaded model routes after startup. If `litellm/config.yaml` changes, deploy

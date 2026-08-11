@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+exec </dev/null
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/chitti}"
 REMOTE_BRANCH="${REMOTE_BRANCH:-main}"
