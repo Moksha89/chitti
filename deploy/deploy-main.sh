@@ -111,6 +111,46 @@ done
 docker compose ps --status running --services | grep -qx chitti
 
 docker build --quiet -t chitti-sandbox:latest sandbox >/dev/null
+runner_image="chitti-chitti:latest"
+
+# Recreate LiteLLM so it cannot retain a process or file-mounted config from
+# an earlier checkout.
+docker compose up -d --build --force-recreate litellm
+docker compose ps
+
+required_gateway_routes="$(
+  docker run --rm --entrypoint python "${runner_image}" -c \
+    'from chitti.provider import REQUIRED_GATEWAY_ROUTES
+print("\n".join(sorted(REQUIRED_GATEWAY_ROUTES)))'
+)"
+gateway_models="$(
+  curl --fail --silent --show-error --max-time 15 \
+    -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+    "http://127.0.0.1:${LITELLM_PORT:-4000}/v1/models"
+)"
+missing_gateway_routes="$(
+  printf '%s' "${gateway_models}" |
+    docker run --rm -i --entrypoint python "${runner_image}" -c \
+      'import json
+import sys
+from chitti.provider import REQUIRED_GATEWAY_ROUTES
+
+payload = json.load(sys.stdin)
+model_ids = {
+    str(item["id"])
+    for item in payload.get("data", [])
+    if isinstance(item, dict) and "id" in item
+}
+print("\n".join(sorted(REQUIRED_GATEWAY_ROUTES - model_ids)))'
+)"
+if [[ -n "${missing_gateway_routes}" ]]; then
+  echo "gateway loaded-route assertion failed; missing: ${missing_gateway_routes}" >&2
+  exit 1
+fi
+while IFS= read -r route; do
+  [[ -n "${route}" ]]
+done <<<"${required_gateway_routes}"
+echo "Gateway loaded-route assertions passed."
 
 if [[ ! -x "${RUNNER_PYTHON}" ]]; then
   if ! python3 -m venv "${RUNNER_VENV_DIR}"; then
@@ -285,7 +325,6 @@ END
 $$;
 SQL
 
-runner_image="chitti-chitti:latest"
 [[ -n "${runner_image}" ]]
 docker run --rm --network host --env-file "${RUNNER_ENV}" \
   --entrypoint python "${runner_image}" -c '

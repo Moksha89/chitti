@@ -8,6 +8,10 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+CODER_ROUTE = "coder"
+REVIEWER_ROUTE = "reviewer"
+REQUIRED_GATEWAY_ROUTES = frozenset({CODER_ROUTE, REVIEWER_ROUTE})
+
 
 class GatewayValidationError(RuntimeError):
     """Base error for runner gateway preflight failures."""
@@ -113,7 +117,7 @@ class LiteLLMProvider:
             raise GatewayMisconfigurationError(
                 "gateway returned an invalid model list"
             ) from exc
-        missing = sorted({"coder", "reviewer"} - model_ids)
+        missing = sorted(REQUIRED_GATEWAY_ROUTES - model_ids)
         if missing:
             raise GatewayMisconfigurationError(
                 f"gateway routes unavailable: {', '.join(missing)}"

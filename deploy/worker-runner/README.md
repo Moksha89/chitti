@@ -20,6 +20,10 @@ runner-only database role on first use, and verifies the schema and container
 boundaries. Re-running it preserves the existing runner environment file and
 does not rotate that role's password.
 
+The deployment recreates the LiteLLM gateway and verifies its authenticated
+loaded model routes after startup. If `litellm/config.yaml` changes, deploy
+through this script so the gateway reloads the checked-out configuration.
+
 The script's schema, role-privilege, Docker-socket, and isolated-worker
 network checks run on the host. The privileged ext4 mount, exact quota and
 disk-fill proofs, cancellation cleanup, restart recovery, and a real queued

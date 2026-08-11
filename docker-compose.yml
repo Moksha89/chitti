@@ -22,7 +22,7 @@ services:
   litellm:
     image: ghcr.io/berriai/litellm:v1.80.0-stable.1
     restart: unless-stopped
-    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "1"]
+    command: ["--config", "/app/litellm/config.yaml", "--port", "4000", "--num_workers", "1"]
     environment:
       GLM_CODING_API_KEY: ${GLM_CODING_API_KEY}
       GLM_API_BASE: ${GLM_API_BASE:-https://api.z.ai/api/paas/v4}
@@ -34,7 +34,7 @@ services:
     ports:
       - "127.0.0.1:${LITELLM_PORT:-4000}:4000"
     volumes:
-      - ./litellm/config.yaml:/app/config.yaml:ro
+      - ./litellm:/app/litellm:ro
     healthcheck:
       test:
         [
@@ -123,7 +123,7 @@ services:
       - "80"
       - "443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/caddy:/etc/caddy:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
