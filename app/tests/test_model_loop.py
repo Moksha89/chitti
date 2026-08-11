@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from chitti.worker import WorkerLimits, _confined_path, _parse_tool_call
+from chitti.worker import DockerSandboxDispatcher, WorkerLimits, _confined_path, _parse_tool_call
 
 
 def test_model_limits_round_trip() -> None:
@@ -28,3 +28,27 @@ def test_model_paths_reject_traversal_and_symlink_escape(tmp_path: Path) -> None
     (tmp_path / "link").symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError, match="escapes"):
         _confined_path(tmp_path, "link/file.txt")
+
+
+@pytest.mark.asyncio
+async def test_model_write_budget_and_command_allowlist(tmp_path: Path) -> None:
+    dispatcher = object.__new__(DockerSandboxDispatcher)
+    limits = WorkerLimits(model_write_bytes=4)
+    with pytest.raises(ValueError, match="single write"):
+        await dispatcher._execute_model_tool(
+            1, "task", 0, "write_file",
+            {"path": "app.js", "content": "too big"},
+            tmp_path, limits, "coder",
+        )
+    with pytest.raises(ValueError, match="unknown allowlisted"):
+        await dispatcher._execute_model_tool(
+            1, "task", 0, "run_command",
+            {"name": "sh", "args": []},
+            tmp_path, limits, "coder",
+        )
+    with pytest.raises(ValueError, match="arbitrary command"):
+        await dispatcher._execute_model_tool(
+            1, "task", 0, "run_command",
+            {"name": "build", "args": ["--unsafe"]},
+            tmp_path, limits, "coder",
+        )
