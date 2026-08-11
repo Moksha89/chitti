@@ -21,8 +21,7 @@ GRANT USAGE, SELECT ON SEQUENCE
     worker_operations_id_seq,
     worker_artifacts_id_seq,
     worker_model_calls_id_seq,
-    export_manifests_id_seq,
-    previews_id_seq
+    export_manifests_id_seq
     TO chitti_runner;
 
 -- Enforce the narrow boundary if this script is applied to an older role.

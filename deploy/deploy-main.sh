@@ -309,7 +309,6 @@ async def main():
         "plan_task_events_id_seq", "worker_run_events_id_seq",
         "worker_operations_id_seq", "worker_artifacts_id_seq",
         "worker_model_calls_id_seq", "export_manifests_id_seq",
-        "previews_id_seq",
     ]
 
     async def require_table_privilege(table, privilege):
