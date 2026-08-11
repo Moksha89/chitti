@@ -16,6 +16,9 @@ class _Result:
     def one(self):
         return self._one
 
+    def one_or_none(self):
+        return self._one
+
     def __iter__(self):
         return iter(self._rows or [])
 
@@ -41,6 +44,41 @@ class _Session:
 class _Database:
     def sessions(self):
         return _Session()
+
+
+class _EventSession:
+    def __init__(self, database):
+        self.database = database
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def execute(self, statement, parameters=None, **_kwargs):
+        query = str(statement)
+        if query.startswith("SELECT status, detail"):
+            latest = self.database.events[-1] if self.database.events else None
+            return _Result(one=latest)
+        self.database.events.append(
+            (
+                parameters["status"],
+                parameters["detail"],
+            )
+        )
+        return _Result()
+
+    async def commit(self):
+        return None
+
+
+class _EventDatabase:
+    def __init__(self):
+        self.events = []
+
+    def sessions(self):
+        return _EventSession(self)
 
 
 def test_publish_failures_are_recorded_and_do_not_stop_later_approvals(
@@ -105,3 +143,22 @@ def test_preview_quota_block_is_durable_and_does_not_stop_later_approvals(
 
 async def _noop(*_args, **_kwargs):
     return None
+
+
+def test_preview_failure_event_is_not_duplicated() -> None:
+    database = _EventDatabase()
+
+    asyncio.run(
+        runner._record_preview_event(
+            database, 11, "preview_failed", "approved preview staging output is missing"
+        )
+    )
+    asyncio.run(
+        runner._record_preview_event(
+            database, 11, "preview_failed", "approved preview staging output is missing"
+        )
+    )
+
+    assert database.events == [
+        ("preview_failed", "approved preview staging output is missing")
+    ]

@@ -128,22 +128,21 @@ async def publish_approved_previews(database: Database, settings: Settings) -> N
                 "SELECT a.id AS approval_id, a.run_id "
                 "FROM promotion_approvals a "
                 "LEFT JOIN previews p ON p.run_id = a.run_id "
+                "LEFT JOIN LATERAL ("
+                "  SELECT status, detail FROM worker_run_events "
+                "  WHERE run_id = a.run_id "
+                "    AND status IN ('preview_failed', 'preview_blocked') "
+                "  ORDER BY id DESC LIMIT 1"
+                ") latest ON true "
                 "WHERE a.decision = 'approved' AND p.run_id IS NULL"
             )
         )
         approvals = list(rows.mappings())
-        existing = await session.execute(
-            text(
-                "SELECT COALESCE(SUM(total_bytes), 0) AS total, COUNT(*) AS count "
-                "FROM previews WHERE expires_at > now()"
-            )
-        )
-        totals = existing.mappings().one()
-        total_bytes = int(totals["total"])
-        preview_count = int(totals["count"])
     for row in approvals:
+        if _promotion_failure_is_terminal(row.get("status"), row.get("detail")):
+            continue
         try:
-            size = await _publish_one_preview(
+            await _publish_one_preview(
                 database, settings, preview_root, cast(Mapping[str, object], row)
             )
         except PreviewBlockedError as exc:
@@ -157,20 +156,52 @@ async def publish_approved_previews(database: Database, settings: Settings) -> N
                 "preview_failed",
                 str(exc)[:2000],
             )
-        else:
-            total_bytes += size
-            preview_count += 1
 
 
 class PreviewBlockedError(RuntimeError):
     pass
 
 
+def _promotion_failure_is_terminal(status: object, detail: object) -> bool:
+    if status != "preview_failed":
+        return False
+    return str(detail) in {
+        "preview approval binding failed",
+        "preview evidence substitution detected",
+        "approved preview staging output is missing",
+    }
+
+
 async def _record_preview_event(
     database: Database, run_id: int, status: str, detail: str
 ) -> None:
     try:
-        await record_event(database, run_id, status, detail[:2000])
+        bounded_detail = detail[:2000]
+        async with database.sessions() as session:
+            latest = await session.execute(
+                text(
+                    "SELECT status, detail FROM worker_run_events "
+                    "WHERE run_id = :run_id "
+                    "AND status IN ('preview_failed', 'preview_blocked') "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"run_id": run_id},
+            )
+            previous = latest.mappings().one_or_none()
+            if (
+                previous is not None
+                and previous["status"] == status
+                and previous["detail"] == bounded_detail
+            ):
+                return
+            await session.execute(
+                text(
+                    "INSERT INTO worker_run_events (run_id, status, detail) "
+                    "VALUES (:run_id, :status, :detail)"
+                ),
+                {"run_id": run_id, "status": status, "detail": bounded_detail},
+            )
+            await session.commit()
     except Exception:
         logger.exception("could not record preview event for run %s", run_id)
 
