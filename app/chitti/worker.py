@@ -1805,6 +1805,18 @@ class WorkerRunManager:
             )
             return [dict(row._mapping) for row in result]
 
+    async def events_after(self, run_id: int, event_id: int) -> list[dict[str, object]]:
+        async with self.database.sessions() as session:
+            result = await session.execute(
+                text(
+                    "SELECT id, status, detail, operation_index, task_id, created_at "
+                    "FROM worker_run_events "
+                    "WHERE run_id = :run_id AND id > :event_id ORDER BY id"
+                ),
+                {"run_id": run_id, "event_id": event_id},
+            )
+            return [dict(row._mapping) for row in result]
+
 def _confined_path(workspace: Path, requested: str) -> Path:
     if not requested or "\x00" in requested:
         raise ValueError("invalid workspace path")

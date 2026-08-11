@@ -98,7 +98,7 @@
   function addEvent(event){if(seen.has(String(event.id)))return;seen.add(String(event.id));const row=document.createElement("article");row.className="event-row";row.dataset.eventId=event.id;const label=document.createElement("strong");label.textContent=event.status;const detail=document.createElement("span");detail.textContent=event.detail;row.append(label,detail);events.appendChild(row);status.textContent=event.status;const task=document.querySelector(`[data-task-id="${CSS.escape(event.task_id||"")}"]`);if(task&&event.status){task.classList.remove("running","passed","failed");task.classList.add(event.status);const state=task.querySelector("em");if(state)state.textContent=event.status+(event.status==="running"?" · current":"")}}}
   const source=new EventSource(`/workspace/runs/${runId}/events`);
   source.onopen=()=>{streamStatus.textContent="live updates connected";streamStatus.classList.remove("offline")};
-  source.addEventListener("run",event=>{try{addEvent(JSON.parse(event.data))}catch(_error){}});
+  source.addEventListener("run",event=>{try{const payload=JSON.parse(event.data);addEvent(payload);if(payload.terminal){streamStatus.textContent="run finished";streamStatus.classList.remove("offline");source.close()}}catch(_error){}});
   source.onerror=()=>{streamStatus.textContent="live updates unavailable · reload for durable state";streamStatus.classList.add("offline")};
   window.addEventListener("beforeunload",()=>source.close());
 })();

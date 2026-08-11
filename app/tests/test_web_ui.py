@@ -11,6 +11,7 @@ from chitti.main import (
     project_from_brief,
     render_markdown,
     templates,
+    workspace_index,
     workspace_run_events,
 )
 
@@ -219,18 +220,18 @@ def test_run_event_stream_replays_after_last_event_id() -> None:
             return False
 
     class Manager:
-        async def events(self, _run_id):
+        async def events_after(self, _run_id, event_id):
             return [
                 {"id": 1, "status": "queued", "detail": "queued"},
                 {"id": 2, "status": "running", "detail": "running"},
-                {"id": 3, "status": "passed", "detail": "passed"},
-            ]
+                {"id": 3, "status": "operation_running", "detail": "working"},
+            ][event_id:]
 
     stream = _run_event_stream(Request(), Manager(), 7, 2)
     first = asyncio.run(stream.__anext__())
 
     assert first.startswith("id: 3\n")
-    assert '"status":"passed"' in first
+    assert '"status":"operation_running"' in first
     asyncio.run(stream.aclose())
 
 
@@ -240,11 +241,28 @@ def test_run_event_stream_stops_cleanly_when_client_disconnects() -> None:
             return True
 
     class Manager:
-        async def events(self, _run_id):
+        async def events_after(self, _run_id, _event_id):
             raise AssertionError("disconnected clients must not query state")
 
     stream = _run_event_stream(Request(), Manager(), 7, 0)
 
+    with pytest.raises(StopAsyncIteration):
+        asyncio.run(stream.__anext__())
+
+
+def test_run_event_stream_closes_after_terminal_event() -> None:
+    class Request:
+        async def is_disconnected(self):
+            return False
+
+    class Manager:
+        async def events_after(self, _run_id, _event_id):
+            return [{"id": 8, "status": "failed", "detail": "finished"}]
+
+    stream = _run_event_stream(Request(), Manager(), 7, 7)
+    terminal = asyncio.run(stream.__anext__())
+
+    assert '"terminal":true' in terminal
     with pytest.raises(StopAsyncIteration):
         asyncio.run(stream.__anext__())
 
@@ -262,3 +280,22 @@ def test_run_event_stream_requires_authentication() -> None:
 
     with pytest.raises(HTTPException, match="authentication required"):
         asyncio.run(workspace_run_events(7, request))
+
+
+def test_workspace_index_honors_forced_password_change() -> None:
+    class Auth:
+        must_change_password = True
+
+        def get_session(self, _token):
+            return SimpleNamespace(username="akirah")
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(auth=Auth())),
+        cookies={"chitti_session": "session"},
+        headers={},
+    )
+
+    response = asyncio.run(workspace_index(request))
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/change-password"

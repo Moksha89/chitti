@@ -49,6 +49,8 @@ SESSION_COOKIE = "chitti_session"
 CSRF_FIELD = "csrf_token"
 RUN_EVENT_POLL_SECONDS = 1.0
 RUN_EVENT_HEARTBEAT_SECONDS = 15.0
+WORKSPACE_RUN_LIST_LIMIT = 25
+TERMINAL_RUN_STATUSES = {"passed", "failed", "cancelled"}
 
 
 class ChatRequest(BaseModel):
@@ -435,14 +437,17 @@ async def _run_event_stream(
     while True:
         if await request.is_disconnected():
             return
-        events = await manager.events(run_id)
-        pending = [event for event in events if int(str(event["id"])) > cursor]
+        pending = await manager.events_after(run_id, cursor)
         for event in pending:
             event_id = int(str(event["id"]))
             cursor = event_id
-            payload = json.dumps(event, default=str, separators=(",", ":"))
+            terminal = str(event.get("status", "")) in TERMINAL_RUN_STATUSES
+            payload_event = {**event, "terminal": terminal}
+            payload = json.dumps(payload_event, default=str, separators=(",", ":"))
             yield f"id: {event_id}\nevent: run\ndata: {payload}\n\n"
             last_heartbeat = time.monotonic()
+            if terminal:
+                return
         now = time.monotonic()
         if now - last_heartbeat >= RUN_EVENT_HEARTBEAT_SECONDS:
             yield ": heartbeat\n\n"
@@ -490,18 +495,22 @@ async def workspace_run_page(
             raise HTTPException(status_code=404, detail="plan revision not found")
         run_rows = await db_session.execute(
             text(
-                "SELECT r.id, r.revision_id, r.created_at, p.project, p.revision "
+                "SELECT r.id, r.revision_id, r.created_at, p.project, p.revision, "
+                "COALESCE(latest.status, 'queued') AS status "
                 "FROM worker_runs r JOIN plan_revisions p ON p.id = r.revision_id "
-                "ORDER BY r.id DESC"
-            )
+                "LEFT JOIN LATERAL ("
+                "SELECT status FROM worker_run_events "
+                "WHERE run_id = r.id ORDER BY id DESC LIMIT 1"
+                ") latest ON TRUE "
+                "ORDER BY r.id DESC LIMIT :limit"
+            ),
+            {"limit": WORKSPACE_RUN_LIST_LIMIT},
         )
         run_links = []
         for row in run_rows.mappings():
-            linked = await manager.detail(int(row["id"]))
             run_links.append(
                 {
                     **dict(row),
-                    "status": _run_status(linked) if linked else "queued",
                     "is_open": int(row["id"]) == run_id,
                 }
             )
@@ -567,6 +576,8 @@ async def workspace_run_page(
 @app.get("/workspace")
 async def workspace_index(request: Request) -> RedirectResponse:
     current_session(request)
+    if auth_manager(request).must_change_password:
+        return RedirectResponse("/change-password", status_code=303)
     database: Database = request.app.state.database
     async with database.sessions() as session:
         result = await session.execute(
