@@ -29,7 +29,7 @@ class Recall:
     similarity: float
 
 
-BELIEF_MATCH_THRESHOLD = 0.62
+BELIEF_MATCH_THRESHOLD = 0.82
 
 
 def normalize(value: str) -> str:
