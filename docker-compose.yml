@@ -99,7 +99,7 @@ services:
         condition: service_healthy
       litellm:
         condition: service_healthy
-    command: ["sh", "-c", "alembic upgrade head && uvicorn chitti.main:app --host 0.0.0.0 --port 8000"]
+    command: ["sh", "-c", "PYTHONPATH=/app alembic upgrade head && uvicorn chitti.main:app --host 0.0.0.0 --port 8000"]
     networks:
       chitti_net:
         ipv4_address: 172.31.250.5
