@@ -2,12 +2,33 @@ from pathlib import Path
 
 import pytest
 
-from chitti.worker import DockerSandboxDispatcher, WorkerLimits, _confined_path, _parse_tool_call
+from chitti.worker import (
+    DockerSandboxDispatcher,
+    WorkerLimits,
+    _bounded_artifact,
+    _confined_path,
+    _parse_tool_call,
+    _task_done_checks,
+)
 
 
 def test_model_limits_round_trip() -> None:
     limits = WorkerLimits(model_iterations=3, model_tool_calls=7, model_write_bytes=1234)
     assert WorkerLimits.from_json(limits.as_json()) == limits
+
+
+def test_done_condition_commands_are_scoped_to_each_task() -> None:
+    first_task_commands = {"build", "test"}
+    second_task_commands: set[str] = set()
+    assert _task_done_checks(first_task_commands)
+    assert not _task_done_checks(second_task_commands)
+
+
+def test_bounded_artifact_preserves_original_size_and_truncation() -> None:
+    payload, original_size, truncated = _bounded_artifact("é" * 9000, maximum=16000)
+    assert len(payload) == 16000
+    assert original_size == 18000
+    assert truncated
 
 
 def test_model_tool_parser_rejects_malformed_and_unknown_shape() -> None:

@@ -234,8 +234,8 @@ class DockerSandboxDispatcher:
         calls = 0
         writes = 0
         operation_index = 1
-        completed_commands: set[str] = set()
         for task in revision.document.tasks:
+            completed_commands: set[str] = set()
             route = "coder"
             failures = 0
             messages = [
@@ -310,7 +310,7 @@ class DockerSandboxDispatcher:
                         {"role": "user", "content": f"TOOL FAILURE: {str(exc)[:1000]}"}
                     )
                     continue
-                if tool == "finish" and {"build", "test"} <= completed_commands:
+                if tool == "finish" and _task_done_checks(completed_commands):
                     await self._event(
                         run_id, "task_finished",
                         str(arguments.get("summary", ""))[:2000], task_id=task.id,
@@ -507,8 +507,8 @@ class DockerSandboxDispatcher:
         completion: ModelCompletion, kind: str = "model_response",
         prompt: str = "",
     ) -> None:
-        prompt_bytes = prompt[:16000].encode()
-        content = completion.content[:16000].encode()
+        prompt_bytes, prompt_size, prompt_truncated = _bounded_artifact(prompt)
+        content, content_size, content_truncated = _bounded_artifact(completion.content)
         async with self.database.sessions() as session:
             result = await session.execute(
                 text(
@@ -531,14 +531,17 @@ class DockerSandboxDispatcher:
             artifact = await session.execute(
                 text(
                     "INSERT INTO worker_artifacts "
-                    "(run_id, kind, path, sha256, byte_size) "
-                    "VALUES (:run_id, :kind, :path, :sha256, :byte_size) RETURNING id"
+                    "(run_id, kind, path, sha256, byte_size, original_byte_size, truncated) "
+                    "VALUES (:run_id, :kind, :path, :sha256, :byte_size, "
+                    ":original_byte_size, :truncated) RETURNING id"
                 ),
                 {
                     "run_id": run_id, "kind": kind,
                     "path": f"model_calls/{call_id}/response.json",
                     "sha256": hashlib.sha256(content).hexdigest(),
                     "byte_size": len(content),
+                    "original_byte_size": content_size,
+                    "truncated": content_truncated,
                 },
             )
             await session.execute(
@@ -551,8 +554,9 @@ class DockerSandboxDispatcher:
             prompt_artifact = await session.execute(
                 text(
                     "INSERT INTO worker_artifacts "
-                    "(run_id, kind, path, sha256, byte_size) "
-                    "VALUES (:run_id, 'model_prompt', :path, :sha256, :byte_size) "
+                    "(run_id, kind, path, sha256, byte_size, original_byte_size, truncated) "
+                    "VALUES (:run_id, 'model_prompt', :path, :sha256, :byte_size, "
+                    ":original_byte_size, :truncated) "
                     "RETURNING id"
                 ),
                 {
@@ -560,6 +564,8 @@ class DockerSandboxDispatcher:
                     "path": f"model_calls/{call_id}/prompt.json",
                     "sha256": hashlib.sha256(prompt_bytes).hexdigest(),
                     "byte_size": len(prompt_bytes),
+                    "original_byte_size": prompt_size,
+                    "truncated": prompt_truncated,
                 },
             )
             await session.execute(
@@ -965,7 +971,8 @@ class WorkerRunManager:
             )
             artifacts = await session.execute(
                 text(
-                    "SELECT id, operation_id, kind, path, sha256, byte_size "
+                    "SELECT id, operation_id, kind, path, sha256, byte_size, "
+                    "original_byte_size, truncated "
                     "FROM worker_artifacts WHERE run_id = :run_id ORDER BY id"
                 ),
                 {"run_id": run_id},
@@ -1015,6 +1022,15 @@ def _parse_tool_call(content: str) -> tuple[str, dict[str, object]]:
     if not isinstance(arguments, dict):
         raise ValueError("tool arguments must be an object")
     return str(value["tool"]), {str(key): item for key, item in arguments.items()}
+
+
+def _task_done_checks(completed_commands: set[str]) -> bool:
+    return {"build", "test"} <= completed_commands
+
+
+def _bounded_artifact(value: str, maximum: int = 16000) -> tuple[bytes, int, bool]:
+    raw = value.encode()
+    return raw[:maximum], len(raw), len(raw) > maximum
 
 
 def _model_system_prompt() -> str:
