@@ -4,13 +4,23 @@ import asyncio
 import json
 import logging
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import cast
 
 from sqlalchemy import text
 
 from .db import Database
+from .previews import (
+    build_manifest,
+    copy_export,
+    manifest_from_json,
+    preview_id,
+    remove_preview,
+    validate_result_binding,
+)
 from .provider import FakeProvider, LiteLLMProvider
-from .settings import get_settings
+from .settings import Settings, get_settings
 from .worker import (
     DockerSandboxDispatcher,
     WorkerLimits,
@@ -109,6 +119,114 @@ async def trim_payloads(database: Database) -> None:
         await session.commit()
 
 
+async def publish_approved_previews(database: Database, settings: Settings) -> None:
+    preview_root = Path(str(settings.preview_root))
+    preview_root.mkdir(parents=True, exist_ok=True)
+    staging_root = preview_root / "staging"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    async with database.sessions() as session:
+        rows = await session.execute(
+            text(
+                "SELECT a.id AS approval_id, a.run_id, a.manifest_id, "
+                "a.revision_content_hash, a.reviewer_artifact_id, a.reviewer_sha256, "
+                "a.diff_artifact_id, a.diff_sha256, a.manifest_digest, "
+                "m.revision_content_hash AS manifest_revision_content_hash, "
+                "m.manifest, m.digest, m.staging_path, m.total_bytes, m.file_count "
+                "FROM promotion_approvals a JOIN export_manifests m "
+                "ON m.id = a.manifest_id "
+                "LEFT JOIN previews p ON p.run_id = a.run_id "
+                "WHERE a.decision = 'approved' AND p.run_id IS NULL"
+            )
+        )
+        approvals = list(rows.mappings())
+        existing = await session.execute(
+            text(
+                "SELECT COALESCE(SUM(total_bytes), 0) AS total, COUNT(*) AS count "
+                "FROM previews WHERE expires_at > now()"
+            )
+        )
+        totals = existing.mappings().one()
+        total_bytes = int(totals["total"])
+        preview_count = int(totals["count"])
+        for row in approvals:
+            if preview_count >= int(settings.preview_max_count):
+                continue
+            manifest = manifest_from_json(row["manifest"], str(row["digest"]))
+            if not validate_result_binding(
+                revision_hash=str(row["revision_content_hash"]),
+                manifest_revision_hash=str(row["manifest_revision_content_hash"]),
+                approval_manifest_digest=str(row["manifest_digest"]),
+                manifest_digest=manifest.digest,
+                approval_reviewer_sha256=str(row["reviewer_sha256"]),
+                reviewer_sha256=str(row["reviewer_sha256"]),
+                approval_diff_sha256=str(row["diff_sha256"]),
+                diff_sha256=str(row["diff_sha256"]),
+            ) or (
+                manifest.total_bytes != int(row["total_bytes"])
+                or len(manifest.entries) != int(row["file_count"])
+            ):
+                raise RuntimeError("preview approval binding failed")
+            if total_bytes + manifest.total_bytes > int(settings.preview_max_bytes):
+                continue
+            reviewer = await session.execute(
+                text(
+                    "SELECT sha256 FROM worker_artifacts "
+                    "WHERE id = :id AND run_id = :run_id"
+                ),
+                {"id": row["reviewer_artifact_id"], "run_id": row["run_id"]},
+            )
+            diff = await session.execute(
+                text(
+                    "SELECT sha256 FROM worker_artifacts "
+                    "WHERE id = :id AND run_id = :run_id"
+                ),
+                {"id": row["diff_artifact_id"], "run_id": row["run_id"]},
+            )
+            if (
+                reviewer.scalar_one_or_none() != row["reviewer_sha256"]
+                or diff.scalar_one_or_none() != row["diff_sha256"]
+            ):
+                raise RuntimeError("preview evidence substitution detected")
+            staging = Path(str(row["staging_path"]))
+            if not staging.is_dir():
+                raise RuntimeError("approved preview staging output is missing")
+            current = await asyncio.to_thread(build_manifest, staging)
+            if current.digest != manifest.digest:
+                raise RuntimeError("preview export changed after approval")
+            identifier = preview_id()
+            destination = preview_root / identifier
+            try:
+                await asyncio.to_thread(copy_export, staging, destination)
+                expires_at = datetime.now(UTC) + timedelta(
+                    hours=int(settings.preview_ttl_hours)
+                )
+                await session.execute(
+                    text(
+                        "INSERT INTO previews "
+                        "(preview_id, expires_at, run_id, manifest_id, approval_id, "
+                        "total_bytes, file_count) VALUES "
+                        "(:preview_id, :expires_at, :run_id, :manifest_id, "
+                        ":approval_id, :total_bytes, :file_count)"
+                    ),
+                    {
+                        "preview_id": identifier,
+                        "expires_at": expires_at,
+                        "run_id": row["run_id"],
+                        "manifest_id": row["manifest_id"],
+                        "approval_id": row["approval_id"],
+                        "total_bytes": manifest.total_bytes,
+                        "file_count": len(manifest.entries),
+                    },
+                )
+                await session.commit()
+                await asyncio.to_thread(remove_preview, staging)
+                total_bytes += manifest.total_bytes
+                preview_count += 1
+            except Exception:
+                await asyncio.to_thread(remove_preview, destination)
+                raise
+
+
 async def execute_run(
     database: Database,
     dispatcher: DockerSandboxDispatcher,
@@ -156,10 +274,17 @@ async def run_forever() -> None:
         if settings.chitti_provider == "fake"
         else LiteLLMProvider(settings.litellm_base_url, settings.litellm_master_key)
     )
-    dispatcher = DockerSandboxDispatcher(database, model_provider=provider)
+    dispatcher = DockerSandboxDispatcher(
+        database,
+        preview_root=Path(settings.preview_root),
+        preview_ttl_hours=settings.preview_ttl_hours,
+        model_provider=provider,
+    )
     try:
         await dispatcher.cleanup_stale_workspaces()
         while True:
+            await dispatcher.cleanup_expired_previews()
+            await publish_approved_previews(database, settings)
             row = await next_queued_run(database)
             if row is None:
                 await asyncio.sleep(POLL_SECONDS)

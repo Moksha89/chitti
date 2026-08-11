@@ -10,6 +10,10 @@ User=root
 WorkingDirectory=/opt/chitti/app
 EnvironmentFile=/etc/chitti/worker-runner.env
 Environment=PYTHONPATH=/opt/chitti/app
+Environment=PREVIEW_ROOT=/var/lib/chitti-previews
+Environment=PREVIEW_TTL_HOURS=72
+Environment=PREVIEW_MAX_BYTES=209715200
+Environment=PREVIEW_MAX_COUNT=4
 RuntimeDirectory=chitti-worker
 StateDirectory=chitti-worker
 ExecStart=/opt/chitti-runner/bin/python -m chitti.runner
@@ -20,7 +24,7 @@ StandardError=journal
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/chitti-worker
+ReadWritePaths=/var/lib/chitti-worker /var/lib/chitti-previews
 NoNewPrivileges=true
 
 [Install]

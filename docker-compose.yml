@@ -86,12 +86,17 @@ services:
       ALLOWED_TELEGRAM_USER_IDS: ${ALLOWED_TELEGRAM_USER_IDS}
       PROFILE_PATH: ${PROFILE_PATH:-/app/profile/PROFILE.md}
       PROJECT_ROOT: ${PROJECT_ROOT:-/app/projects}
+      PREVIEW_ROOT: ${PREVIEW_ROOT:-/app/previews}
+      PREVIEW_TTL_HOURS: ${PREVIEW_TTL_HOURS:-72}
+      PREVIEW_MAX_BYTES: ${PREVIEW_MAX_BYTES:-209715200}
+      PREVIEW_MAX_COUNT: ${PREVIEW_MAX_COUNT:-4}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
     ports:
       - "127.0.0.1:${CHITTI_PORT:-8000}:8000"
     volumes:
       - ./profile:/app/profile:ro
       - ./projects:/app/projects
+      - ${PREVIEW_HOST_ROOT:-/var/lib/chitti-previews}:/app/previews:ro
       - chitti_state:/app/data
     depends_on:
       postgres:

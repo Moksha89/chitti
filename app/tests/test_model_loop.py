@@ -26,7 +26,7 @@ def test_model_token_budget_round_trip() -> None:
 
 
 def test_done_condition_commands_are_scoped_to_each_task() -> None:
-    first_task_commands = {"build", "test"}
+    first_task_commands = {"build", "test", "export"}
     second_task_commands: set[str] = set()
     assert _task_done_checks(first_task_commands)
     assert not _task_done_checks(second_task_commands)
