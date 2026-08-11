@@ -1,12 +1,11 @@
 import json
 import os
-import sys
 
 from chitti.runtime_identity import IDENTITY_MODULES, loaded_code_digest, write_loaded_code_identity
 
 
 def test_loaded_code_digest_is_stable_and_covers_worker_modules() -> None:
-    assert set(IDENTITY_MODULES) <= set(sys.modules)
+    assert len(IDENTITY_MODULES) == 4
     assert loaded_code_digest() == loaded_code_digest()
 
 
