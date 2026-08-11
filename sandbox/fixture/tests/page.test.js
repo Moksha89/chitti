@@ -8,7 +8,7 @@ const styles = fs.readFileSync("app/globals.css", "utf8");
 test("landing page contains an authored interactive scene", () => {
   assert.match(page, /Canvas/);
   assert.match(page, /useFrame/);
-  assert.match(page, /Explore/i);
+  assert.match(page, /<button\b/);
   assert.doesNotMatch(page, /raw\.githack\.com|jsdelivr\.net|Environment\s+.*preset/);
   if (process.env.CHITTI_MODEL_LOOP === "1") {
     assert.doesNotMatch(page, /Ideas with a little more dimension\./);

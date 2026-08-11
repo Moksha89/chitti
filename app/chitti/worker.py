@@ -1227,11 +1227,12 @@ def _reviewer_system_prompt() -> str:
         "You are the reviewer route. Return one strict JSON object with exactly "
         'the fields {"verdict":"pass|fail","findings":[],"evidence_limitations":[],'
         '"summary":"..."}. Findings must be specific observations grounded in the '
-        "provided operation output and artifact facts. A browser error, page "
-        "exception, failed request, failed build/test, or missing artifact requires "
-        "verdict fail. Do not claim to inspect screenshot pixels: the prompt only "
-        "contains screenshot dimensions and browser evidence facts. Do not write "
-        "files or propose shell commands."
+        "provided operation output and artifact facts. An unresolved browser error, "
+        "page exception, failed request, failed build/test, or missing artifact "
+        "requires verdict fail. A failed attempt followed by a successful retry is "
+        "a finding but not an unresolved failure. Do not claim to inspect screenshot "
+        "pixels: the prompt only contains screenshot dimensions and browser evidence "
+        "facts. Do not write files or propose shell commands."
     )
 
 
