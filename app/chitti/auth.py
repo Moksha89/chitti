@@ -3,6 +3,7 @@ import ipaddress
 import json
 import os
 import secrets
+import string
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,7 @@ class AuthManager:
         self.username = username
         self.password_hash = password_hash
         self.state_path = Path(state_path)
+        self.bootstrap_password_path = self.state_path.with_name("bootstrap_password.txt")
         self.session_ttl_seconds = session_ttl_minutes * 60
         self.must_change_password = True
         self.sessions: dict[str, Session] = {}
@@ -59,7 +61,12 @@ class AuthManager:
             self.must_change_password = bool(state["must_change_password"])
             return
         if not self.password_hash:
-            raise RuntimeError("CHITTI_PASSWORD_HASH must be configured")
+            alphabet = string.ascii_letters + string.digits + "!@#$%^&*_-+="
+            password = "".join(secrets.choice(alphabet) for _ in range(32))
+            self.password_hash = self.hasher.hash(password)
+            self.bootstrap_password_path.parent.mkdir(parents=True, exist_ok=True)
+            self.bootstrap_password_path.write_text(password, encoding="utf-8")
+            os.chmod(self.bootstrap_password_path, 0o600)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self._save_state()
 
@@ -139,6 +146,7 @@ class AuthManager:
         self.password_hash = self.hasher.hash(password)
         self.must_change_password = False
         self._save_state()
+        self.bootstrap_password_path.unlink(missing_ok=True)
 
     def csrf_valid(self, session: Session, token: str | None) -> bool:
         return bool(token) and hmac.compare_digest(session.csrf_token, token or "")

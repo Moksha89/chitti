@@ -18,14 +18,6 @@ class ExtractedMemory:
     source: str = "chitti_inferred"
 
 
-def readable_memory_value(key: str, value: str) -> str:
-    cleaned = value.strip()
-    if cleaned and not re.search(r"\s", cleaned):
-        label = re.sub(r"[_\.]+", " ", key).strip()
-        return f"{label}: {cleaned}"
-    return cleaned
-
-
 class ModelProvider(Protocol):
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str: ...
 
@@ -103,7 +95,7 @@ class LiteLLMProvider:
         return [
             ExtractedMemory(
                 key=str(item["key"]),
-                value=readable_memory_value(str(item["key"]), str(item["value"])),
+                value=str(item["value"]),
                 rationale=str(item["rationale"]) if item.get("rationale") else None,
                 project=str(item["project"]) if item.get("project") else None,
                 source=str(item.get("source", "chitti_inferred")),

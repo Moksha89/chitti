@@ -19,6 +19,19 @@ def make_auth(tmp_path):
     return auth, password
 
 
+def test_fresh_auth_bootstraps_a_forced_change_credential(tmp_path) -> None:
+    auth = AuthManager("akirah", "", str(tmp_path / "state.json"), 1)
+    auth.initialize()
+    bootstrap = tmp_path / "bootstrap_password.txt"
+    password = bootstrap.read_text()
+    assert len(password) == 32
+    assert auth.must_change_password
+    assert auth.authenticate("akirah", password, "fresh-client")
+    assert auth.state_path.exists()
+    auth.change_password("new-secure-password")
+    assert not bootstrap.exists()
+
+
 def test_safe_next_path_rejects_protocol_relative_backslashes() -> None:
     assert safe_next_path("/workspace") == "/workspace"
     assert safe_next_path("/\\evil.com") == "/"
