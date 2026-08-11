@@ -74,7 +74,13 @@ class LiteLLMProvider:
             response = await client.post(
                 self.url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": role, "messages": messages, "temperature": 0.2},
+                json={
+                    "model": role,
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "max_tokens": 4096,
+                    "thinking": {"type": "disabled"},
+                },
             )
             response.raise_for_status()
             body = response.json()

@@ -18,14 +18,17 @@ model_list:
       model: os.environ/GLM_LITELLM_MODEL
       api_base: os.environ/GLM_API_BASE
       api_key: os.environ/GLM_CODING_API_KEY
-      max_budget: 2
+      input_cost_per_token: 0.0000014
+      output_cost_per_token: 0.0000044
+      cache_read_input_token_cost: 0.00000026
+      max_budget: 1.5
       budget_duration: 1d
   - model_name: reviewer
     litellm_params:
       model: deepseek/deepseek-v4-flash
       api_base: https://api.deepseek.com
       api_key: os.environ/DEEPSEEK_API_KEY
-      max_budget: 1
+      max_budget: 0.5
       budget_duration: 1d
   - model_name: bulk
     litellm_params:

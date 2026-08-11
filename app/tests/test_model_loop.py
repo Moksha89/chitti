@@ -17,6 +17,13 @@ def test_model_limits_round_trip() -> None:
     assert WorkerLimits.from_json(limits.as_json()) == limits
 
 
+def test_model_token_budget_round_trip() -> None:
+    limits = WorkerLimits(model_iterations=40, model_tool_calls=120, model_tokens=30000)
+    encoded = limits.as_json()
+    assert encoded["model_tokens"] == 30000
+    assert WorkerLimits.from_json(encoded).model_tokens == 30000
+
+
 def test_done_condition_commands_are_scoped_to_each_task() -> None:
     first_task_commands = {"build", "test"}
     second_task_commands: set[str] = set()

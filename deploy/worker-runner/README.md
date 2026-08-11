@@ -57,12 +57,13 @@ mechanism.
 Model coding runs add a second, runner-enforced budget document to the
 immutable `worker_runs.limits` JSON:
 
-- 8 model iterations per task and 32 total tool calls;
+- 40 model iterations per task and 120 total tool calls;
+- 30,000 total model tokens;
 - 2 MiB total model-authored writes;
 - 1,800 seconds overall run wall-clock, separate from each Docker operation's
   900-second timeout;
 - $1.50 loop-side spend cap, with the `coder` and `reviewer` LiteLLM routes
-  capped independently at the gateway.
+  capped at $1.50 and $0.50 respectively at the gateway.
 
 Only the host runner constructs model prompts and holds the LiteLLM credential.
 The worker receives structured fixed tools, never a model key or arbitrary

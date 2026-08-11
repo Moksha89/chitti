@@ -38,8 +38,9 @@ class WorkerLimits:
     output_bytes: int = 100 * 1024 * 1024
     workspace_bytes: int = 4 * 1024 * 1024 * 1024
     shm_size: str = "256m"
-    model_iterations: int = 8
-    model_tool_calls: int = 32
+    model_iterations: int = 40
+    model_tool_calls: int = 120
+    model_tokens: int = 30000
     model_write_bytes: int = 2 * 1024 * 1024
     model_spend_usd: float = 1.50
     run_timeout_seconds: int = 1800
@@ -57,6 +58,7 @@ class WorkerLimits:
             "shm_size": self.shm_size,
             "model_iterations": self.model_iterations,
             "model_tool_calls": self.model_tool_calls,
+            "model_tokens": self.model_tokens,
             "model_write_bytes": self.model_write_bytes,
             "model_spend_usd": self.model_spend_usd,
             "run_timeout_seconds": self.run_timeout_seconds,
@@ -77,8 +79,9 @@ class WorkerLimits:
             output_bytes=int(cast(int, values.get("output_bytes", artifact_bytes))),
             workspace_bytes=int(cast(int, values.get("workspace_bytes", artifact_bytes))),
             shm_size=str(values["shm_size"]),
-            model_iterations=int(cast(int, values.get("model_iterations", 8))),
-            model_tool_calls=int(cast(int, values.get("model_tool_calls", 32))),
+            model_iterations=int(cast(int, values.get("model_iterations", 40))),
+            model_tool_calls=int(cast(int, values.get("model_tool_calls", 120))),
+            model_tokens=int(cast(int, values.get("model_tokens", 30000))),
             model_write_bytes=int(cast(int, values.get("model_write_bytes", 2 * 1024 * 1024))),
             model_spend_usd=float(cast(float, values.get("model_spend_usd", 1.50))),
             run_timeout_seconds=int(cast(int, values.get("run_timeout_seconds", 1800))),
@@ -220,6 +223,21 @@ class DockerSandboxDispatcher:
             run_id, init, 0, "passed", _init_out, init_err,
             init_result.returncode, datetime.now(UTC),
         )
+        fixture = FixedOperation(
+            "runner",
+            "write-fixture",
+            ("sh", "-c", "cp -r /opt/fixture/. /workspace/ && mkdir -p /workspace/artifacts"),
+        )
+        fixture_result, fixture_out, fixture_err = await self._run_container(
+            run_id, self._docker_command(fixture, workspace, run_id, limits), limits
+        )
+        if fixture_result.returncode:
+            raise RuntimeError(fixture_err[-1000:] or "fixture initialization failed")
+        await self._operation(
+            run_id, fixture, 1, "passed", fixture_out, fixture_err,
+            fixture_result.returncode, datetime.now(UTC),
+        )
+        starter_context = _starter_context(workspace)
         async with self.database.sessions() as session:
             result = await session.execute(
                 text(
@@ -231,6 +249,7 @@ class DockerSandboxDispatcher:
             beliefs = [dict(row._mapping) for row in result]
         stable = _model_system_prompt()
         spent = 0.0
+        spent_tokens = 0
         calls = 0
         writes = 0
         operation_index = 1
@@ -243,6 +262,7 @@ class DockerSandboxDispatcher:
                 {
                     "role": "user",
                     "content": (
+                        f"STARTER WORKSPACE:\n{starter_context}\n"
                         f"PLAN:\n{revision.brief}\n{revision.document.summary}\n"
                         f"BELIEFS:\n{json.dumps(beliefs)}\n"
                         f"TASK {task.id}: {task.title}\n{task.description}\n"
@@ -279,12 +299,15 @@ class DockerSandboxDispatcher:
                     raise
                 calls += 1
                 spent += completion.cost_usd
-                if spent > limits.model_spend_usd:
-                    raise RuntimeError("model spend budget exceeded")
+                spent_tokens += completion.total_tokens
                 await self._record_model_call(
                     run_id, task.id, iteration, route, completion,
                     prompt=json.dumps(messages, separators=(",", ":")),
                 )
+                if spent_tokens > limits.model_tokens:
+                    raise RuntimeError("model token budget exceeded")
+                if spent > limits.model_spend_usd:
+                    raise RuntimeError("model spend budget exceeded")
                 if route == "reviewer":
                     messages.extend(
                         [
@@ -358,7 +381,7 @@ class DockerSandboxDispatcher:
                 )
             if not done:
                 raise RuntimeError(f"task {task.id} exceeded model iteration budget")
-        await self._review_run(run_id, revision, limits, spent, calls)
+        await self._review_run(run_id, revision, limits, spent, spent_tokens, calls)
         diff = FixedOperation(
             "runner",
             "git-diff",
@@ -465,7 +488,7 @@ class DockerSandboxDispatcher:
 
     async def _review_run(
         self, run_id: int, revision: PlanRevision, limits: WorkerLimits,
-        spent: float, calls: int,
+        spent: float, spent_tokens: int, calls: int,
     ) -> None:
         assert self.model_provider is not None
         review_messages = [
@@ -493,6 +516,8 @@ class DockerSandboxDispatcher:
                 prompt=json.dumps(review_messages, separators=(",", ":")),
             )
             raise
+        if spent_tokens + completion.total_tokens > limits.model_tokens:
+            raise RuntimeError("model token budget exceeded during review")
         if spent + completion.cost_usd > limits.model_spend_usd:
             raise RuntimeError("model spend budget exceeded during review")
         await self._record_model_call(
@@ -1044,8 +1069,22 @@ def _model_system_prompt() -> str:
         '{"tool":"capture_screenshot","arguments":{"route":"/","width":390}}\n'
         '{"tool":"finish","arguments":{"summary":"done"}}\n'
         "All paths are relative to the disposable workspace. No .env, secrets, "
-        "credentials, arbitrary argv, shell passthrough, or network tool exists."
+        "credentials, arbitrary argv, shell passthrough, or network tool exists. "
+        "Write useful code early, then iterate using build and test feedback; do not "
+        "read the entire workspace before making a first change."
     )
+
+
+def _starter_context(workspace: Path) -> str:
+    listing = sorted(item.name for item in workspace.iterdir())[:200]
+    files = ("package.json", "app/page.js", "app/layout.js", "app/globals.css", "next.config.mjs")
+    sections = [f"FILES:\n{json.dumps(listing)}"]
+    for relative in files:
+        path = workspace / relative
+        if path.is_file():
+            content = path.read_bytes()[:12000].decode("utf-8", errors="replace")
+            sections.append(f"FILE {relative}:\n{content}")
+    return "\n\n".join(sections)
 
 
 def _reviewer_system_prompt() -> str:
