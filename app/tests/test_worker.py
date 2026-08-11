@@ -86,6 +86,15 @@ def test_static_capture_serves_produced_export_without_model_server(tmp_path) ->
     (tmp_path / "out" / "index.html").write_text("<html><body>export</body></html>")
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
+    served = {}
+    original_serve = module._serve_export
+
+    def serve(workspace):
+        process = original_serve(workspace)
+        served["process"] = process
+        return process
+
+    module._serve_export = serve
 
     class Page:
         def on(self, *_args) -> None:
@@ -138,6 +147,26 @@ def test_static_capture_serves_produced_export_without_model_server(tmp_path) ->
     assert (artifacts / "phone.png").exists()
     assert (artifacts / "desktop.png").exists()
     assert (artifacts / "browser-errors.json").read_text() == "[]"
+    assert served["process"].poll() is not None
+
+
+def test_static_capture_module_imports_without_playwright() -> None:
+    _capture_module()
+
+
+def test_workspace_mount_verifies_artifact_write_access(monkeypatch, tmp_path) -> None:
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command, 0, "/dev/loop0 ext4 rw,nosuid,nodev\n", ""
+        )
+
+    monkeypatch.setattr("chitti.worker.subprocess.run", run)
+    DockerSandboxDispatcher._verify_worker_mount(tmp_path)
+    assert "write_probe.write_bytes" in commands[0][-1]
+    assert "worker artifacts directory is missing" in commands[0][-1]
 
 
 def test_static_capture_rejects_missing_export_informatively(tmp_path) -> None:

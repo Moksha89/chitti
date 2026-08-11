@@ -17,6 +17,8 @@ from chitti.worker import (
     _task_done_checks,
     _tool_exchange,
     _tool_rejection_exchange,
+    _tool_result_message,
+    _unexecuted_tool_results,
 )
 
 
@@ -135,6 +137,36 @@ def test_rejected_native_calls_are_answered_with_tool_results() -> None:
     assert all(item["role"] == "tool" for item in exchange[1:])
 
 
+def test_native_batch_history_can_answer_each_call_and_unexecuted_remainder() -> None:
+    completion = ModelCompletion(
+        content="",
+        model="coder",
+        prompt_tokens=1,
+        completion_tokens=1,
+        total_tokens=2,
+        cost_usd=0,
+        tool_calls=(
+            ModelToolCall(id="call-1", name="list_files", arguments={}),
+            ModelToolCall(id="call-2", name="write_file", arguments={}),
+            ModelToolCall(id="call-3", name="run_command", arguments={}),
+        ),
+    )
+    results = [
+        _tool_result_message(completion.tool_calls[0], "listed"),
+        _tool_result_message(completion.tool_calls[1], "TOOL FAILURE: write_file failed"),
+        *_unexecuted_tool_results(
+            completion.tool_calls[2:],
+            "TOOL FAILURE: not executed because an earlier tool call in "
+            "this batch failed",
+        ),
+    ]
+    assert [item["tool_call_id"] for item in results] == [
+        "call-1", "call-2", "call-3"
+    ]
+    assert results[2]["role"] == "tool"
+    assert "not executed" in results[2]["content"]
+
+
 def test_reviewer_diagnosis_request_contains_no_tool_shaped_turns() -> None:
     messages = _reviewer_diagnosis_messages(
         "Capture page",
@@ -171,6 +203,24 @@ def test_truncated_model_response_is_reported_distinctly() -> None:
         "model response truncated at the output limit"
     )
     assert not completion.message_fields
+
+
+def test_truncated_native_tool_call_is_rejected_not_executed() -> None:
+    completion = ModelCompletion(
+        content="",
+        model="coder",
+        prompt_tokens=10,
+        completion_tokens=8192,
+        total_tokens=8202,
+        cost_usd=0.01,
+        finish_reason="length",
+        tool_calls=(
+            ModelToolCall(id="partial", name="write_file", arguments={}),
+        ),
+    )
+    assert _model_response_failure(completion) == (
+        "model response truncated at the output limit"
+    )
 
 
 def test_empty_content_with_reasoning_but_no_tool_call_is_nonproductive() -> None:

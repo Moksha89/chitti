@@ -4,8 +4,6 @@ import sys
 import time
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
-
 
 def _serve_export(workspace: Path) -> subprocess.Popen[bytes]:
     export = workspace / "out"
@@ -34,7 +32,11 @@ def _serve_export(workspace: Path) -> subprocess.Popen[bytes]:
     )
 
 
-def capture(workspace: Path = Path("/workspace"), playwright_factory=sync_playwright) -> None:
+def capture(workspace: Path = Path("/workspace"), playwright_factory=None) -> None:
+    if playwright_factory is None:
+        from playwright.sync_api import sync_playwright
+
+        playwright_factory = sync_playwright
     server = _serve_export(workspace)
     try:
         deadline = time.monotonic() + 30
