@@ -102,7 +102,7 @@ class WorkerLimits:
     shm_size: str = "256m"
     model_iterations: int = 40
     model_tool_calls: int = 120
-    model_tokens: int = 300000
+    model_tokens: int = 500000
     model_write_bytes: int = 2 * 1024 * 1024
     model_spend_usd: float = 0.75
     run_timeout_seconds: int = 7200
@@ -143,7 +143,7 @@ class WorkerLimits:
             shm_size=str(values["shm_size"]),
             model_iterations=int(cast(int, values.get("model_iterations", 40))),
             model_tool_calls=int(cast(int, values.get("model_tool_calls", 120))),
-            model_tokens=int(cast(int, values.get("model_tokens", 300000))),
+            model_tokens=int(cast(int, values.get("model_tokens", 500000))),
             model_write_bytes=int(cast(int, values.get("model_write_bytes", 2 * 1024 * 1024))),
             model_spend_usd=float(cast(float, values.get("model_spend_usd", 0.75))),
             run_timeout_seconds=int(cast(int, values.get("run_timeout_seconds", 7200))),
@@ -345,8 +345,9 @@ class DockerSandboxDispatcher:
         tool_calls_used = 0
         writes = 0
         operation_index = 1
+        completed_commands: set[str] = set()
         for task in revision.document.tasks:
-            completed_commands: set[str] = set()
+            await self._task_event(run_id, task.id, "running", task.title)
             file_write_counts: dict[str, int] = {}
             file_writes_without_command = 0
             nonproductive_turns = 0
@@ -416,6 +417,10 @@ class DockerSandboxDispatcher:
 
             for iteration in range(1, limits.model_iterations + 1):
                 if time.monotonic() - started > limits.run_timeout_seconds:
+                    await self._task_event(
+                        run_id, task.id, "failed",
+                        "model run wall-clock budget exceeded",
+                    )
                     raise RuntimeError("model run wall-clock budget exceeded")
                 try:
                     completion = await self.model_provider.agent_completion(
@@ -443,6 +448,7 @@ class DockerSandboxDispatcher:
                         detail[:1000],
                         task_id=task.id,
                     )
+                    await self._task_event(run_id, task.id, "failed", detail[:1000])
                     raise
                 calls += 1
                 spent += completion.cost_usd
@@ -452,8 +458,14 @@ class DockerSandboxDispatcher:
                     prompt=json.dumps(messages, separators=(",", ":")),
                 )
                 if spent_tokens > limits.model_tokens:
+                    await self._task_event(
+                        run_id, task.id, "failed", "model token budget exceeded"
+                    )
                     raise RuntimeError("model token budget exceeded")
                 if spent > limits.model_spend_usd:
+                    await self._task_event(
+                        run_id, task.id, "failed", "model spend budget exceeded"
+                    )
                     raise RuntimeError("model spend budget exceeded")
                 response_failure = _model_response_failure(completion)
                 if response_failure is not None:
@@ -509,6 +521,10 @@ class DockerSandboxDispatcher:
                                     str(arguments.get("summary", ""))[:2000],
                                     task_id=task.id,
                                 )
+                                await self._task_event(
+                                    run_id, task.id, "passed",
+                                    str(arguments.get("summary", ""))[:2000],
+                                )
                                 messages.append(
                                     _tool_result_message(native_call, "task finished")
                                 )
@@ -517,7 +533,7 @@ class DockerSandboxDispatcher:
                             elif tool == "finish":
                                 result_text = (
                                     "TOOL FAILURE: done condition requires "
-                                    "successful build and test commands"
+                                    "current successful build, test, and export commands"
                                 )
                                 batch_failure = result_text
                                 messages.append(_tool_result_message(native_call, result_text))
@@ -531,16 +547,25 @@ class DockerSandboxDispatcher:
                                     )
                                     writes += written
                                     if writes > limits.model_write_bytes:
+                                        await self._task_event(
+                                            run_id, task.id, "failed",
+                                            "model write-byte budget exceeded",
+                                        )
                                         raise RuntimeError(
                                             "model write-byte budget exceeded"
                                         )
                                     if tool == "run_command":
-                                        completed_commands.add(
-                                            str(arguments.get("name", ""))
+                                        command_name = str(arguments.get("name", ""))
+                                        _record_gate_command(
+                                            completed_commands, command_name
                                         )
+                                    elif tool == "capture_screenshot":
+                                        completed_commands.add("capture_screenshot")
                                         file_writes_without_command = 0
                                     elif tool == "write_file":
                                         path = str(arguments.get("path", ""))
+                                        if _source_path_invalidates_gates(path):
+                                            completed_commands.clear()
                                         file_writes_without_command += 1
                                         file_write_counts[path] = (
                                             file_write_counts.get(path, 0) + 1
@@ -566,6 +591,9 @@ class DockerSandboxDispatcher:
                                     )
                                 except Exception as exc:
                                     if isinstance(exc, ModelProgressError):
+                                        await self._task_event(
+                                            run_id, task.id, "failed", str(exc)[:1000]
+                                        )
                                         raise
                                     result_text = (
                                         f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
@@ -641,6 +669,10 @@ class DockerSandboxDispatcher:
                     await compact_history()
                     continue
                 if tool_calls_used >= limits.model_tool_calls:
+                    await self._task_event(
+                        run_id, task.id, "failed",
+                        "model tool-call budget exceeded",
+                    )
                     raise RuntimeError("model tool-call budget exceeded")
                 tool_calls_used += 1
                 if tool == "finish" and _task_done_checks(completed_commands):
@@ -648,10 +680,17 @@ class DockerSandboxDispatcher:
                         run_id, "task_finished",
                         str(arguments.get("summary", ""))[:2000], task_id=task.id,
                     )
+                    await self._task_event(
+                        run_id, task.id, "passed",
+                        str(arguments.get("summary", ""))[:2000],
+                    )
                     done = True
                     break
                 if tool == "finish":
-                    result_text = "TOOL FAILURE: done condition requires successful build and test commands"
+                    result_text = (
+                        "TOOL FAILURE: done condition requires current successful "
+                        "build, test, and export commands"
+                    )
                     await record_nonproductive(result_text)
                     messages.extend(_tool_exchange(completion, result_text, native_call))
                     await compact_history()
@@ -663,12 +702,21 @@ class DockerSandboxDispatcher:
                     )
                     writes += written
                     if writes > limits.model_write_bytes:
+                        await self._task_event(
+                            run_id, task.id, "failed",
+                            "model write-byte budget exceeded",
+                        )
                         raise RuntimeError("model write-byte budget exceeded")
                     if tool == "run_command":
-                        completed_commands.add(str(arguments.get("name", "")))
+                        command_name = str(arguments.get("name", ""))
+                        _record_gate_command(completed_commands, command_name)
+                    elif tool == "capture_screenshot":
+                        completed_commands.add("capture_screenshot")
                         file_writes_without_command = 0
                     elif tool == "write_file":
                         path = str(arguments.get("path", ""))
+                        if _source_path_invalidates_gates(path):
+                            completed_commands.clear()
                         file_writes_without_command += 1
                         file_write_counts[path] = file_write_counts.get(path, 0) + 1
                         stall = _file_write_stall(
@@ -684,6 +732,9 @@ class DockerSandboxDispatcher:
                         await record_inspection_turn()
                 except Exception as exc:
                     if isinstance(exc, ModelProgressError):
+                        await self._task_event(
+                            run_id, task.id, "failed", str(exc)[:1000]
+                        )
                         raise
                     result_text = f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
                     await record_nonproductive(result_text)
@@ -703,6 +754,10 @@ class DockerSandboxDispatcher:
                 )
                 await compact_history()
             if not done:
+                await self._task_event(
+                    run_id, task.id, "failed",
+                    f"task {task.id} exceeded model iteration budget",
+                )
                 raise RuntimeError(f"task {task.id} exceeded model iteration budget")
         diff = FixedOperation(
             "runner",
@@ -1922,6 +1977,41 @@ def _task_done_checks(completed_commands: set[str]) -> bool:
     return {"build", "test", "export"} <= completed_commands
 
 
+def _record_gate_command(evidence: set[str], command: str) -> None:
+    if command == "sync-lockfile":
+        evidence.clear()
+    elif command in {"build", "test", "export", "capture_screenshot"}:
+        evidence.add(command)
+
+
+_NONTRIVIAL_COMPACTION_CHARS = 256
+_NON_PROJECT_PATHS = {
+    "artifacts",
+    "node_modules",
+    ".next",
+    ".npm-cache",
+    ".home",
+    ".cache",
+    ".npm",
+    "out",
+}
+
+
+def _source_path_invalidates_gates(path: str) -> bool:
+    normalized: list[str] = []
+    for part in Path(path).parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if normalized:
+                normalized.pop()
+            else:
+                return True
+        else:
+            normalized.append(part)
+    return not normalized or normalized[0] not in _NON_PROJECT_PATHS
+
+
 def _bounded_artifact(value: str, maximum: int = 16000) -> tuple[bytes, int, bool]:
     raw = value.encode()
     return raw[:maximum], len(raw), len(raw) > maximum
@@ -1969,6 +2059,8 @@ def _compact_model_messages(
         for unit in older_units
         for item in unit
     ) - sum(len(str(item.get("content", ""))) for item in important)
+    if removed_chars < _NONTRIVIAL_COMPACTION_CHARS:
+        return messages, False, 0
     summary: dict[str, object] = {
         "role": "user",
         "content": (

@@ -18,7 +18,9 @@ from chitti.worker import (
     _model_system_prompt,
     _parse_tool_call,
     _progress_counters,
+    _record_gate_command,
     _reviewer_diagnosis_messages,
+    _source_path_invalidates_gates,
     _starter_context,
     _task_done_checks,
     _tool_exchange,
@@ -73,6 +75,7 @@ def test_model_limits_round_trip() -> None:
     limits = WorkerLimits(model_iterations=3, model_tool_calls=7, model_write_bytes=1234)
     assert WorkerLimits.from_json(limits.as_json()) == limits
     assert WorkerLimits().run_timeout_seconds == 7200
+    assert WorkerLimits().model_tokens == 500000
 
 
 def test_model_call_failure_detail_distinguishes_transport_and_response_errors() -> None:
@@ -119,11 +122,36 @@ def test_model_token_budget_round_trip() -> None:
     assert WorkerLimits.from_json(encoded).model_tokens == 30000
 
 
-def test_done_condition_commands_are_scoped_to_each_task() -> None:
-    first_task_commands = {"build", "test", "export"}
-    second_task_commands: set[str] = set()
-    assert _task_done_checks(first_task_commands)
-    assert not _task_done_checks(second_task_commands)
+def test_done_condition_evidence_survives_task_boundaries() -> None:
+    run_gate_evidence = {"build", "test", "export"}
+    _record_gate_command(run_gate_evidence, "build")
+    _record_gate_command(run_gate_evidence, "test")
+    _record_gate_command(run_gate_evidence, "export")
+    assert _task_done_checks(run_gate_evidence)
+    assert _task_done_checks(run_gate_evidence)
+
+
+def test_lockfile_sync_invalidates_gate_evidence() -> None:
+    run_gate_evidence = {"build", "test", "export"}
+    _record_gate_command(run_gate_evidence, "sync-lockfile")
+    assert not run_gate_evidence
+
+
+def test_source_changes_invalidate_gate_evidence_but_generated_paths_do_not() -> None:
+    assert _source_path_invalidates_gates("app/page.js")
+    assert _source_path_invalidates_gates("package-lock.json")
+    assert not _source_path_invalidates_gates("artifacts/desktop.png")
+    assert not _source_path_invalidates_gates("out/index.html")
+    assert not _source_path_invalidates_gates("node_modules/three/index.js")
+    evidence = {"build", "test", "export", "capture_screenshot"}
+    _record_gate_command(evidence, "capture_screenshot")
+    assert "capture_screenshot" in evidence
+    evidence.clear()
+    _record_gate_command(evidence, "build")
+    _record_gate_command(evidence, "test")
+    _record_gate_command(evidence, "export")
+    _record_gate_command(evidence, "capture_screenshot")
+    assert _task_done_checks(evidence)
 
 
 def test_bounded_artifact_preserves_original_size_and_truncation() -> None:
@@ -138,7 +166,7 @@ def test_model_history_compaction_keeps_prefix_recent_and_feedback() -> None:
         {"role": "system", "content": "stable"},
         {"role": "user", "content": "task contract"},
         *[
-            {"role": "assistant", "content": f"old {index}"}
+            {"role": "assistant", "content": f"old {index} " + ("x" * 200)}
             for index in range(10)
         ],
         {"role": "user", "content": "next-build passed"},
@@ -151,6 +179,22 @@ def test_model_history_compaction_keeps_prefix_recent_and_feedback() -> None:
     assert compacted[1] == messages[1]
     assert any("next-build passed" in item["content"] for item in compacted)
     assert any("COMPACTION:" in item["content"] for item in compacted)
+
+
+def test_model_history_compaction_skips_negligible_savings() -> None:
+    messages = [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "task contract"},
+        *[
+            {"role": "assistant", "content": f"old {index}"}
+            for index in range(10)
+        ],
+        {"role": "assistant", "content": "recent"},
+    ]
+    compacted, changed, removed = _compact_model_messages(messages, recent_turns=2)
+    assert compacted == messages
+    assert not changed
+    assert removed == 0
 
 
 def test_model_history_compaction_keeps_native_tool_exchange_together() -> None:
@@ -170,7 +214,7 @@ def test_model_history_compaction_keeps_native_tool_exchange_together() -> None:
     messages = [
         {"role": "system", "content": "stable"},
         {"role": "user", "content": "task"},
-        {"role": "assistant", "content": "old"},
+        {"role": "assistant", "content": "old " + ("x" * 300)},
         *_tool_exchange(completion, "[\"package.json\"]", completion.tool_calls[0]),
         {"role": "assistant", "content": "recent"},
     ]
