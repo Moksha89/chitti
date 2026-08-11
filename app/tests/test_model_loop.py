@@ -19,6 +19,7 @@ from chitti.worker import (
     _parse_tool_call,
     _progress_counters,
     _record_gate_command,
+    _reset_file_write_counter,
     _reviewer_diagnosis_messages,
     _source_path_invalidates_gates,
     _starter_context,
@@ -383,6 +384,16 @@ def test_many_file_scaffold_writes_can_reach_a_command() -> None:
     assert _file_write_stall("app/file-23.js", 1, 24) == (
         "stopped after 24 file writes without running a command"
     )
+
+
+def test_successful_command_resets_write_stall_counter_but_capture_does_not() -> None:
+    writes_without_command = 3
+    writes_without_command = _reset_file_write_counter(
+        "run_command", writes_without_command
+    )
+    assert writes_without_command == 0
+    assert _file_write_stall("app/page.js", 1, writes_without_command) is None
+    assert _reset_file_write_counter("capture_screenshot", 3) == 3
 
 
 def test_model_paths_reject_traversal_and_symlink_escape(tmp_path: Path) -> None:

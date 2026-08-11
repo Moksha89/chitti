@@ -89,6 +89,10 @@ def _file_write_stall(path: str, path_writes: int, total_writes: int) -> str | N
     return None
 
 
+def _reset_file_write_counter(tool: str, current: int) -> int:
+    return 0 if tool == "run_command" else current
+
+
 @dataclass(frozen=True)
 class WorkerLimits:
     cpus: float = 1.0
@@ -559,9 +563,13 @@ class DockerSandboxDispatcher:
                                         _record_gate_command(
                                             completed_commands, command_name
                                         )
+                                        file_writes_without_command = (
+                                            _reset_file_write_counter(
+                                                tool, file_writes_without_command
+                                            )
+                                        )
                                     elif tool == "capture_screenshot":
                                         completed_commands.add("capture_screenshot")
-                                        file_writes_without_command = 0
                                     elif tool == "write_file":
                                         path = str(arguments.get("path", ""))
                                         if _source_path_invalidates_gates(path):
@@ -710,9 +718,11 @@ class DockerSandboxDispatcher:
                     if tool == "run_command":
                         command_name = str(arguments.get("name", ""))
                         _record_gate_command(completed_commands, command_name)
+                        file_writes_without_command = _reset_file_write_counter(
+                            tool, file_writes_without_command
+                        )
                     elif tool == "capture_screenshot":
                         completed_commands.add("capture_screenshot")
-                        file_writes_without_command = 0
                     elif tool == "write_file":
                         path = str(arguments.get("path", ""))
                         if _source_path_invalidates_gates(path):
