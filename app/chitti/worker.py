@@ -1751,7 +1751,7 @@ class WorkerRunManager:
                 return None
             events = await session.execute(
                 text(
-                    "SELECT status, detail, operation_index, task_id, created_at "
+                    "SELECT id, status, detail, operation_index, task_id, created_at "
                     "FROM worker_run_events WHERE run_id = :run_id ORDER BY id"
                 ),
                 {"run_id": run_id},
@@ -1793,6 +1793,30 @@ class WorkerRunManager:
                 ),
                 "cost_total_usd": sum(float(row["cost_usd"]) for row in model_call_rows),
             }
+
+    async def latest_status(self, run_id: int) -> str | None:
+        async with self.database.sessions() as session:
+            result = await session.execute(
+                text(
+                    "SELECT status FROM worker_run_events "
+                    "WHERE run_id = :run_id ORDER BY id DESC LIMIT 1"
+                ),
+                {"run_id": run_id},
+            )
+            status = result.scalar_one_or_none()
+            return str(status) if status is not None else None
+
+    async def events_after(self, run_id: int, event_id: int) -> list[dict[str, object]]:
+        async with self.database.sessions() as session:
+            result = await session.execute(
+                text(
+                    "SELECT id, status, detail, operation_index, task_id, created_at "
+                    "FROM worker_run_events "
+                    "WHERE run_id = :run_id AND id > :event_id ORDER BY id"
+                ),
+                {"run_id": run_id, "event_id": event_id},
+            )
+            return [dict(row._mapping) for row in result]
 
 def _confined_path(workspace: Path, requested: str) -> Path:
     if not requested or "\x00" in requested:

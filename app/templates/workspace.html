@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Run workspace · Chitti{% endblock %}
+{% block body %}
+<style>
+  .workspace-shell{display:grid;grid-template-columns:240px minmax(0,1fr) 280px;min-height:100vh;background:var(--bg)}
+  .workspace-column{min-width:0;padding:18px;border-right:1px solid var(--line-soft)}
+  .workspace-column:last-child{border-right:0}.workspace-main{min-width:0;padding:18px}
+  .workspace-brand{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+  .workspace-brand a{font:11px var(--mono);color:var(--muted)}.workspace-label{margin:0 0 8px;color:var(--faint);font:10px var(--mono);letter-spacing:.15em;text-transform:uppercase}
+  .run-list,.workspace-tasks{display:grid;gap:7px}.run-link{display:grid;gap:3px;padding:10px;border:1px solid var(--line-soft);border-radius:7px;color:var(--muted)}
+  .run-link:hover,.run-link.open{border-color:#6ee7c866;background:#122422;color:var(--ink);text-decoration:none}.run-link strong{font:12px var(--mono);color:var(--ink)}
+  .run-link small,.workspace-task small{color:var(--faint);font:10px var(--mono)}.workspace-task{display:grid;gap:3px;padding:9px;border-left:2px solid var(--line);color:var(--muted)}
+  .workspace-task.running{border-left-color:var(--accent);background:#122422}.workspace-task.passed{border-left-color:#5cc99f}.workspace-task.failed{border-left-color:var(--danger)}
+  .workspace-task strong{color:var(--ink);font-size:13px}.workspace-task em{color:var(--warning);font:10px var(--mono);font-style:normal;text-transform:uppercase}
+  .workspace-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:16px}.workspace-top h1{margin-bottom:3px}
+  .workspace-tabs{display:flex;gap:7px;border-bottom:1px solid var(--line);margin-bottom:14px}.workspace-tab{border:1px solid transparent;border-bottom:0;border-radius:7px 7px 0 0;background:transparent;color:var(--muted);padding:8px 12px;font:11px var(--mono)}
+  .workspace-tab.active{border-color:var(--line);background:var(--panel);color:var(--accent)}.workspace-pane{display:none}.workspace-pane.active{display:block}
+  .workspace-panel{margin-bottom:14px}.workspace-panel .panel-body{padding:14px 16px}.event-list{display:grid;gap:7px}.event-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;padding:9px;border:1px solid var(--line-soft);border-radius:6px}
+  .event-row strong{color:var(--accent);font:10px var(--mono);text-transform:uppercase}.event-row span{color:var(--muted);overflow-wrap:anywhere}
+  .operation-output{margin-top:8px}.operation-output pre{max-height:180px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:#cce9df;background:#090d12;padding:10px;border-radius:5px;font-size:11px}
+  .output-link{display:inline-block;margin:5px 8px 0 0;font:10px var(--mono)}.screenshot-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  .screenshot-card{min-width:0;padding:10px;border:1px solid var(--line-soft);border-radius:7px}.screenshot-card img{display:block;width:auto;max-width:100%;height:auto;margin:auto}
+  .screenshot-card figcaption{margin-bottom:8px;color:var(--muted);font:10px var(--mono);text-transform:uppercase}.reviewer-grid{display:grid;gap:10px}.reviewer-box{padding:10px;border:1px solid var(--line-soft);border-radius:6px}
+  .reviewer-box h3{margin-bottom:5px;font-size:12px}.reviewer-box ul{margin:5px 0 0;padding-left:20px;color:var(--muted)}.empty-state{padding:18px;border:1px dashed var(--line);border-radius:7px;color:var(--muted)}
+  .metric-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.metric-card{padding:10px;border:1px solid var(--line-soft);border-radius:6px}.metric-card strong{display:block;color:var(--ink);font:16px var(--mono)}.metric-card span{color:var(--faint);font:10px var(--mono);text-transform:uppercase}
+  .workspace-right .panel{margin-bottom:14px}.workspace-right .panel-body{padding:14px 16px}.workspace-right .panel-meta{display:block}
+  .workspace-controls{display:grid;gap:8px}.workspace-controls form{display:grid;gap:7px}.workspace-controls textarea{min-height:65px}.workspace-controls button{width:100%}
+  .stream-status{color:var(--accent);font:10px var(--mono)}.stream-status.offline{color:var(--warning)}
+  @media (max-width:1050px){.workspace-shell{grid-template-columns:210px minmax(0,1fr)}.workspace-right{grid-column:1/-1;border-top:1px solid var(--line-soft);border-right:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.workspace-right .panel{margin:0}}
+  @media (max-width:700px){.workspace-shell{display:block}.workspace-column{border-right:0;border-bottom:1px solid var(--line-soft)}.workspace-left{max-height:300px;overflow:auto}.workspace-main{padding:12px}.workspace-right{display:block}.workspace-right .panel{margin-bottom:14px}.screenshot-grid{grid-template-columns:1fr}.workspace-tabs{overflow:auto}.workspace-tab{white-space:nowrap}}
+</style>
+<div class="workspace-shell">
+  <aside class="workspace-column workspace-left">
+    <div class="workspace-brand"><div class="brand"><div class="brand-mark">C/</div><div><div class="brand-name">Chitti</div><div class="brand-sub">workspace</div></div></div><a href="/">dashboard ↗</a></div>
+    <p class="workspace-label">Runs / newest first</p>
+    <nav class="run-list" aria-label="Worker runs">
+      {% for link in run_links %}
+      <a class="run-link{% if link.is_open %} open{% endif %}" href="/workspace/runs/{{ link.id }}">
+        <strong>Run {{ link.id }} · {{ link.status }}</strong>
+        <span>{{ link.project }} / revision {{ link.revision }}</span>
+      </a>
+      {% else %}<div class="empty-state">No worker runs yet.</div>{% endfor %}
+    </nav>
+    <p class="workspace-label" style="margin-top:22px">Open run tasks</p>
+    <div class="workspace-tasks">
+      {% for task in revision.document.tasks %}
+      {% set status = task_statuses.get(task.id, "pending") %}
+      <article class="workspace-task {{ status }}" data-task-id="{{ task.id }}">
+        <strong>{{ task.title }}</strong><small>{{ task.id }}</small><em>{{ status }}{% if task.id == current_task %} · current{% endif %}</em>
+      </article>
+      {% endfor %}
+    </div>
+  </aside>
+
+  <main class="workspace-main">
+    <header class="workspace-top">
+      <div><div class="kicker">Run workspace / durable evidence</div><h1>Run {{ run.run.id }}</h1><p class="subhead">{{ revision.project }} · revision {{ revision.revision }} · <span id="stream-status" class="stream-status">{% if run.latest_status in ["passed", "failed", "cancelled"] %}run finished{% else %}live updates connecting{% endif %}</span></p></div>
+      <a class="button-secondary" href="/plans/{{ revision.id }}">Plan detail</a>
+    </header>
+    <div class="workspace-tabs" role="tablist">
+      <button class="workspace-tab active" data-tab="activity" role="tab">Activity</button>
+      <button class="workspace-tab" data-tab="preview" role="tab">Preview</button>
+      <button class="workspace-tab" data-tab="reviewer" role="tab">Reviewer</button>
+    </div>
+
+    <section class="workspace-pane active" data-pane="activity">
+      <section class="panel workspace-panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">01</span><div><h2>Event timeline</h2><div class="panel-meta">append-only run events</div></div></div></div><div class="panel-body"><div id="event-list" class="event-list">
+        {% for event in run.events %}<article class="event-row" data-event-id="{{ event.id }}"><strong>{{ event.status }}</strong><span>{{ event.detail }}</span></article>{% else %}<div class="empty-state">No events recorded yet.</div>{% endfor %}
+      </div></div></section>
+      <section class="panel workspace-panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">02</span><div><h2>Completed operations</h2><div class="panel-meta">stdout and stderr are bounded in-page; full payloads stay behind authenticated artifact links</div></div></div></div><div class="panel-body">
+        {% for operation in run.operations %}<article class="operation"><h3>{{ operation.name }} · {{ operation.status }} · exit {{ operation.exit_code }}</h3><details class="operation-output"><summary>Output preview</summary><pre>{{ operation.stdout_preview }}{% if operation.stderr_preview %}{{ "\n" }}{{ operation.stderr_preview }}{% endif %}</pre></details>{% if operation.stdout_artifact_id %}<a class="output-link" href="/runs/{{ run.run.id }}/artifacts/{{ operation.stdout_artifact_id }}">full stdout</a>{% endif %}{% if operation.stderr_artifact_id %}<a class="output-link" href="/runs/{{ run.run.id }}/artifacts/{{ operation.stderr_artifact_id }}">full stderr</a>{% endif %}</article>{% else %}<div class="empty-state">No completed operations yet. Live terminal output is intentionally out of this slice.</div>{% endfor %}
+      </div></section>
+    </section>
+
+    <section class="workspace-pane" data-pane="preview">
+      <section class="panel workspace-panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">03</span><div><h2>Captured preview</h2><div class="panel-meta">authenticated artifact delivery · no active-run preview</div></div></div></div><div class="panel-body">
+        {% if run.screenshots %}<div class="screenshot-grid">{% for artifact in run.screenshots %}<figure class="screenshot-card"><figcaption>{{ "phone" if artifact.path.endswith("phone.png") else "desktop" }} · {{ artifact.byte_size }} bytes</figcaption><img src="/runs/{{ run.run.id }}/artifacts/{{ artifact.id }}" alt="Captured {{ "phone" if artifact.path.endswith("phone.png") else "desktop" }} screenshot"></figure>{% endfor %}</div>{% else %}<div class="empty-state">No screenshots have been captured for this run yet. In-flight previews are intentionally not shown.</div>{% endif %}
+        {% if run.browser_errors %}<p><a class="output-link" href="/runs/{{ run.run.id }}/artifacts/{{ run.browser_errors.id }}">Open browser errors artifact</a></p>{% elif run.screenshots %}<p class="panel-meta">No browser error artifact was recorded.</p>{% endif %}
+      </div></section>
+    </section>
+
+    <section class="workspace-pane" data-pane="reviewer">
+      <section class="panel workspace-panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">04</span><div><h2>Reviewer verdict</h2><div class="panel-meta">structured evidence review</div></div></div></div><div class="panel-body">
+        {% if run.reviewer_verdict %}<div class="reviewer-grid"><div class="reviewer-box"><h3>Verdict: {{ run.reviewer_verdict.verdict }}</h3><p>{{ run.reviewer_verdict.summary }}</p></div><div class="reviewer-box"><h3>Findings</h3><ul>{% for finding in run.reviewer_verdict.findings %}<li>{{ finding }}</li>{% else %}<li>None recorded.</li>{% endfor %}</ul></div><div class="reviewer-box"><h3>Evidence limitations</h3><ul>{% for limitation in run.reviewer_verdict.evidence_limitations %}<li>{{ limitation }}</li>{% else %}<li>None recorded.</li>{% endfor %}</ul></div></div>{% else %}<div class="empty-state">No reviewer verdict has been recorded yet.</div>{% endif %}
+      </div></section>
+    </section>
+  </main>
+
+  <aside class="workspace-column workspace-right">
+    <section class="panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">05</span><div><h2>Run header</h2><div class="panel-meta">live durable projection</div></div></div><strong id="run-status" class="capability-status">{{ run.latest_status }}</strong></div><div class="panel-body"><div class="metric-grid"><div class="metric-card"><strong id="elapsed">{{ run.elapsed_seconds // 60 }}m</strong><span>elapsed</span></div><div class="metric-card"><strong id="calls">{{ run.model_call_count }}</strong><span>model calls</span></div><div class="metric-card"><strong>{{ run.token_totals }}</strong><span>tokens</span></div><div class="metric-card"><strong>{{ "%.1f"|format(run.reasoning_share) }}%</strong><span>reasoning share</span></div><div class="metric-card"><strong>${{ "%.6f"|format(run.cost_total_usd) }}</strong><span>spend</span></div></div></div></section>
+    <section class="panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">06</span><div><h2>Controls</h2><div class="panel-meta">approval remains explicit</div></div></div></div><div class="panel-body workspace-controls"><a class="button-secondary" href="/">Open chat dashboard</a>{% if run.promotion and run.promotion.approval_id %}<div class="plan-approval"><strong>{{ run.promotion.decision }}</strong>{% if run.promotion.preview_id %}<a href="/previews/{{ run.promotion.preview_id }}/index.html">Open published preview</a>{% else %}<span>Preview is queued for the host runner.</span>{% endif %}</div>{% elif run.promotion and not run.promotion.approval_id and run.latest_status == "passed" %}<form method="post" action="/runs/{{ run.run.id }}/approve-result"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="send-button" type="submit">Approve result</button></form>{% elif run.latest_status == "passed" %}<div class="panel-meta">This run is not promotable: static export evidence is missing.</div>{% endif %}</div></section>
+  </aside>
+</div>
+<script>
+(() => {
+  const runId={{ run.run.id }}, terminalRun={{ "true" if run.latest_status in ["passed", "failed", "cancelled"] else "false" }}, status=document.getElementById("run-status"), streamStatus=document.getElementById("stream-status"), events=document.getElementById("event-list"), seen=new Set([...document.querySelectorAll("[data-event-id]")].map(item=>item.dataset.eventId));
+  document.querySelectorAll(".workspace-tab").forEach(tab=>tab.addEventListener("click",()=>{document.querySelectorAll(".workspace-tab").forEach(item=>item.classList.toggle("active",item===tab));document.querySelectorAll(".workspace-pane").forEach(pane=>pane.classList.toggle("active",pane.dataset.pane===tab.dataset.tab))}));
+  if(terminalRun)return;
+  function addEvent(event){if(seen.has(String(event.id)))return;seen.add(String(event.id));const row=document.createElement("article");row.className="event-row";row.dataset.eventId=event.id;const label=document.createElement("strong");label.textContent=event.status;const detail=document.createElement("span");detail.textContent=event.detail;row.append(label,detail);events.appendChild(row);status.textContent=event.status;const task=document.querySelector(`[data-task-id="${CSS.escape(event.task_id||"")}"]`);if(task&&event.status){task.classList.remove("running","passed","failed");task.classList.add(event.status);const state=task.querySelector("em");if(state)state.textContent=event.status+(event.status==="running"?" · current":"")}}}
+  const source=new EventSource(`/workspace/runs/${runId}/events`);
+  source.onopen=()=>{streamStatus.textContent="live updates connected";streamStatus.classList.remove("offline")};
+  source.addEventListener("run",event=>{try{const payload=JSON.parse(event.data);addEvent(payload);if(payload.terminal){streamStatus.textContent="run finished";streamStatus.classList.remove("offline");source.close()}}catch(_error){}});
+  source.onerror=()=>{streamStatus.textContent="live updates unavailable · reload for durable state";streamStatus.classList.add("offline")};
+  window.addEventListener("beforeunload",()=>source.close());
+})();
+</script>
+{% endblock %}
