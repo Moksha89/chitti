@@ -928,28 +928,6 @@ class DockerSandboxDispatcher:
         if failures:
             raise RuntimeError("; ".join(failures))
 
-    async def _record_cleanup_failure(self, run_id: str, detail: str) -> None:
-        try:
-            numeric_run_id = int(run_id)
-        except (TypeError, ValueError):
-            logger.error("workspace cleanup failure for non-run %s: %s", run_id, detail)
-            return
-        if self.database is None:
-            logger.error("workspace cleanup failure for run %s: %s", run_id, detail)
-            return
-        try:
-            async with self.database.sessions() as session:
-                await session.execute(
-                    text(
-                        "INSERT INTO worker_run_events (run_id, status, detail) "
-                        "VALUES (:run_id, 'failed', :detail)"
-                    ),
-                    {"run_id": numeric_run_id, "detail": detail},
-                )
-                await session.commit()
-        except Exception:
-            logger.exception("could not record workspace cleanup failure for run %s", run_id)
-
         self.preview_root.mkdir(parents=True, exist_ok=True)
         staging = self.preview_root / "staging"
         staging.mkdir(parents=True, exist_ok=True)
@@ -980,6 +958,28 @@ class DockerSandboxDispatcher:
                 continue
             if child.name not in known_previews:
                 await asyncio.to_thread(remove_preview, child)
+
+    async def _record_cleanup_failure(self, run_id: str, detail: str) -> None:
+        try:
+            numeric_run_id = int(run_id)
+        except (TypeError, ValueError):
+            logger.error("workspace cleanup failure for non-run %s: %s", run_id, detail)
+            return
+        if self.database is None:
+            logger.error("workspace cleanup failure for run %s: %s", run_id, detail)
+            return
+        try:
+            async with self.database.sessions() as session:
+                await session.execute(
+                    text(
+                        "INSERT INTO worker_run_events (run_id, status, detail) "
+                        "VALUES (:run_id, 'failed', :detail)"
+                    ),
+                    {"run_id": numeric_run_id, "detail": detail},
+                )
+                await session.commit()
+        except Exception:
+            logger.exception("could not record workspace cleanup failure for run %s", run_id)
 
     async def cleanup_expired_previews(self) -> None:
         if not self.preview_root.exists():
