@@ -8,6 +8,7 @@ RUNNER_ENV="${RUNNER_ENV:-/etc/chitti/worker-runner.env}"
 RUNNER_UNIT="chitti-worker-runner.service"
 RUNNER_ROLE_SQL="${RUNNER_ROLE_SQL:-deploy/worker-runner/runner-role.sql}"
 RUNNER_UNIT_SOURCE="${RUNNER_UNIT_SOURCE:-deploy/worker-runner/chitti-worker-runner.service}"
+RUNNER_VENV_DIR="${RUNNER_VENV_DIR:-/opt/chitti-runner}"
 RUNNER_PYTHON="${RUNNER_PYTHON:-/opt/chitti-runner/bin/python}"
 fresh_clone=0
 real_checkout=0
@@ -109,7 +110,11 @@ docker compose ps --status running --services | grep -qx chitti
 docker build --quiet -t chitti-sandbox:latest sandbox >/dev/null
 
 if [[ ! -x "${RUNNER_PYTHON}" ]]; then
-  python3 -m venv "$(dirname "${RUNNER_PYTHON}")"
+  if ! python3 -m venv "${RUNNER_VENV_DIR}"; then
+    apt-get update --quiet
+    DEBIAN_FRONTEND=noninteractive apt-get install --yes --quiet python3.12-venv
+    python3 -m venv "${RUNNER_VENV_DIR}"
+  fi
 fi
 "${RUNNER_PYTHON}" -m pip install --quiet --disable-pip-version-check \
   "asyncpg==0.30.0" \
