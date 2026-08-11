@@ -78,7 +78,7 @@ class LiteLLMProvider:
                     "model": role,
                     "messages": messages,
                     "temperature": 0.2,
-                    "max_tokens": 4096,
+                    "max_tokens": 1200 if role == "reviewer" else 4096,
                     "thinking": {"type": "disabled"},
                 },
             )
