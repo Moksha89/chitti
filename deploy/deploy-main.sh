@@ -203,15 +203,72 @@ import asyncpg
 
 async def main():
     conn = await asyncpg.connect(os.environ["DATABASE_URL"])
-    row = await conn.fetchrow("""
-    SELECT current_user,
-               has_table_privilege(current_user, $$decisions$$, $$INSERT$$),
-               has_table_privilege(current_user, $$worker_runs$$, $$INSERT$$),
-               has_sequence_privilege(current_user, $$worker_runs_id_seq$$, $$USAGE$$)
-    """)
+    current_user = await conn.fetchval("SELECT current_user")
+    if current_user != "chitti_runner":
+        raise SystemExit("runner role identity check failed")
+
+    # Derived from the SQL paths in worker.py and runner.py, rather than
+    # copied from runner-role.sql.
+    reads = [
+        "plan_revisions", "plan_approvals", "decisions", "decision_forgets",
+        "worker_runs", "worker_run_events", "worker_operations",
+        "worker_artifacts", "worker_retention_policy",
+        "worker_artifact_payloads", "worker_model_calls",
+    ]
+    inserts = [
+        "plan_task_events", "worker_run_events", "worker_operations",
+        "worker_artifacts", "worker_artifact_payloads", "worker_model_calls",
+    ]
+    updates = ["worker_runs"]  # SELECT ... FOR UPDATE OF worker_runs in runner.py
+    deletes = ["worker_artifact_payloads"]
+    sequences = [
+        "plan_task_events_id_seq", "worker_run_events_id_seq",
+        "worker_operations_id_seq", "worker_artifacts_id_seq",
+        "worker_model_calls_id_seq",
+    ]
+
+    async def require_table_privilege(table, privilege):
+        allowed = await conn.fetchval(
+            "SELECT has_table_privilege(current_user, $1, $2)", table, privilege
+        )
+        if not allowed:
+            raise SystemExit(f"runner lacks {privilege} on {table}")
+
+    async def require_sequence_privilege(sequence):
+        allowed = await conn.fetchval(
+            "SELECT has_sequence_privilege(current_user, $1, $$USAGE$$)",
+            sequence,
+        )
+        if not allowed:
+            raise SystemExit(f"runner lacks sequence usage on {sequence}")
+
+    for table in reads:
+        await require_table_privilege(table, "SELECT")
+    for table in inserts:
+        await require_table_privilege(table, "INSERT")
+    for table in updates:
+        await require_table_privilege(table, "UPDATE")
+    for table in deletes:
+        await require_table_privilege(table, "DELETE")
+    for sequence in sequences:
+        await require_sequence_privilege(sequence)
+
+    negatives = [
+        ("decisions", "INSERT"),
+        ("worker_runs", "INSERT"),
+    ]
+    for table, privilege in negatives:
+        allowed = await conn.fetchval(
+            "SELECT has_table_privilege(current_user, $1, $2)", table, privilege
+        )
+        if allowed:
+            raise SystemExit(f"runner unexpectedly has {privilege} on {table}")
+    if await conn.fetchval(
+        "SELECT has_sequence_privilege(current_user, $$worker_runs_id_seq$$, $$USAGE$$)"
+    ):
+        raise SystemExit("runner unexpectedly has sequence usage on worker_runs_id_seq")
+
     await conn.close()
-    if row[0] != "chitti_runner" or row[1] or row[2] or row[3]:
-        raise SystemExit("runner role privilege boundary failed")
 
 asyncio.run(main())
 '
