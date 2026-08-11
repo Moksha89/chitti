@@ -8,6 +8,7 @@ RUNNER_ENV="${RUNNER_ENV:-/etc/chitti/worker-runner.env}"
 RUNNER_UNIT="chitti-worker-runner.service"
 RUNNER_ROLE_SQL="${RUNNER_ROLE_SQL:-deploy/worker-runner/runner-role.sql}"
 RUNNER_UNIT_SOURCE="${RUNNER_UNIT_SOURCE:-deploy/worker-runner/chitti-worker-runner.service}"
+RUNNER_PYTHON="${RUNNER_PYTHON:-/opt/chitti-runner/bin/python}"
 fresh_clone=0
 real_checkout=0
 if [[ -e "${INSTALL_DIR}/.git" ]] &&
@@ -106,6 +107,15 @@ done
 docker compose ps --status running --services | grep -qx chitti
 
 docker build --quiet -t chitti-sandbox:latest sandbox >/dev/null
+
+if [[ ! -x "${RUNNER_PYTHON}" ]]; then
+  python3 -m venv "$(dirname "${RUNNER_PYTHON}")"
+fi
+"${RUNNER_PYTHON}" -m pip install --quiet --disable-pip-version-check \
+  "asyncpg==0.30.0" \
+  "httpx==0.28.1" \
+  "pydantic-settings==2.8.1" \
+  "SQLAlchemy[asyncio]==2.0.39"
 
 install -d -m 0755 /etc/chitti
 umask 077
