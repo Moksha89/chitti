@@ -14,11 +14,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 
 from .auth import AuthManager, Session
 from .db import Database
 from .embedding import FakeEmbedder, get_embedder
 from .memory import MemoryStore
+from .plans import PlanManager, approve_revision, latest_revisions, reject_revision, revision_by_id
 from .project_state import ProjectState
 from .provider import FakeProvider, LiteLLMProvider
 from .service import ChittiService
@@ -141,8 +143,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.settings = settings
     app.state.database = database
     app.state.service = service
+    app.state.plan_manager = PlanManager(database, service.provider, service.memory)
     app.state.project_state = ProjectState(settings.project_root)
     app.state.auth = auth
+    await app.state.plan_manager.resume_queued()
     try:
         yield
     finally:
@@ -305,6 +309,17 @@ async def dashboard_context(request: Request, session: Session) -> dict[str, obj
     async with database.sessions() as db_session:
         decisions = await memory.decisions(db_session)
         conflicts = await memory.conflicts(db_session)
+        plans = await latest_revisions(db_session)
+        for plan in plans:
+            approval_result = await db_session.execute(
+                text(
+                    "SELECT decision, reason, content_hash, created_at FROM plan_approvals "
+                    "WHERE revision_id = :revision ORDER BY id DESC LIMIT 1"
+                ),
+                {"revision": plan["id"]},
+            )
+            approval = approval_result.mappings().one_or_none()
+            plan["approval"] = dict(approval) if approval else None
     for decision in decisions:
         decision["display_key"] = humanize_belief_key(str(decision["decision_key"]))
         decision["display_value"] = str(decision["decision"])
@@ -323,6 +338,7 @@ async def dashboard_context(request: Request, session: Session) -> dict[str, obj
         "csrf_token": session.csrf_token,
         "decisions": decisions,
         "conflicts": conflicts,
+        "plans": plans,
         "greeting": greeting,
         "display_timezone": request.app.state.settings.display_timezone,
     }
@@ -330,6 +346,18 @@ async def dashboard_context(request: Request, session: Session) -> dict[str, obj
 
 def humanize_belief_key(value: str) -> str:
     return re.sub(r"[_\.]+", " ", value).strip().capitalize()
+
+
+def project_from_brief(message: str, project: str | None) -> str | None:
+    if project:
+        return project.strip() or None
+    if not re.search(r"\b(build|create|make|develop|design)\b", message, re.IGNORECASE):
+        return None
+    match = re.search(r"\bfor\s+([A-Za-z0-9][A-Za-z0-9 _-]{1,80}?)(?:[.!?]|$)", message, re.IGNORECASE)
+    if not match:
+        return "untitled-project"
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", match.group(1).strip()).strip("-").lower()
+    return value or "untitled-project"
 
 
 
@@ -372,6 +400,56 @@ async def resolve_conflict(conflict_id: int, request: Request) -> RedirectRespon
             await db_session.commit()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/plans/{revision_id}/approve")
+async def approve_plan(revision_id: int, request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    if auth_manager(request).must_change_password:
+        return RedirectResponse("/change-password", status_code=303)
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    database: Database = request.app.state.database
+    async with database.sessions() as db_session:
+        try:
+            await approve_revision(db_session, revision_id)
+            await db_session.commit()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/plans/{revision_id}/reject")
+async def reject_plan(revision_id: int, request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    if auth_manager(request).must_change_password:
+        return RedirectResponse("/change-password", status_code=303)
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    reason = str(form.get("reason", "")).strip()
+    database: Database = request.app.state.database
+    async with database.sessions() as db_session:
+        revision = await revision_by_id(db_session, revision_id)
+        if revision is None:
+            raise HTTPException(status_code=404, detail="plan revision not found")
+        try:
+            await reject_revision(db_session, revision_id, reason)
+            await db_session.commit()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    manager: PlanManager = request.app.state.plan_manager
+    await manager.enqueue(
+        revision.project,
+        f"{revision.document.summary}\nOwner rejection feedback: {reason}",
+        revision_id,
+    )
     return RedirectResponse("/", status_code=303)
 
 
@@ -420,11 +498,31 @@ async def chat(payload: ChatRequest, request: Request) -> dict[str, object]:
     except Exception as exc:
         logging.getLogger(__name__).exception("chat_provider_failed")
         raise HTTPException(status_code=503, detail="model provider unavailable") from exc
+    plan_job_id = None
+    reply = result.reply
+    plan_project = project_from_brief(payload.message, payload.project)
+    if plan_project:
+        manager: PlanManager = request.app.state.plan_manager
+        plan_job_id = await manager.enqueue(plan_project, payload.message)
+        reply += "\n\nI queued a project plan for owner approval. Nothing will execute."
     return {
-        "reply": result.reply,
-        "reply_html": render_markdown(result.reply),
+        "reply": reply,
+        "reply_html": render_markdown(reply),
         "conflicts": [asdict(item) for item in result.conflicts],
+        "plan_job_id": plan_job_id,
     }
+
+
+@app.get("/plans/jobs/{job_id}")
+async def plan_job(job_id: int, request: Request) -> dict[str, object]:
+    current_session(request)
+    if auth_manager(request).must_change_password:
+        raise HTTPException(status_code=403, detail="password change required")
+    manager: PlanManager = request.app.state.plan_manager
+    job = await manager.job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="planning job not found")
+    return job
 
 
 @app.get("/projects/{project}/state")

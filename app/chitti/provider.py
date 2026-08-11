@@ -21,6 +21,10 @@ class ExtractedMemory:
 class ModelProvider(Protocol):
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str: ...
 
+    async def plan(
+        self, brief: str, project: str, beliefs: list[dict[str, object]], rejection: str | None = None
+    ) -> str: ...
+
     async def extract_memories(
         self,
         profile: str,
@@ -59,6 +63,30 @@ class LiteLLMProvider:
 
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str:
         return await self._completion([{"role": "system", "content": system}, *messages], role)
+
+    async def plan(
+        self, brief: str, project: str, beliefs: list[dict[str, object]], rejection: str | None = None
+    ) -> str:
+        memory = "\n".join(
+            f"- {item['decision_key']}: {item['decision']}" for item in beliefs
+        ) or "(none)"
+        feedback = f"\nREJECTION FEEDBACK:\n{rejection}" if rejection else ""
+        prompt = (
+            "Create a delivery plan as strict JSON with exactly these top-level keys: "
+            "title, summary, tasks, memory_decisions. Each task must have id, title, "
+            "description, dependencies, and done_condition. Dependencies are task ids. "
+            "Tasks must be ordered and independently testable. memory_decisions must list "
+            "which supplied beliefs influenced the plan, with decision_key and influence. "
+            "Do not include markdown or extra keys.\n"
+            f"PROJECT: {project}\nBRIEF: {brief}\nACTIVE BELIEFS:\n{memory}{feedback}"
+        )
+        return await self._completion(
+            [
+                {"role": "system", "content": "You create validated project plans as strict JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            "planner",
+        )
 
     async def extract_memories(
         self,
@@ -110,6 +138,39 @@ class FakeProvider:
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str:
         latest = messages[-1]["content"] if messages else ""
         return f"[fake:{role}] I heard you: {latest}"
+
+    async def plan(
+        self, brief: str, project: str, beliefs: list[dict[str, object]], rejection: str | None = None
+    ) -> str:
+        return json.dumps(
+            {
+                "title": f"{project}: {brief[:80]}",
+                "summary": f"Deliver the requested project for {project}.",
+                "memory_decisions": [
+                    {
+                        "decision_key": str(item["decision_key"]),
+                        "influence": "Applied as a project constraint.",
+                    }
+                    for item in beliefs
+                ],
+                "tasks": [
+                    {
+                        "id": "brief",
+                        "title": "Turn the brief into an implementation checklist",
+                        "description": brief,
+                        "dependencies": [],
+                        "done_condition": "The checklist is explicit, ordered, and testable.",
+                    },
+                    {
+                        "id": "review",
+                        "title": "Review the proposed delivery plan",
+                        "description": "Confirm scope, constraints, and acceptance criteria.",
+                        "dependencies": ["brief"],
+                        "done_condition": "The owner has approved the exact plan revision.",
+                    },
+                ],
+            }
+        )
 
     async def extract_memories(
         self,
