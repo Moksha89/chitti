@@ -24,6 +24,7 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
       "Would apply migrations through the normal chitti startup path" \
       "Would build chitti-sandbox:latest" \
       "Would install and enable ${RUNNER_UNIT}" \
+      "Would restart ${RUNNER_UNIT} and verify its loaded-code identity" \
       "Would create or verify the runner-only database role" \
       "Would verify schema, privileges, and container network boundaries"
   else
@@ -34,6 +35,7 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
       "Would apply migrations through the normal chitti startup path" \
       "Would build chitti-sandbox:latest" \
       "Would install and enable ${RUNNER_UNIT}" \
+      "Would restart ${RUNNER_UNIT} and verify its loaded-code identity" \
       "Would create or verify the runner-only database role" \
       "Would verify schema, privileges, and container network boundaries"
   fi
@@ -242,7 +244,40 @@ install -o root -g root -m 0644 \
   "/etc/systemd/system/${RUNNER_UNIT}"
 systemctl daemon-reload
 systemctl enable "${RUNNER_UNIT}"
+expected_runner_digest="$(
+  PYTHONPATH="${INSTALL_DIR}/app" CHITTI_CODE_IDENTITY_PATH=/run/chitti-worker/loaded-code.json \
+    "${RUNNER_PYTHON}" -c \
+    'from chitti.runtime_identity import loaded_code_digest; print(loaded_code_digest())'
+)"
+rm -f /run/chitti-worker/loaded-code.json
 systemctl restart "${RUNNER_UNIT}"
+
+for _ in {1..30}; do
+  runner_pid="$(systemctl show --property=MainPID --value "${RUNNER_UNIT}")"
+  if [[ "${runner_pid}" != "0" ]] &&
+    [[ -s /run/chitti-worker/loaded-code.json ]]; then
+    break
+  fi
+  sleep 1
+done
+runner_pid="$(systemctl show --property=MainPID --value "${RUNNER_UNIT}")"
+if [[ "${runner_pid}" == "0" ]] || [[ ! -s /run/chitti-worker/loaded-code.json ]]; then
+  echo "runner loaded-code identity was not produced after restart" >&2
+  exit 1
+fi
+RUNNER_PID="${runner_pid}" EXPECTED_RUNNER_DIGEST="${expected_runner_digest}" \
+  "${RUNNER_PYTHON}" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+identity = json.loads(Path("/run/chitti-worker/loaded-code.json").read_text())
+if str(identity.get("pid")) != os.environ["RUNNER_PID"]:
+    raise SystemExit("runner loaded-code identity belongs to a different process")
+if identity.get("digest") != os.environ["EXPECTED_RUNNER_DIGEST"]:
+    raise SystemExit("runner loaded-code identity does not match deployed code")
+PY
+echo "Runner loaded-code identity assertion passed."
 
 app_container="$(docker compose ps -q chitti)"
 [[ -n "${app_container}" ]]

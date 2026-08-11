@@ -10,6 +10,7 @@ User=root
 WorkingDirectory=/opt/chitti/app
 EnvironmentFile=/etc/chitti/worker-runner.env
 Environment=PYTHONPATH=/opt/chitti/app
+Environment=CHITTI_CODE_IDENTITY_PATH=/run/chitti-worker/loaded-code.json
 Environment=PREVIEW_ROOT=/var/lib/chitti-previews
 Environment=PREVIEW_STAGING_ROOT=/var/lib/chitti-preview-staging
 Environment=PREVIEW_TTL_HOURS=72

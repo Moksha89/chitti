@@ -35,6 +35,12 @@ placeholder password. The runner polls queued rows, claims one run at a time,
 observes durable `cancel_requested` events, and appends execution history.
 There is no inbound runner API.
 
+Deployment restarts the runner after installing the application and verifies a
+loaded-code identity emitted by that process. The identity includes the
+running PID and a digest of the imported runner, worker, provider, and tool
+modules; deployment refuses to finish if it does not match the checked-out
+code.
+
 The runner requires host root because each workspace is a per-run ext4
 filesystem backed by a file under `/var/lib/chitti-worker/runs`. The backing
 file is mounted with a loop device and its exact size is the recorded workspace
