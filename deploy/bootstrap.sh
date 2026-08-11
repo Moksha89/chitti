@@ -19,7 +19,6 @@ apt-get install -y age ca-certificates curl gnupg ufw fail2ban postgresql-client
 if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
   useradd --system --create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
 fi
-usermod -aG docker "${SERVICE_USER}" 2>/dev/null || true
 
 if ! command -v docker >/dev/null 2>&1; then
   install -m 0755 -d /etc/apt/keyrings
@@ -32,6 +31,7 @@ if ! command -v docker >/dev/null 2>&1; then
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   systemctl enable --now docker
 fi
+usermod -aG docker "${SERVICE_USER}"
 
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${INSTALL_DIR}" "${BACKUP_DIR}"
 
