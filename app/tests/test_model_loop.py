@@ -13,6 +13,7 @@ from chitti.worker import (
     _file_write_stall,
     _model_response_failure,
     _parse_tool_call,
+    _reviewer_diagnosis_messages,
     _task_done_checks,
     _tool_exchange,
     _tool_rejection_exchange,
@@ -132,6 +133,19 @@ def test_rejected_native_calls_are_answered_with_tool_results() -> None:
     assert exchange[0]["role"] == "assistant"
     assert [item["tool_call_id"] for item in exchange[1:]] == ["call-1", "call-2"]
     assert all(item["role"] == "tool" for item in exchange[1:])
+
+
+def test_reviewer_diagnosis_request_contains_no_tool_shaped_turns() -> None:
+    messages = _reviewer_diagnosis_messages(
+        "Capture page",
+        "Capture phone and desktop screenshots.",
+        "capture_screenshot",
+        "TOOL FAILURE: static export server exited",
+    )
+    assert all(message["role"] in {"system", "user"} for message in messages)
+    assert all("tool_calls" not in message for message in messages)
+    assert all(message["role"] != "tool" for message in messages)
+    assert "capture_screenshot" in messages[1]["content"]
 
 
 def test_model_tool_parser_rejects_malformed_and_unknown_shape() -> None:

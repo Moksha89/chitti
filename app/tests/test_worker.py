@@ -1,7 +1,10 @@
 import asyncio
+import importlib.util
 import subprocess
+import urllib.request
 from datetime import UTC, datetime
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 
@@ -66,6 +69,84 @@ def test_fixed_operations_are_deterministic_and_include_preview() -> None:
     assert "node_modules" in operations[-1].command[-1]
     assert ".next" in operations[-1].command[-1]
     assert ".npm-cache" in operations[-1].command[-1]
+
+
+def _capture_module():
+    script = Path(__file__).parents[2] / "sandbox" / "next_screenshot.py"
+    spec = importlib.util.spec_from_file_location("next_screenshot", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_static_capture_serves_produced_export_without_model_server(tmp_path) -> None:
+    module = _capture_module()
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "index.html").write_text("<html><body>export</body></html>")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    class Page:
+        def on(self, *_args) -> None:
+            pass
+
+        def goto(self, url, **_kwargs) -> None:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                assert response.status == 200
+
+        def wait_for_timeout(self, _milliseconds) -> None:
+            pass
+
+        def locator(self, _selector):
+            return self
+
+        def inner_text(self) -> str:
+            return "export"
+
+        def evaluate(self, _script):
+            return []
+
+        def screenshot(self, path, **_kwargs) -> None:
+            Path(path).write_bytes(b"png")
+
+        def close(self) -> None:
+            pass
+
+    class Browser:
+        def new_page(self, **_kwargs):
+            return Page()
+
+        def close(self) -> None:
+            pass
+
+    class Playwright:
+        class Chromium:
+            def launch(self):
+                return Browser()
+
+        chromium = Chromium()
+
+    class PlaywrightContext:
+        def __enter__(self):
+            return Playwright()
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+    module.capture(tmp_path, playwright_factory=lambda: PlaywrightContext())
+    assert (artifacts / "phone.png").exists()
+    assert (artifacts / "desktop.png").exists()
+    assert (artifacts / "browser-errors.json").read_text() == "[]"
+
+
+def test_static_capture_rejects_missing_export_informatively(tmp_path) -> None:
+    module = _capture_module()
+    with pytest.raises(RuntimeError, match="static export directory is missing"):
+        module._serve_export(tmp_path)
+    (tmp_path / "out").mkdir()
+    with pytest.raises(RuntimeError, match="static export directory is empty"):
+        module._serve_export(tmp_path)
 
 
 @pytest.mark.parametrize("network", ["chitti_net", "host"])
