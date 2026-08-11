@@ -9,6 +9,7 @@ from typing import cast
 from sqlalchemy import text
 
 from .db import Database
+from .provider import FakeProvider, LiteLLMProvider
 from .settings import get_settings
 from .worker import (
     DockerSandboxDispatcher,
@@ -127,8 +128,13 @@ async def execute_run(
 
     task = asyncio.create_task(dispatcher.dispatch(revision, run_id, limits))
     try:
+        deadline = asyncio.get_running_loop().time() + limits.run_timeout_seconds
         while not task.done():
             await asyncio.sleep(1)
+            if asyncio.get_running_loop().time() > deadline:
+                await dispatcher.cancel(run_id)
+                await record_event(database, run_id, "failed", "model run wall-clock budget exceeded")
+                return
             if await cancellation_requested(database, run_id):
                 await dispatcher.cancel(run_id)
         await task
@@ -144,7 +150,13 @@ async def execute_run(
 
 async def run_forever() -> None:
     database = Database(get_settings())
-    dispatcher = DockerSandboxDispatcher(database)
+    settings = get_settings()
+    provider = (
+        FakeProvider()
+        if settings.chitti_provider == "fake"
+        else LiteLLMProvider(settings.litellm_base_url, settings.litellm_master_key)
+    )
+    dispatcher = DockerSandboxDispatcher(database, model_provider=provider)
     try:
         await dispatcher.cleanup_stale_workspaces()
         while True:

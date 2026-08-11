@@ -18,7 +18,14 @@ model_list:
       model: os.environ/GLM_LITELLM_MODEL
       api_base: os.environ/GLM_API_BASE
       api_key: os.environ/GLM_CODING_API_KEY
-      max_budget: 25
+      max_budget: 2
+      budget_duration: 1d
+  - model_name: reviewer
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_base: https://api.deepseek.com
+      api_key: os.environ/DEEPSEEK_API_KEY
+      max_budget: 1
       budget_duration: 1d
   - model_name: bulk
     litellm_params:

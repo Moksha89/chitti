@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,6 +21,7 @@ from .plans import (
     revision_by_id,
     validate_approval_binding,
 )
+from .provider import ModelCompletion, ModelProvider
 
 if TYPE_CHECKING:
     from .db import Database
@@ -36,6 +38,11 @@ class WorkerLimits:
     output_bytes: int = 100 * 1024 * 1024
     workspace_bytes: int = 4 * 1024 * 1024 * 1024
     shm_size: str = "256m"
+    model_iterations: int = 8
+    model_tool_calls: int = 32
+    model_write_bytes: int = 2 * 1024 * 1024
+    model_spend_usd: float = 1.50
+    run_timeout_seconds: int = 1800
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -48,6 +55,11 @@ class WorkerLimits:
             "output_bytes": self.output_bytes,
             "workspace_bytes": self.workspace_bytes,
             "shm_size": self.shm_size,
+            "model_iterations": self.model_iterations,
+            "model_tool_calls": self.model_tool_calls,
+            "model_write_bytes": self.model_write_bytes,
+            "model_spend_usd": self.model_spend_usd,
+            "run_timeout_seconds": self.run_timeout_seconds,
             "network_policy": "public_egress_default_bridge",
             "non_root_uid": 65532,
         }
@@ -65,6 +77,11 @@ class WorkerLimits:
             output_bytes=int(cast(int, values.get("output_bytes", artifact_bytes))),
             workspace_bytes=int(cast(int, values.get("workspace_bytes", artifact_bytes))),
             shm_size=str(values["shm_size"]),
+            model_iterations=int(cast(int, values.get("model_iterations", 8))),
+            model_tool_calls=int(cast(int, values.get("model_tool_calls", 32))),
+            model_write_bytes=int(cast(int, values.get("model_write_bytes", 2 * 1024 * 1024))),
+            model_spend_usd=float(cast(float, values.get("model_spend_usd", 1.50))),
+            run_timeout_seconds=int(cast(int, values.get("run_timeout_seconds", 1800))),
         )
 
 
@@ -92,10 +109,12 @@ class DockerSandboxDispatcher:
         database: Database,
         image: str = "chitti-sandbox:latest",
         workspace_root: Path = Path("/var/lib/chitti-worker/runs"),
+        model_provider: ModelProvider | None = None,
     ) -> None:
         self.database = database
         self.image = image
         self.workspace_root = workspace_root
+        self.model_provider = model_provider
         self._containers: dict[int, str] = {}
         self._processes: dict[int, subprocess.Popen[bytes]] = {}
         self._cancelled: set[int] = set()
@@ -131,6 +150,9 @@ class DockerSandboxDispatcher:
             await self._mount_workspace(workspace, limits)
             mounted = True
             await self._event(run_id, "running", "run started")
+            if self.model_provider is not None:
+                await self._dispatch_model_one(revision, run_id, limits, workspace)
+                return
             for index, operation in enumerate(fixed_operations(revision)):
                 if run_id in self._cancelled:
                     await self._event(run_id, "cancelled", "cancelled before operation")
@@ -181,6 +203,376 @@ class DockerSandboxDispatcher:
                 await self._unmount_workspace(workspace)
             shutil.rmtree(workspace, ignore_errors=True)
             self._workspace_image(workspace).unlink(missing_ok=True)
+
+    async def _dispatch_model_one(
+        self, revision: PlanRevision, run_id: int, limits: WorkerLimits, workspace: Path
+    ) -> None:
+        assert self.model_provider is not None
+        started = time.monotonic()
+        (workspace / "artifacts").mkdir(parents=True, exist_ok=True)
+        init = FixedOperation("runner", "git-init", ("sh", "-c", "git init -q /workspace"))
+        init_result, _init_out, init_err = await self._run_container(
+            run_id, self._docker_command(init, workspace, run_id, limits), limits
+        )
+        if init_result.returncode:
+            raise RuntimeError(init_err[-1000:] or "git initialization failed")
+        await self._operation(
+            run_id, init, 0, "passed", _init_out, init_err,
+            init_result.returncode, datetime.now(UTC),
+        )
+        async with self.database.sessions() as session:
+            result = await session.execute(
+                text(
+                    "SELECT d.decision_key, d.decision FROM decisions d "
+                    "LEFT JOIN decision_forgets f ON f.decision_id = d.id "
+                    "WHERE d.superseded_by IS NULL AND f.id IS NULL ORDER BY d.id"
+                )
+            )
+            beliefs = [dict(row._mapping) for row in result]
+        stable = _model_system_prompt()
+        spent = 0.0
+        calls = 0
+        writes = 0
+        operation_index = 1
+        completed_commands: set[str] = set()
+        for task in revision.document.tasks:
+            route = "coder"
+            failures = 0
+            messages = [
+                {"role": "system", "content": stable},
+                {
+                    "role": "user",
+                    "content": (
+                        f"PLAN:\n{revision.brief}\n{revision.document.summary}\n"
+                        f"BELIEFS:\n{json.dumps(beliefs)}\n"
+                        f"TASK {task.id}: {task.title}\n{task.description}\n"
+                        f"DONE CONDITION: {task.done_condition}"
+                    ),
+                },
+            ]
+            done = False
+            for iteration in range(1, limits.model_iterations + 1):
+                if time.monotonic() - started > limits.run_timeout_seconds:
+                    raise RuntimeError("model run wall-clock budget exceeded")
+                if calls >= limits.model_tool_calls:
+                    raise RuntimeError("model tool-call budget exceeded")
+                try:
+                    completion = await self.model_provider.agent_completion(messages, route)
+                except Exception as exc:
+                    failure = ModelCompletion(
+                        content=f"model call failed: {str(exc)[:1000]}",
+                        model=route,
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                        total_tokens=0,
+                        cost_usd=0.0,
+                    )
+                    await self._record_model_call(
+                        run_id, task.id, iteration, route, failure,
+                        prompt=json.dumps(messages, separators=(",", ":")),
+                    )
+                    await self._event(
+                        run_id, "model_tool_failed",
+                        f"model call failed on route {route}: {str(exc)[:1000]}",
+                        task_id=task.id,
+                    )
+                    raise
+                calls += 1
+                spent += completion.cost_usd
+                if spent > limits.model_spend_usd:
+                    raise RuntimeError("model spend budget exceeded")
+                await self._record_model_call(
+                    run_id, task.id, iteration, route, completion,
+                    prompt=json.dumps(messages, separators=(",", ":")),
+                )
+                if route == "reviewer":
+                    messages.extend(
+                        [
+                            {"role": "assistant", "content": completion.content[:16000]},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Diagnosis received. Return to the coder route and make "
+                                    "one corrective attempt using that diagnosis."
+                                ),
+                            },
+                        ]
+                    )
+                    route = "coder"
+                    continue
+                try:
+                    tool, arguments = _parse_tool_call(completion.content)
+                except ValueError as exc:
+                    await self._event(
+                        run_id, "model_tool_failed", str(exc)[:1000], task_id=task.id
+                    )
+                    messages.append(
+                        {"role": "user", "content": f"TOOL FAILURE: {str(exc)[:1000]}"}
+                    )
+                    continue
+                if tool == "finish" and {"build", "test"} <= completed_commands:
+                    await self._event(
+                        run_id, "task_finished",
+                        str(arguments.get("summary", ""))[:2000], task_id=task.id,
+                    )
+                    done = True
+                    break
+                if tool == "finish":
+                    failures += 1
+                    result_text = "TOOL FAILURE: done condition requires successful build and test commands"
+                    await self._event(run_id, "model_tool_failed", result_text, task_id=task.id)
+                    messages.extend(
+                        [
+                            {"role": "assistant", "content": completion.content[:16000]},
+                            {"role": "user", "content": result_text},
+                        ]
+                    )
+                    continue
+                try:
+                    result_text, written, operation_index = await self._execute_model_tool(
+                        run_id, task.id, operation_index, tool, arguments,
+                        workspace, limits, route,
+                    )
+                    writes += written
+                    if writes > limits.model_write_bytes:
+                        raise RuntimeError("model write-byte budget exceeded")
+                    if tool == "run_command":
+                        completed_commands.add(str(arguments.get("name", "")))
+                    failures = 0
+                except Exception as exc:
+                    failures += 1
+                    result_text = f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
+                    await self._event(run_id, "model_tool_failed", result_text, task_id=task.id)
+                    if failures >= 2 and route == "coder":
+                        route = "reviewer"
+                        await self._event(
+                            run_id, "model_route_switched",
+                            "switched to reviewer after two failures on the same task",
+                            task_id=task.id,
+                        )
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": completion.content[:16000]},
+                        {"role": "user", "content": result_text[:16000]},
+                    ]
+                )
+            if not done:
+                raise RuntimeError(f"task {task.id} exceeded model iteration budget")
+        await self._review_run(run_id, revision, limits, spent, calls)
+        diff = FixedOperation(
+            "runner",
+            "git-diff",
+            (
+                "sh", "-c",
+                "cd /workspace && git -c safe.directory=/workspace add -A -f -- . "
+                "':(exclude)node_modules' ':(exclude)node_modules/**' "
+                "':(exclude).next' ':(exclude).next/**' "
+                "':(exclude).npm-cache' ':(exclude).npm-cache/**' "
+                "':(exclude)artifacts' ':(exclude)artifacts/**' && "
+                "git -c safe.directory=/workspace diff --cached --no-ext-diff "
+                "> artifacts/workspace.diff",
+            ),
+        )
+        diff_result, _diff_out, diff_err = await self._run_container(
+            run_id, self._docker_command(diff, workspace, run_id, limits), limits
+        )
+        if diff_result.returncode:
+            raise RuntimeError(diff_err[-1000:] or "git diff failed")
+        await self._operation(
+            run_id, diff, operation_index, "passed", _diff_out, diff_err,
+            diff_result.returncode, datetime.now(UTC),
+        )
+        await self._capture_workspace_artifacts(run_id, workspace, limits)
+        await self._event(run_id, "passed", "model tasks and reviewer passed")
+
+    async def _execute_model_tool(
+        self, run_id: int, task_id: str, operation_index: int, tool: str,
+        arguments: dict[str, object], workspace: Path, limits: WorkerLimits, route: str,
+    ) -> tuple[str, int, int]:
+        if tool == "list_files":
+            path = _confined_path(workspace, str(arguments.get("path", ".")))
+            return json.dumps(sorted(item.name for item in path.iterdir())[:200]), 0, operation_index
+        if tool == "read_file":
+            path = _confined_path(workspace, str(arguments.get("path", "")))
+            maximum = min(int(cast(int, arguments.get("max_bytes", 65536))), 65536)
+            return path.read_bytes()[:maximum].decode("utf-8", errors="replace"), 0, operation_index
+        if tool == "write_file":
+            if route != "coder":
+                raise ValueError("reviewer route cannot write files")
+            path = _confined_path(workspace, str(arguments.get("path", "")))
+            content = str(arguments.get("content", ""))
+            encoded = content.encode()
+            if len(encoded) > limits.model_write_bytes:
+                raise ValueError("single write exceeds model write budget")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(encoded)
+            return f"wrote {len(encoded)} bytes", len(encoded), operation_index
+        if tool == "capture_screenshot":
+            route_value = str(arguments.get("route", "/"))
+            width = int(cast(int, arguments.get("width", 390)))
+            if not route_value.startswith("/") or width not in {390, 1440}:
+                raise ValueError("invalid screenshot route or width")
+            operation = FixedOperation(task_id, "capture-screenshot", ("python3", "/opt/next_screenshot.py"))
+            result, stdout, stderr = await self._run_container(
+                run_id, self._docker_command(operation, workspace, run_id, limits), limits
+            )
+            operation_index += 1
+            await self._operation(
+                run_id, operation, operation_index,
+                "passed" if result.returncode == 0 else "failed",
+                stdout, stderr, result.returncode, datetime.now(UTC),
+            )
+            if result.returncode:
+                raise RuntimeError(stderr[-1000:] or "screenshot failed")
+            return "screenshots captured in artifacts/", 0, operation_index
+        if tool == "run_command":
+            name = str(arguments.get("name", ""))
+            if arguments.get("args", []) not in ([], None):
+                raise ValueError("arbitrary command arguments are not allowed")
+            commands = {
+                "install": ("npm-install", ("sh", "-c", "npm ci --ignore-scripts --no-audit --no-fund"), "bridge"),
+                "build": ("next-build", ("sh", "-c", "npm run build"), "none"),
+                "test": (
+                    "run-tests",
+                    (
+                        "node",
+                        "-e",
+                        "const p=require('./package.json'); "
+                        "if (!p.dependencies.next) process.exit(1)",
+                    ),
+                    "none",
+                ),
+            }
+            if name not in commands:
+                raise ValueError("unknown allowlisted command")
+            op_name, command, network = commands[name]
+            operation = FixedOperation(task_id, op_name, command, network=network)
+            result, stdout, stderr = await self._run_container(
+                run_id, self._docker_command(operation, workspace, run_id, limits), limits
+            )
+            operation_index += 1
+            status = "passed" if result.returncode == 0 else "failed"
+            await self._operation(
+                run_id, operation, operation_index, status, stdout, stderr,
+                result.returncode, datetime.now(UTC),
+            )
+            if result.returncode:
+                raise RuntimeError((stderr or stdout)[-2000:] or f"{name} failed")
+            return (stdout or "command passed")[-4000:], 0, operation_index
+        if tool == "finish":
+            return str(arguments.get("summary", "")), 0, operation_index
+        raise ValueError(f"unknown model tool: {tool}")
+
+    async def _review_run(
+        self, run_id: int, revision: PlanRevision, limits: WorkerLimits,
+        spent: float, calls: int,
+    ) -> None:
+        assert self.model_provider is not None
+        review_messages = [
+            {"role": "system", "content": _reviewer_system_prompt()},
+            {
+                "role": "user",
+                "content": f"Review completed run for {revision.document.title}. "
+                "Build, tests, diff, and screenshots are recorded artifacts.",
+            },
+        ]
+        try:
+            completion = await self.model_provider.agent_completion(review_messages, "reviewer")
+        except Exception as exc:
+            failure = ModelCompletion(
+                content=f"reviewer call failed: {str(exc)[:1000]}",
+                model="reviewer",
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+                cost_usd=0.0,
+            )
+            await self._record_model_call(
+                run_id, "review", calls + 1, "reviewer", failure,
+                kind="reviewer_report",
+                prompt=json.dumps(review_messages, separators=(",", ":")),
+            )
+            raise
+        if spent + completion.cost_usd > limits.model_spend_usd:
+            raise RuntimeError("model spend budget exceeded during review")
+        await self._record_model_call(
+            run_id, "review", calls + 1, "reviewer", completion,
+            kind="reviewer_report",
+            prompt=json.dumps(review_messages, separators=(",", ":")),
+        )
+        await self._event(run_id, "review_complete", completion.content[:4000])
+
+    async def _record_model_call(
+        self, run_id: int, task_id: str, iteration: int, route: str,
+        completion: ModelCompletion, kind: str = "model_response",
+        prompt: str = "",
+    ) -> None:
+        prompt_bytes = prompt[:16000].encode()
+        content = completion.content[:16000].encode()
+        async with self.database.sessions() as session:
+            result = await session.execute(
+                text(
+                    "INSERT INTO worker_model_calls "
+                    "(run_id, task_id, iteration, route, model, prompt_tokens, "
+                    "completion_tokens, total_tokens, cost_usd) VALUES "
+                    "(:run_id, :task_id, :iteration, :route, :model, :prompt_tokens, "
+                    ":completion_tokens, :total_tokens, :cost_usd) RETURNING id"
+                ),
+                {
+                    "run_id": run_id, "task_id": task_id, "iteration": iteration,
+                    "route": route, "model": completion.model,
+                    "prompt_tokens": completion.prompt_tokens,
+                    "completion_tokens": completion.completion_tokens,
+                    "total_tokens": completion.total_tokens,
+                    "cost_usd": completion.cost_usd,
+                },
+            )
+            call_id = int(result.scalar_one())
+            artifact = await session.execute(
+                text(
+                    "INSERT INTO worker_artifacts "
+                    "(run_id, kind, path, sha256, byte_size) "
+                    "VALUES (:run_id, :kind, :path, :sha256, :byte_size) RETURNING id"
+                ),
+                {
+                    "run_id": run_id, "kind": kind,
+                    "path": f"model_calls/{call_id}/response.json",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "byte_size": len(content),
+                },
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO worker_artifact_payloads (artifact_id, content) "
+                    "VALUES (:artifact_id, :content)"
+                ),
+                {"artifact_id": int(artifact.scalar_one()), "content": content},
+            )
+            prompt_artifact = await session.execute(
+                text(
+                    "INSERT INTO worker_artifacts "
+                    "(run_id, kind, path, sha256, byte_size) "
+                    "VALUES (:run_id, 'model_prompt', :path, :sha256, :byte_size) "
+                    "RETURNING id"
+                ),
+                {
+                    "run_id": run_id,
+                    "path": f"model_calls/{call_id}/prompt.json",
+                    "sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+                    "byte_size": len(prompt_bytes),
+                },
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO worker_artifact_payloads (artifact_id, content) "
+                    "VALUES (:artifact_id, :content)"
+                ),
+                {
+                    "artifact_id": int(prompt_artifact.scalar_one()),
+                    "content": prompt_bytes,
+                },
+            )
+            await session.commit()
 
     async def _mount_workspace(self, workspace: Path, limits: WorkerLimits) -> None:
         image = self._workspace_image(workspace)
@@ -578,12 +970,74 @@ class WorkerRunManager:
                 ),
                 {"run_id": run_id},
             )
+            model_calls = await session.execute(
+                text(
+                    "SELECT id, task_id, iteration, route, model, prompt_tokens, "
+                    "completion_tokens, total_tokens, cost_usd, created_at "
+                    "FROM worker_model_calls WHERE run_id = :run_id ORDER BY id"
+                ),
+                {"run_id": run_id},
+            )
+            model_call_rows = [dict(row._mapping) for row in model_calls]
             return {
                 "run": dict(run),
                 "events": [dict(row._mapping) for row in events],
                 "operations": [dict(row._mapping) for row in operations],
                 "artifacts": [dict(row._mapping) for row in artifacts],
+                "model_calls": model_call_rows,
+                "token_totals": sum(int(row["total_tokens"]) for row in model_call_rows),
+                "cost_total_usd": sum(float(row["cost_usd"]) for row in model_call_rows),
             }
+
+def _confined_path(workspace: Path, requested: str) -> Path:
+    if not requested or "\x00" in requested:
+        raise ValueError("invalid workspace path")
+    relative = Path(requested)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("workspace path escapes sandbox")
+    if any(part.lower() in {".env", ".env.local", "credentials", "secrets"} for part in relative.parts):
+        raise ValueError("sensitive workspace path is not accessible")
+    root = workspace.resolve()
+    candidate = (root / relative).resolve(strict=False)
+    if candidate != root and root not in candidate.parents:
+        raise ValueError("workspace path escapes sandbox")
+    return candidate
+
+
+def _parse_tool_call(content: str) -> tuple[str, dict[str, object]]:
+    try:
+        value = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError("model response was not valid JSON") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("tool"), str):
+        raise ValueError("model response did not contain one tool call")
+    arguments = value.get("arguments", {})
+    if not isinstance(arguments, dict):
+        raise ValueError("tool arguments must be an object")
+    return str(value["tool"]), {str(key): item for key, item in arguments.items()}
+
+
+def _model_system_prompt() -> str:
+    return (
+        "Stable worker rules and tool schemas come first. Emit exactly one strict JSON "
+        "object per response and never emit shell commands. Tools:\n"
+        '{"tool":"list_files","arguments":{"path":"."}}\n'
+        '{"tool":"read_file","arguments":{"path":"app/page.js","max_bytes":65536}}\n'
+        '{"tool":"write_file","arguments":{"path":"app/page.js","content":"..."}}\n'
+        '{"tool":"run_command","arguments":{"name":"install|build|test","args":[]}}\n'
+        '{"tool":"capture_screenshot","arguments":{"route":"/","width":390}}\n'
+        '{"tool":"finish","arguments":{"summary":"done"}}\n'
+        "All paths are relative to the disposable workspace. No .env, secrets, "
+        "credentials, arbitrary argv, shell passthrough, or network tool exists."
+    )
+
+
+def _reviewer_system_prompt() -> str:
+    return (
+        "You are the reviewer route. Return one strict JSON object using only the "
+        '{"tool":"finish","arguments":{"summary":"..."}} tool. '
+        "Do not write files or propose shell commands."
+    )
 
 
 def fixed_operations(revision: PlanRevision) -> tuple[FixedOperation, ...]:
