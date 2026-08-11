@@ -30,7 +30,7 @@ from .plans import (
     reject_revision,
     revision_by_id,
 )
-from .previews import safe_preview_file, validate_result_binding
+from .previews import safe_preview_file
 from .project_state import ProjectState
 from .provider import FakeProvider, LiteLLMProvider
 from .service import ChittiService
@@ -489,6 +489,16 @@ async def plan_page(revision_id: int, request: Request) -> HTMLResponse | Redire
                 {"run_id": int(run["run"]["id"])},
             )
             run["promotion"] = promotion_result.mappings().one_or_none()
+            promotion_event_result = await db_session.execute(
+                text(
+                    "SELECT status, detail FROM worker_run_events "
+                    "WHERE run_id = :run_id AND status IN "
+                    "('preview_failed', 'preview_blocked') "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"run_id": int(run["run"]["id"])},
+            )
+            run["promotion_event"] = promotion_event_result.mappings().one_or_none()
             reviewer_result = await db_session.execute(
                 text(
                     "SELECT p.content FROM worker_artifacts a "
@@ -547,17 +557,6 @@ async def approve_result(run_id: int, request: Request) -> RedirectResponse:
                 status_code=400,
                 detail="this run is not promotable; static export evidence is missing",
             )
-        if not validate_result_binding(
-            revision_hash=str(manifest["revision_content_hash"]),
-            manifest_revision_hash=str(manifest["manifest_revision_hash"]),
-            approval_manifest_digest=str(manifest["digest"]),
-            manifest_digest=str(manifest["digest"]),
-            approval_reviewer_sha256=str(manifest["reviewer_sha256"]),
-            reviewer_sha256=str(manifest["reviewer_sha256"]),
-            approval_diff_sha256=str(manifest["diff_sha256"]),
-            diff_sha256=str(manifest["diff_sha256"]),
-        ):
-            raise HTTPException(status_code=409, detail="result approval binding failed")
         try:
             await db_session.execute(
                 text(
@@ -665,12 +664,21 @@ async def preview_file(preview_id: str, path: str, request: Request) -> Streamin
         )
         if result.scalar_one_or_none() is None:
             raise HTTPException(status_code=404, detail="preview not found")
-    try:
-        file_descriptor, filename = safe_preview_file(
-            Path(request.app.state.settings.preview_root), preview_id, path
-        )
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=404, detail="preview file not found") from exc
+    candidates = [path]
+    if not path or path.endswith("/"):
+        candidates.insert(0, f"{path}index.html")
+    file_descriptor = None
+    filename = ""
+    for candidate in candidates:
+        try:
+            file_descriptor, filename = safe_preview_file(
+                Path(request.app.state.settings.preview_root), preview_id, candidate
+            )
+            break
+        except (OSError, ValueError):
+            continue
+    if file_descriptor is None:
+        raise HTTPException(status_code=404, detail="preview file not found")
     media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return StreamingResponse(os.fdopen(file_descriptor, "rb"), media_type=media_type)
 

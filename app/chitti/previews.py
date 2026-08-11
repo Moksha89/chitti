@@ -49,25 +49,6 @@ class ExportManifest:
         ]
 
 
-def validate_result_binding(
-    *,
-    revision_hash: str,
-    manifest_revision_hash: str,
-    approval_manifest_digest: str,
-    manifest_digest: str,
-    approval_reviewer_sha256: str,
-    reviewer_sha256: str,
-    approval_diff_sha256: str,
-    diff_sha256: str,
-) -> bool:
-    return (
-        revision_hash == manifest_revision_hash
-        and approval_manifest_digest == manifest_digest
-        and approval_reviewer_sha256 == reviewer_sha256
-        and approval_diff_sha256 == diff_sha256
-    )
-
-
 def preview_is_active(expires_at: datetime, now: datetime | None = None) -> bool:
     current = now or datetime.now(UTC)
     return expires_at > current
@@ -165,12 +146,12 @@ def build_manifest(root: Path) -> ExportManifest:
                 if not item.is_file(follow_symlinks=False):
                     raise ValueError(f"preview entry is not a regular file: {path}")
                 size, digest = _read_regular(directory_fd, item.name, MAX_PREVIEW_FILE_BYTES)
-                total_bytes += size
-                if total_bytes > MAX_PREVIEW_TOTAL_BYTES:
+                if total_bytes + size > MAX_PREVIEW_TOTAL_BYTES:
                     raise ValueError("preview total size limit exceeded")
-                entries.append(ManifestEntry(path, size, digest))
-                if len(entries) > MAX_PREVIEW_FILES:
+                if len(entries) + 1 > MAX_PREVIEW_FILES:
                     raise ValueError("preview file-count limit exceeded")
+                total_bytes += size
+                entries.append(ManifestEntry(path, size, digest))
 
     try:
         walk(root_fd, "", 0)
