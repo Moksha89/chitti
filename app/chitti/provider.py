@@ -18,6 +18,16 @@ class ExtractedMemory:
     source: str = "chitti_inferred"
 
 
+@dataclass(frozen=True)
+class ModelCompletion:
+    content: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cost_usd: float
+
+
 class ModelProvider(Protocol):
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str: ...
 
@@ -32,6 +42,10 @@ class ModelProvider(Protocol):
         assistant_message: str,
         existing_keys: list[str] | None = None,
     ) -> list[ExtractedMemory]: ...
+
+    async def agent_completion(
+        self, messages: list[dict[str, str]], role: str
+    ) -> ModelCompletion: ...
 
 
 def _json_payload(text: str) -> object:
@@ -51,15 +65,38 @@ class LiteLLMProvider:
         self.api_key = api_key
 
     async def _completion(self, messages: list[dict[str, str]], role: str) -> str:
+        return (await self.agent_completion(messages, role)).content
+
+    async def agent_completion(
+        self, messages: list[dict[str, str]], role: str
+    ) -> ModelCompletion:
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
                 self.url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": role, "messages": messages, "temperature": 0.2},
+                json={
+                    "model": role,
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "max_tokens": 1200 if role == "reviewer" else 4096,
+                    "thinking": {"type": "disabled"},
+                },
             )
             response.raise_for_status()
             body = response.json()
-            return str(body["choices"][0]["message"]["content"])
+            usage = body.get("usage") or {}
+            prompt_tokens = int(usage.get("prompt_tokens", 0))
+            completion_tokens = int(usage.get("completion_tokens", 0))
+            total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens))
+            cost = body.get("cost", response.headers.get("x-litellm-response-cost", 0.0))
+            return ModelCompletion(
+                content=str(body["choices"][0]["message"]["content"]),
+                model=str(body.get("model", role)),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cost_usd=float(cost or 0.0),
+            )
 
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str:
         return await self._completion([{"role": "system", "content": system}, *messages], role)
@@ -194,3 +231,17 @@ class FakeProvider:
                 ExtractedMemory("hard_rule", value, "User stated a hard rule.", None, "user_stated")
             )
         return memories
+
+    async def agent_completion(
+        self, messages: list[dict[str, str]], role: str
+    ) -> ModelCompletion:
+        return ModelCompletion(
+            content=json.dumps(
+                {"tool": "finish", "arguments": {"summary": "Fake provider completed the task."}}
+            ),
+            model=f"fake:{role}",
+            prompt_tokens=sum(len(item["content"]) for item in messages),
+            completion_tokens=12,
+            total_tokens=sum(len(item["content"]) for item in messages) + 12,
+            cost_usd=0.0,
+        )

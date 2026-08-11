@@ -10,7 +10,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field
@@ -20,12 +20,19 @@ from .auth import AuthManager, Session
 from .db import Database
 from .embedding import FakeEmbedder, get_embedder
 from .memory import MemoryStore
-from .plans import PlanManager, approve_revision, latest_revisions, reject_revision, revision_by_id
+from .plans import (
+    PlanManager,
+    approve_revision,
+    latest_revisions,
+    reject_revision,
+    revision_by_id,
+)
 from .project_state import ProjectState
 from .provider import FakeProvider, LiteLLMProvider
 from .service import ChittiService
 from .settings import Settings, get_settings
 from .telegram import TelegramPoller
+from .worker import WorkerLimits, WorkerRunManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -145,6 +152,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.database = database
     app.state.service = service
     app.state.plan_manager = PlanManager(database, service.provider, service.memory)
+    app.state.worker_manager = WorkerRunManager(database)
     app.state.project_state = ProjectState(settings.project_root)
     app.state.auth = auth
     await app.state.plan_manager.resume_queued()
@@ -155,7 +163,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await database.close()
 
 
-app = FastAPI(title="Chitti", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Chitti", version="0.3.0", lifespan=lifespan)
 template_directory = "/app/templates"
 if not Path(template_directory).exists():
     template_directory = str(Path(__file__).resolve().parents[1] / "templates")
@@ -419,6 +427,122 @@ async def approve_plan(revision_id: int, request: Request) -> RedirectResponse:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     return RedirectResponse("/", status_code=303)
+
+
+@app.get("/plans/{revision_id}", response_class=HTMLResponse, response_model=None)
+async def plan_page(revision_id: int, request: Request) -> HTMLResponse | RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    if auth_manager(request).must_change_password:
+        return RedirectResponse("/change-password", status_code=303)
+    database: Database = request.app.state.database
+    async with database.sessions() as db_session:
+        revision = await revision_by_id(db_session, revision_id)
+        if revision is None:
+            raise HTTPException(status_code=404, detail="plan revision not found")
+        approval_result = await db_session.execute(
+            text(
+                "SELECT decision, reason, content_hash, created_at "
+                "FROM plan_approvals WHERE revision_id = :revision ORDER BY id DESC LIMIT 1"
+            ),
+            {"revision": revision_id},
+        )
+        approval = approval_result.mappings().one_or_none()
+        events = await db_session.execute(
+            text(
+                "SELECT task_id, status FROM plan_task_events "
+                "WHERE revision_id = :revision ORDER BY id"
+            ),
+            {"revision": revision_id},
+        )
+        task_statuses: dict[str, str] = {}
+        for event in events:
+            task_statuses[str(event.task_id)] = str(event.status)
+        runs_result = await db_session.execute(
+            text(
+                "SELECT id FROM worker_runs WHERE revision_id = :revision ORDER BY id DESC"
+            ),
+            {"revision": revision_id},
+        )
+        runs = [
+            await request.app.state.worker_manager.detail(int(row.id))
+            for row in runs_result
+        ]
+    return templates.TemplateResponse(
+        request=request,
+        name="plan.html",
+        context={
+            "csrf_token": session.csrf_token,
+            "revision": revision,
+            "approval": dict(approval) if approval else None,
+            "task_statuses": task_statuses,
+            "runs": [run for run in runs if run is not None],
+        },
+    )
+
+
+@app.post("/plans/{revision_id}/runs")
+async def start_run(revision_id: int, request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    if auth_manager(request).must_change_password:
+        return RedirectResponse("/change-password", status_code=303)
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    manager: WorkerRunManager = request.app.state.worker_manager
+    try:
+        run_id = await manager.enqueue(revision_id, WorkerLimits())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse(f"/plans/{revision_id}?run={run_id}", status_code=303)
+
+
+@app.post("/runs/{run_id}/cancel")
+async def cancel_run(run_id: int, request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    await request.app.state.worker_manager.cancel(run_id)
+    return RedirectResponse(request.headers.get("referer", "/"), status_code=303)
+
+
+@app.get("/runs/{run_id}")
+async def run_detail(run_id: int, request: Request) -> dict[str, object]:
+    current_session(request)
+    detail = await request.app.state.worker_manager.detail(run_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="worker run not found")
+    return cast(dict[str, object], detail)
+
+
+@app.get("/runs/{run_id}/artifacts/{artifact_id}")
+async def worker_artifact(run_id: int, artifact_id: int, request: Request) -> Response:
+    current_session(request)
+    database: Database = request.app.state.database
+    async with database.sessions() as session:
+        result = await session.execute(
+            text(
+                "SELECT a.kind, p.content FROM worker_artifacts a "
+                "LEFT JOIN worker_artifact_payloads p ON p.artifact_id = a.id "
+                "WHERE a.id = :artifact AND a.run_id = :run"
+            ),
+            {"artifact": artifact_id, "run": run_id},
+        )
+        artifact = result.mappings().one_or_none()
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="worker artifact not found")
+    if artifact["content"] is None:
+        raise HTTPException(status_code=410, detail="artifact payload has expired")
+    kind = str(artifact["kind"])
+    media_type = "image/png" if kind == "screenshot" else "text/plain"
+    return Response(content=bytes(artifact["content"]), media_type=media_type)
 
 
 @app.post("/plans/{revision_id}/reject")

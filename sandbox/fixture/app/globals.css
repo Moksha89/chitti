@@ -1,0 +1,86 @@
+:root {
+  color-scheme: dark;
+  font-family: Arial, Helvetica, sans-serif;
+  background: #0b0a16;
+  color: #f7f5ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 78% 20%, rgba(124, 92, 255, 0.34), transparent 34rem),
+    linear-gradient(135deg, #0b0a16 0%, #151128 100%);
+}
+
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  align-items: center;
+  gap: 2rem;
+  max-width: 1240px;
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 4rem 6vw;
+}
+
+.copy {
+  max-width: 34rem;
+}
+
+.eyebrow {
+  color: #a99bff;
+  font-size: 0.75rem;
+  letter-spacing: 0.22em;
+}
+
+h1 {
+  margin: 1rem 0;
+  font-size: clamp(3rem, 7vw, 6.5rem);
+  line-height: 0.95;
+}
+
+.lede {
+  max-width: 30rem;
+  color: #c4bfd9;
+  font-size: 1.1rem;
+  line-height: 1.6;
+}
+
+button {
+  margin-top: 1.4rem;
+  padding: 0.9rem 1.2rem;
+  border: 0;
+  border-radius: 999px;
+  background: #f7f5ff;
+  color: #171129;
+  font-weight: 700;
+}
+
+.scene {
+  height: min(70vh, 680px);
+  min-height: 360px;
+  border: 1px solid rgba(220, 214, 255, 0.16);
+  border-radius: 2rem;
+  background: rgba(16, 12, 35, 0.48);
+  box-shadow: 0 2rem 7rem rgba(0, 0, 0, 0.28);
+}
+
+@media (max-width: 760px) {
+  .hero {
+    grid-template-columns: 1fr;
+    padding: 2rem 1.25rem;
+  }
+
+  .scene {
+    height: 52vh;
+    min-height: 300px;
+  }
+}
