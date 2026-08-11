@@ -54,12 +54,14 @@ provider-side prefix caching has a stable candidate. Provider cache hits are
 reported by provider usage metadata when available; do not assume every request
 will hit.
 
-Belief slots use canonicalized keys plus cosine similarity over the normalized
-key-and-value subject. The candidate threshold is `0.82`; exact canonical-key
-matches are always candidates, while unrelated subjects below the threshold
-remain separate. Forgetting a belief appends a marker in `decision_forgets`
-instead of deleting or mutating the original decision. `DISPLAY_TIMEZONE`
-controls the dashboard greeting and defaults to `Asia/Dubai`.
+Belief slots use canonicalized key reuse as the matching mechanism. Earlier
+experiments with value-inclusive and subject-only embeddings did not separate
+reversals from topically adjacent beliefs reliably, so the persisted
+`decision_embeddings` table is retained only as historical derived data and is
+not used for slot matching. Forgetting a belief appends a marker in
+`decision_forgets` instead of deleting or mutating the original decision.
+`DISPLAY_TIMEZONE` controls the dashboard greeting and defaults to
+`Asia/Dubai`.
 
 ## Run locally
 

@@ -71,8 +71,9 @@ class LiteLLMProvider:
         prompt = (
             "Extract only durable facts, preferences, or decisions from this turn. "
             "Return a JSON array of objects with key, value, rationale, project, source. "
-            "Write each value as a complete, self-contained statement that a person can "
-            "understand without the key. Never return a bare time, color, product name, "
+            "Write each value as a complete, self-contained direct statement of the rule "
+            "that a person can understand without the key. Use first person or imperative "
+            "wording as appropriate; do not write 'The user ...'. Never return a bare time, color, product name, "
             "framework name, version, or code; include the subject while preserving the "
             "exact value. "
             "Use source user_stated when the user explicitly states it, otherwise "

@@ -2,7 +2,6 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from math import sqrt
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,9 +28,6 @@ class Recall:
     similarity: float
 
 
-BELIEF_MATCH_THRESHOLD = 0.82
-
-
 def normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
 
@@ -44,17 +40,8 @@ def normalize_key(value: str) -> str:
     return key
 
 
-def belief_subject(key: str, value: str) -> str:
-    return f"{normalize_key(key)}: {normalize(value)}"
-
-
-def cosine_similarity(left: list[float], right: list[float]) -> float:
-    numerator = sum(a * b for a, b in zip(left, right, strict=False))
-    left_norm = sqrt(sum(value * value for value in left))
-    right_norm = sqrt(sum(value * value for value in right))
-    if not left_norm or not right_norm:
-        return 0.0
-    return numerator / (left_norm * right_norm)
+def belief_subject(key: str) -> str:
+    return normalize_key(key)
 
 
 class MemoryStore:
@@ -75,38 +62,7 @@ class MemoryStore:
                 "key": normalize_key(item.key),
             },
         )
-        decision_id = int(result.scalar_one())
-        await self._insert_embedding(session, decision_id, item.key, item.value)
-        return decision_id
-
-    async def _insert_embedding(
-        self, session: AsyncSession, decision_id: int, key: str, value: str
-    ) -> None:
-        await session.execute(
-            text(
-                "INSERT INTO decision_embeddings (decision_id, key_normalized, embedding) "
-                "VALUES (:id, :key, CAST(:embedding AS vector)) "
-                "ON CONFLICT (decision_id) DO NOTHING"
-            ),
-            {
-                "id": decision_id,
-                "key": normalize_key(key),
-                "embedding": vector_literal(self.embedder.embed(belief_subject(key, value))),
-            },
-        )
-
-    async def ensure_belief_embeddings(self, session: AsyncSession) -> None:
-        result = await session.execute(
-            text(
-                "SELECT d.id, d.decision_key, d.decision FROM decisions d "
-                "LEFT JOIN decision_embeddings e ON e.decision_id = d.id "
-                "WHERE e.decision_id IS NULL"
-            )
-        )
-        for row in result:
-            await self._insert_embedding(
-                session, int(row.id), str(row.decision_key), str(row.decision)
-            )
+        return int(result.scalar_one())
 
     async def active_beliefs(self, session: AsyncSession) -> list[dict[str, object]]:
         result = await session.execute(
@@ -124,62 +80,28 @@ class MemoryStore:
     async def find_matching_belief(
         self, session: AsyncSession, memory: ExtractedMemory
     ) -> tuple[dict[str, object] | None, float]:
-        await self.ensure_belief_embeddings(session)
-        embedding = vector_literal(self.embedder.embed(belief_subject(memory.key, memory.value)))
         result = await session.execute(
             text(
-                "WITH nearest AS ("
-                "SELECT d.id, d.decision_key, d.decision, "
-                "1 - (e.embedding <=> CAST(:embedding AS vector)) AS similarity "
-                "FROM decision_embeddings e JOIN decisions d ON d.id = e.decision_id "
-                "LEFT JOIN decision_forgets f ON f.decision_id = d.id "
-                "WHERE d.superseded_by IS NULL AND f.id IS NULL "
-                "ORDER BY e.embedding <=> CAST(:embedding AS vector) LIMIT 20"
-                "), exact AS ("
                 "SELECT d.id, d.decision_key, d.decision, 1.0 AS similarity "
-                "FROM decision_embeddings e JOIN decisions d ON d.id = e.decision_id "
+                "FROM decisions d "
                 "LEFT JOIN decision_forgets f ON f.decision_id = d.id "
                 "WHERE d.superseded_by IS NULL AND f.id IS NULL "
-                "AND e.key_normalized = :key"
-                ") SELECT DISTINCT ON (id) id, decision_key, decision, similarity "
-                "FROM (SELECT * FROM nearest UNION ALL SELECT * FROM exact) candidates "
-                "ORDER BY id, similarity DESC"
+                "AND d.decision_key = :key ORDER BY d.id LIMIT 1"
             ),
-            {"embedding": embedding, "key": normalize_key(memory.key)},
+            {"key": normalize_key(memory.key)},
         )
-        candidates = [dict(row._mapping) for row in result]
-        canonical_key = normalize_key(memory.key)
-        for item in candidates:
-            if normalize_key(str(item["decision_key"])) == canonical_key:
-                return item, 1.0
-        if not candidates:
-            return None, 0.0
-        best = max(candidates, key=lambda item: float(item["similarity"]))
-        similarity = float(best["similarity"])
-        if similarity >= BELIEF_MATCH_THRESHOLD:
-            return best, similarity
-        return None, similarity
+        item = result.mappings().one_or_none()
+        return (dict(item), 1.0) if item is not None else (None, 0.0)
 
     def matching_belief(
         self, existing: list[dict[str, object]], memory: ExtractedMemory
     ) -> tuple[dict[str, object] | None, float]:
         proposed_key = normalize_key(memory.key)
-        proposed_embedding = self.embedder.embed(belief_subject(memory.key, memory.value))
-        best: tuple[dict[str, object] | None, float] = (None, 0.0)
         for item in existing:
             existing_key = str(item["decision_key"])
             if normalize_key(existing_key) == proposed_key:
-                similarity = 1.0
-            else:
-                similarity = cosine_similarity(
-                    proposed_embedding,
-                    self.embedder.embed(belief_subject(existing_key, str(item["decision"]))),
-                )
-            if similarity > best[1]:
-                best = (item, similarity)
-        if best[1] >= BELIEF_MATCH_THRESHOLD:
-            return best
-        return None, best[1]
+                return item, 1.0
+        return None, 0.0
 
     async def record_memories(
         self, session: AsyncSession, memories: list[ExtractedMemory]

@@ -1,5 +1,5 @@
 from chitti.embedding import FakeEmbedder
-from chitti.memory import BELIEF_MATCH_THRESHOLD, MemoryStore, normalize, normalize_key
+from chitti.memory import MemoryStore, normalize, normalize_key
 from chitti.provider import ExtractedMemory
 
 
@@ -35,11 +35,17 @@ class SubjectEmbedder:
         return [0.0, 1.0]
 
 
-def test_matching_belief_requires_threshold_for_unrelated_subjects() -> None:
+def test_matching_belief_uses_only_normalized_keys() -> None:
     store = MemoryStore(SubjectEmbedder())
     related, score = store.matching_belief(
         [{"id": 1, "decision_key": "deployment_target", "decision": "VPS"}],
         ExtractedMemory("frontend_framework", "Next.js", None, None),
     )
     assert related is None
-    assert score < BELIEF_MATCH_THRESHOLD
+    assert score == 0.0
+    related, score = store.matching_belief(
+        [{"id": 1, "decision_key": "deployment_target", "decision": "VPS"}],
+        ExtractedMemory("preferred_deployment_target", "managed cloud", None, None),
+    )
+    assert related is not None
+    assert score == 1.0

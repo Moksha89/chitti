@@ -39,11 +39,10 @@ def upgrade() -> None:
         os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     )
     decisions = connection.execute(
-        sa.text("SELECT id, decision_key, decision FROM decisions ORDER BY id")
+        sa.text("SELECT id, decision_key FROM decisions ORDER BY id")
     )
     for decision in decisions:
         key = str(decision.decision_key)
-        value = str(decision.decision)
         normalized_key = normalize_key(key)
         connection.execute(
             sa.text(
@@ -53,7 +52,7 @@ def upgrade() -> None:
             {
                 "id": decision.id,
                 "key": normalized_key,
-                "embedding": vector_literal(embedder.embed(belief_subject(key, value))),
+                "embedding": vector_literal(embedder.embed(belief_subject(key))),
             },
         )
 
