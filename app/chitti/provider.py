@@ -12,6 +12,7 @@ CODER_ROUTE = "coder"
 REVIEWER_ROUTE = "reviewer"
 REQUIRED_GATEWAY_ROUTES = frozenset({CODER_ROUTE, REVIEWER_ROUTE})
 CODER_MAX_OUTPUT_TOKENS = 32768
+REVIEWER_MAX_OUTPUT_TOKENS = 4096
 
 
 class GatewayValidationError(RuntimeError):
@@ -199,7 +200,11 @@ class LiteLLMProvider:
             "model": role,
             "messages": messages,
             "temperature": 0.2,
-            "max_tokens": 1200 if role == "reviewer" else CODER_MAX_OUTPUT_TOKENS,
+            "max_tokens": (
+                REVIEWER_MAX_OUTPUT_TOKENS
+                if role == "reviewer"
+                else CODER_MAX_OUTPUT_TOKENS
+            ),
         }
         if tools is not None:
             request["tools"] = tools
