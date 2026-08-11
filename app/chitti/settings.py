@@ -12,11 +12,13 @@ class Settings(BaseSettings):
     chitti_password_hash: str = ""
     chitti_session_ttl_minutes: int = 480
     chitti_auth_state_path: str = "/app/data/auth_state.json"
+    chitti_trusted_proxy_ip: str = "172.31.250.2"
     telegram_bot_token: str = ""
     allowed_telegram_user_ids: str = ""
     profile_path: str = "/app/profile/PROFILE.md"
     project_root: str = "/app/projects"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    display_timezone: str = "Asia/Dubai"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

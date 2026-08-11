@@ -21,8 +21,16 @@ class ExtractedMemory:
 class ModelProvider(Protocol):
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str: ...
 
+    async def plan(
+        self, brief: str, project: str, beliefs: list[dict[str, object]], rejection: str | None = None
+    ) -> str: ...
+
     async def extract_memories(
-        self, profile: str, user_message: str, assistant_message: str
+        self,
+        profile: str,
+        user_message: str,
+        assistant_message: str,
+        existing_keys: list[str] | None = None,
     ) -> list[ExtractedMemory]: ...
 
 
@@ -56,14 +64,51 @@ class LiteLLMProvider:
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str:
         return await self._completion([{"role": "system", "content": system}, *messages], role)
 
+    async def plan(
+        self, brief: str, project: str, beliefs: list[dict[str, object]], rejection: str | None = None
+    ) -> str:
+        memory = "\n".join(
+            f"- {item['decision_key']}: {item['decision']}" for item in beliefs
+        ) or "(none)"
+        feedback = f"\nREJECTION FEEDBACK:\n{rejection}" if rejection else ""
+        prompt = (
+            "Create a delivery plan as strict JSON with exactly these top-level keys: "
+            "title, summary, tasks, memory_decisions. Each task must have id, title, "
+            "description, dependencies, and done_condition. Dependencies are task ids. "
+            "Tasks must be ordered and independently testable. memory_decisions must list "
+            "which supplied beliefs influenced the plan, with decision_key and influence. "
+            "Do not include markdown or extra keys.\n"
+            f"PROJECT: {project}\nBRIEF: {brief}\nACTIVE BELIEFS:\n{memory}{feedback}"
+        )
+        return await self._completion(
+            [
+                {"role": "system", "content": "You create validated project plans as strict JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            "planner",
+        )
+
     async def extract_memories(
-        self, profile: str, user_message: str, assistant_message: str
+        self,
+        profile: str,
+        user_message: str,
+        assistant_message: str,
+        existing_keys: list[str] | None = None,
     ) -> list[ExtractedMemory]:
+        keys = ", ".join(existing_keys or []) or "(none)"
         prompt = (
             "Extract only durable facts, preferences, or decisions from this turn. "
             "Return a JSON array of objects with key, value, rationale, project, source. "
+            "Write each value as a complete, self-contained direct statement of the rule "
+            "that a person can understand without the key. Use first person or imperative "
+            "wording as appropriate; do not write 'The user ...'. Never return a bare time, color, product name, "
+            "framework name, version, or code; include the subject while preserving the "
+            "exact value. "
             "Use source user_stated when the user explicitly states it, otherwise "
-            "chitti_inferred. Return [] when there is nothing durable.\n"
+            "chitti_inferred. Return [] when there is nothing durable. "
+            "When a fact matches an existing key, reuse that key exactly instead of "
+            "creating a synonym. Existing active keys:\n"
+            f"{keys}\n"
             f"PROFILE:\n{profile}\nUSER:\n{user_message}\nASSISTANT:\n{assistant_message}"
         )
         raw = await self._completion(
@@ -94,8 +139,45 @@ class FakeProvider:
         latest = messages[-1]["content"] if messages else ""
         return f"[fake:{role}] I heard you: {latest}"
 
+    async def plan(
+        self, brief: str, project: str, beliefs: list[dict[str, object]], rejection: str | None = None
+    ) -> str:
+        return json.dumps(
+            {
+                "title": f"{project}: {brief[:80]}",
+                "summary": f"Deliver the requested project for {project}.",
+                "memory_decisions": [
+                    {
+                        "decision_key": str(item["decision_key"]),
+                        "influence": "Applied as a project constraint.",
+                    }
+                    for item in beliefs
+                ],
+                "tasks": [
+                    {
+                        "id": "brief",
+                        "title": "Turn the brief into an implementation checklist",
+                        "description": brief,
+                        "dependencies": [],
+                        "done_condition": "The checklist is explicit, ordered, and testable.",
+                    },
+                    {
+                        "id": "review",
+                        "title": "Review the proposed delivery plan",
+                        "description": "Confirm scope, constraints, and acceptance criteria.",
+                        "dependencies": ["brief"],
+                        "done_condition": "The owner has approved the exact plan revision.",
+                    },
+                ],
+            }
+        )
+
     async def extract_memories(
-        self, profile: str, user_message: str, assistant_message: str
+        self,
+        profile: str,
+        user_message: str,
+        assistant_message: str,
+        existing_keys: list[str] | None = None,
     ) -> list[ExtractedMemory]:
         lowered = user_message.lower()
         memories: list[ExtractedMemory] = []

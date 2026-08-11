@@ -1,19 +1,26 @@
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import cast
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 
 from .auth import AuthManager, Session
 from .db import Database
 from .embedding import FakeEmbedder, get_embedder
 from .memory import MemoryStore
+from .plans import PlanManager, approve_revision, latest_revisions, reject_revision, revision_by_id
 from .project_state import ProjectState
 from .provider import FakeProvider, LiteLLMProvider
 from .service import ChittiService
@@ -32,6 +39,7 @@ CSRF_FIELD = "csrf_token"
 class ChatRequest(BaseModel):
     message: str
     project: str | None = None
+    plan_requested: bool = False
     history: list[dict[str, str]] = Field(default_factory=list)
 
 
@@ -49,13 +57,19 @@ def build_service(settings: Settings) -> ChittiService:
     return ChittiService(provider, MemoryStore(embedder), profile)
 
 
-def set_session_cookie(response: RedirectResponse | HTMLResponse, token: str) -> None:
+def request_is_https(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    return auth_manager(request).is_trusted_proxy(request) and request.headers.get("X-Forwarded-Proto") == "https"
+
+
+def set_session_cookie(response: RedirectResponse | HTMLResponse, token: str, secure: bool) -> None:
     response.set_cookie(
         SESSION_COOKIE,
         token,
         max_age=8 * 60 * 60,
         httponly=True,
-        secure=True,
+        secure=secure,
         samesite="lax",
     )
 
@@ -76,6 +90,36 @@ def current_session(request: Request) -> tuple[str, Session]:
     return token, session
 
 
+def safe_next_path(value: str | None) -> str:
+    candidate = value or "/"
+    if candidate.startswith("/") and not candidate.startswith("//"):
+        return candidate
+    return "/"
+
+
+def change_password_location(next_path: str) -> str:
+    if next_path == "/":
+        return "/change-password"
+    return f"/change-password?next={quote(next_path, safe='')}"
+
+
+def login_redirect(request: Request, *, include_next: bool = True) -> RedirectResponse:
+    if not include_next:
+        return RedirectResponse("/login", status_code=303)
+    destination = request.url.path
+    if request.url.query:
+        destination = f"{destination}?{request.url.query}"
+    return RedirectResponse(f"/login?next={quote(destination, safe='')}", status_code=303)
+
+
+def browser_session(request: Request, *, include_next: bool = True) -> tuple[str, Session] | RedirectResponse:
+    token = request.cookies.get(SESSION_COOKIE)
+    session = auth_manager(request).get_session(token)
+    if not token or session is None or session.username is None:
+        return login_redirect(request, include_next=include_next)
+    return token, session
+
+
 def require_csrf(request: Request, session: Session, form_token: str | None = None) -> None:
     token = form_token or request.headers.get("X-CSRF-Token")
     if not auth_manager(request).csrf_valid(session, token):
@@ -92,6 +136,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.chitti_password_hash,
         settings.chitti_auth_state_path,
         settings.chitti_session_ttl_minutes,
+        settings.chitti_trusted_proxy_ip,
     )
     auth.initialize()
     poller = TelegramPoller(settings, service, database.sessions)
@@ -99,8 +144,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.settings = settings
     app.state.database = database
     app.state.service = service
+    app.state.plan_manager = PlanManager(database, service.provider, service.memory)
     app.state.project_state = ProjectState(settings.project_root)
     app.state.auth = auth
+    await app.state.plan_manager.resume_queued()
     try:
         yield
     finally:
@@ -113,6 +160,11 @@ template_directory = "/app/templates"
 if not Path(template_directory).exists():
     template_directory = str(Path(__file__).resolve().parents[1] / "templates")
 templates = Jinja2Templates(directory=template_directory)
+markdown = MarkdownIt("commonmark", {"html": False, "breaks": True}).enable("table")
+
+
+def render_markdown(value: str) -> str:
+    return cast(str, markdown.render(value))
 
 
 @app.middleware("http")
@@ -131,15 +183,24 @@ async def login_page(request: Request) -> HTMLResponse | RedirectResponse:
     manager = auth_manager(request)
     session = manager.get_session(request.cookies.get(SESSION_COOKIE))
     if session and session.username:
-        destination = "/change-password" if manager.must_change_password else "/"
+        next_path = safe_next_path(request.query_params.get("next"))
+        destination = (
+            change_password_location(next_path)
+            if manager.must_change_password
+            else "/"
+        )
         return RedirectResponse(destination, status_code=303)
     token, session = manager.create_session()
     response = templates.TemplateResponse(
         request=request,
         name="login.html",
-        context={"csrf_token": session.csrf_token, "error": None},
+        context={
+            "csrf_token": session.csrf_token,
+            "error": None,
+            "next": safe_next_path(request.query_params.get("next")),
+        },
     )
-    set_session_cookie(response, token)
+    set_session_cookie(response, token, request_is_https(request))
     return response
 
 
@@ -150,8 +211,9 @@ async def login(request: Request) -> HTMLResponse | RedirectResponse:
     old_token = request.cookies.get(SESSION_COOKIE)
     old_session = manager.get_session(old_token)
     csrf_token = str(form.get(CSRF_FIELD, ""))
+    next_path = safe_next_path(str(form.get("next", "")))
     if old_session is None:
-        response = RedirectResponse("/login", status_code=303)
+        response = RedirectResponse(f"/login?next={quote(next_path, safe='')}", status_code=303)
         clear_session_cookie(response)
         return response
     if not manager.csrf_valid(old_session, csrf_token):
@@ -162,19 +224,30 @@ async def login(request: Request) -> HTMLResponse | RedirectResponse:
         return templates.TemplateResponse(
             request=request,
             name="login.html",
-            context={"csrf_token": old_session.csrf_token, "error": "Invalid credentials or login temporarily locked."},
+            context={
+                "csrf_token": old_session.csrf_token,
+                "error": "Invalid credentials or login temporarily locked.",
+                "next": next_path,
+            },
             status_code=401,
         )
     token, session = manager.rotate_authenticated_session(old_token or "", manager.username)
-    destination = "/change-password" if manager.must_change_password else "/"
+    destination = (
+        change_password_location(next_path)
+        if manager.must_change_password
+        else next_path
+    )
     response = RedirectResponse(destination, status_code=303)
-    set_session_cookie(response, token)
+    set_session_cookie(response, token, request_is_https(request))
     return response
 
 
 @app.post("/logout")
 async def logout(request: Request) -> RedirectResponse:
-    token, session = current_session(request)
+    result = browser_session(request, include_next=False)
+    if isinstance(result, RedirectResponse):
+        return result
+    token, session = result
     form = await request.form()
     require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
     manager = auth_manager(request)
@@ -185,31 +258,46 @@ async def logout(request: Request) -> RedirectResponse:
 
 
 @app.get("/change-password", response_class=HTMLResponse, response_model=None)
-async def change_password_page(request: Request) -> HTMLResponse:
-    _, session = current_session(request)
+async def change_password_page(request: Request) -> HTMLResponse | RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
     return templates.TemplateResponse(
         request=request,
         name="change_password.html",
-        context={"csrf_token": session.csrf_token, "error": None},
+        context={
+            "csrf_token": session.csrf_token,
+            "error": None,
+            "next": safe_next_path(request.query_params.get("next")),
+        },
     )
 
 
 @app.post("/change-password", response_class=HTMLResponse, response_model=None)
 async def change_password(request: Request) -> HTMLResponse | RedirectResponse:
-    _, session = current_session(request)
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
     form = await request.form()
     require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
     password = str(form.get("password", ""))
     confirmation = str(form.get("confirmation", ""))
+    next_path = safe_next_path(str(form.get("next", "")))
     if len(password) < 12 or password != confirmation:
         return templates.TemplateResponse(
             request=request,
             name="change_password.html",
-            context={"csrf_token": session.csrf_token, "error": "Passwords must match and be at least 12 characters."},
+            context={
+                "csrf_token": session.csrf_token,
+                "error": "Passwords must match and be at least 12 characters.",
+                "next": next_path,
+            },
             status_code=400,
         )
     auth_manager(request).change_password(password)
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse(next_path, status_code=303)
 
 
 async def dashboard_context(request: Request, session: Session) -> dict[str, object]:
@@ -222,12 +310,62 @@ async def dashboard_context(request: Request, session: Session) -> dict[str, obj
     async with database.sessions() as db_session:
         decisions = await memory.decisions(db_session)
         conflicts = await memory.conflicts(db_session)
-    return {"csrf_token": session.csrf_token, "decisions": decisions, "conflicts": conflicts}
+        plans = await latest_revisions(db_session)
+        for plan in plans:
+            approval_result = await db_session.execute(
+                text(
+                    "SELECT decision, reason, content_hash, created_at FROM plan_approvals "
+                    "WHERE revision_id = :revision ORDER BY id DESC LIMIT 1"
+                ),
+                {"revision": plan["id"]},
+            )
+            approval = approval_result.mappings().one_or_none()
+            plan["approval"] = dict(approval) if approval else None
+    for decision in decisions:
+        decision["display_key"] = humanize_belief_key(str(decision["decision_key"]))
+        decision["display_value"] = str(decision["decision"])
+    for conflict in conflicts:
+        conflict["display_key"] = humanize_belief_key(str(conflict["decision_key"]))
+        conflict["display_existing"] = str(conflict["existing_value"])
+        conflict["display_proposed"] = str(conflict["proposed_value"])
+    now = datetime.now(ZoneInfo(request.app.state.settings.display_timezone))
+    if now.hour < 12:
+        greeting = "Good morning"
+    elif now.hour < 18:
+        greeting = "Good afternoon"
+    else:
+        greeting = "Good evening"
+    return {
+        "csrf_token": session.csrf_token,
+        "decisions": decisions,
+        "conflicts": conflicts,
+        "plans": plans,
+        "greeting": greeting,
+        "display_timezone": request.app.state.settings.display_timezone,
+    }
+
+
+def humanize_belief_key(value: str) -> str:
+    return re.sub(r"[_\.]+", " ", value).strip().capitalize()
+
+
+def project_from_brief(
+    project: str | None, plan_requested: bool = False
+) -> str | None:
+    if not plan_requested or not project or not project.strip():
+        return None
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", project.strip()).strip("-").lower()
+    return value or None
+
+
 
 
 @app.get("/", response_class=HTMLResponse, response_model=None)
 async def dashboard(request: Request) -> HTMLResponse | RedirectResponse:
-    _, session = current_session(request)
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
     if auth_manager(request).must_change_password:
         return RedirectResponse("/change-password", status_code=303)
     return templates.TemplateResponse(
@@ -239,17 +377,100 @@ async def dashboard(request: Request) -> HTMLResponse | RedirectResponse:
 
 @app.post("/memory/conflicts/{conflict_id}/resolve")
 async def resolve_conflict(conflict_id: int, request: Request) -> RedirectResponse:
-    _, session = current_session(request)
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
     if auth_manager(request).must_change_password:
         return RedirectResponse("/change-password", status_code=303)
     form = await request.form()
     require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
     choice = str(form.get("choice", ""))
     database: Database = request.app.state.database
-    memory = MemoryStore(FakeEmbedder())
+    memory = MemoryStore(
+        FakeEmbedder()
+        if request.app.state.settings.chitti_provider == "fake"
+        else get_embedder(request.app.state.settings.embedding_model)
+    )
     async with database.sessions() as db_session:
         try:
             await memory.resolve_conflict(db_session, conflict_id, choice)
+            await db_session.commit()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/plans/{revision_id}/approve")
+async def approve_plan(revision_id: int, request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    if auth_manager(request).must_change_password:
+        return RedirectResponse("/change-password", status_code=303)
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    database: Database = request.app.state.database
+    async with database.sessions() as db_session:
+        try:
+            await approve_revision(db_session, revision_id)
+            await db_session.commit()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/plans/{revision_id}/reject")
+async def reject_plan(revision_id: int, request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    if auth_manager(request).must_change_password:
+        return RedirectResponse("/change-password", status_code=303)
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    reason = str(form.get("reason", "")).strip()
+    database: Database = request.app.state.database
+    async with database.sessions() as db_session:
+        revision = await revision_by_id(db_session, revision_id)
+        if revision is None:
+            raise HTTPException(status_code=404, detail="plan revision not found")
+        try:
+            await reject_revision(db_session, revision_id, reason)
+            await db_session.commit()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    manager: PlanManager = request.app.state.plan_manager
+    await manager.enqueue(
+        revision.project,
+        revision.brief,
+        revision_id,
+        reason,
+    )
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/memory/decisions/{decision_id}/forget")
+async def forget_decision(decision_id: int, request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    if auth_manager(request).must_change_password:
+        return RedirectResponse("/change-password", status_code=303)
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    database: Database = request.app.state.database
+    memory = MemoryStore(
+        FakeEmbedder()
+        if request.app.state.settings.chitti_provider == "fake"
+        else get_embedder(request.app.state.settings.embedding_model)
+    )
+    async with database.sessions() as db_session:
+        try:
+            await memory.forget_decision(db_session, decision_id)
             await db_session.commit()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -270,13 +491,44 @@ async def chat(payload: ChatRequest, request: Request) -> dict[str, object]:
     require_csrf(request, session)
     database: Database = request.app.state.database
     service: ChittiService = request.app.state.service
+    plan_project = project_from_brief(payload.project, payload.plan_requested)
+    if payload.plan_requested and plan_project is None:
+        raise HTTPException(
+            status_code=400, detail="a named project is required for planning"
+        )
     try:
         async with database.sessions() as db_session:
             result = await service.turn(db_session, payload.message, payload.project, payload.history)
     except Exception as exc:
         logging.getLogger(__name__).exception("chat_provider_failed")
         raise HTTPException(status_code=503, detail="model provider unavailable") from exc
-    return {"reply": result.reply, "conflicts": [asdict(item) for item in result.conflicts]}
+    plan_job_id = None
+    reply = result.reply
+    if plan_project:
+        manager: PlanManager = request.app.state.plan_manager
+        plan_job_id = await manager.enqueue(plan_project, payload.message)
+        reply += (
+            "\n\nI created a plan draft for "
+            f"{plan_project}. It is waiting for your approval; nothing will execute."
+        )
+    return {
+        "reply": reply,
+        "reply_html": render_markdown(reply),
+        "conflicts": [asdict(item) for item in result.conflicts],
+        "plan_job_id": plan_job_id,
+    }
+
+
+@app.get("/plans/jobs/{job_id}")
+async def plan_job(job_id: int, request: Request) -> dict[str, object]:
+    current_session(request)
+    if auth_manager(request).must_change_password:
+        raise HTTPException(status_code=403, detail="password change required")
+    manager: PlanManager = request.app.state.plan_manager
+    job = await manager.job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="planning job not found")
+    return job
 
 
 @app.get("/projects/{project}/state")

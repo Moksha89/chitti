@@ -32,6 +32,18 @@ def normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
 
 
+def normalize_key(value: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+    for prefix in ("preferred_stack_", "preferences_", "preferred_", "stack_"):
+        if key.startswith(prefix):
+            return key[len(prefix) :]
+    return key
+
+
+def belief_subject(key: str) -> str:
+    return normalize_key(key)
+
+
 class MemoryStore:
     def __init__(self, embedder: EmbedderProtocol) -> None:
         self.embedder = embedder
@@ -47,32 +59,61 @@ class MemoryStore:
                 "decision": item.value,
                 "rationale": item.rationale,
                 "source": item.source,
-                "key": item.key,
+                "key": normalize_key(item.key),
             },
         )
         return int(result.scalar_one())
 
-    async def active_decisions(self, session: AsyncSession, key: str) -> list[tuple[int, str]]:
+    async def active_beliefs(self, session: AsyncSession) -> list[dict[str, object]]:
         result = await session.execute(
             text(
-                "SELECT id, decision FROM decisions "
-                "WHERE decision_key = :key AND superseded_by IS NULL ORDER BY id"
+                "SELECT d.id, d.decision_key, d.decision FROM decisions d "
+                "LEFT JOIN decision_forgets f ON f.decision_id = d.id "
+                "WHERE d.superseded_by IS NULL AND f.id IS NULL ORDER BY d.id"
             ),
-            {"key": key},
         )
-        return [(int(row.id), str(row.decision)) for row in result]
+        return [dict(row._mapping) for row in result]
+
+    async def active_keys(self, session: AsyncSession) -> list[str]:
+        return [str(item["decision_key"]) for item in await self.active_beliefs(session)]
+
+    async def find_matching_belief(
+        self, session: AsyncSession, memory: ExtractedMemory
+    ) -> tuple[dict[str, object] | None, float]:
+        result = await session.execute(
+            text(
+                "SELECT d.id, d.decision_key, d.decision, 1.0 AS similarity "
+                "FROM decisions d "
+                "LEFT JOIN decision_forgets f ON f.decision_id = d.id "
+                "WHERE d.superseded_by IS NULL AND f.id IS NULL "
+                "AND d.decision_key = :key ORDER BY d.id LIMIT 1"
+            ),
+            {"key": normalize_key(memory.key)},
+        )
+        item = result.mappings().one_or_none()
+        return (dict(item), 1.0) if item is not None else (None, 0.0)
+
+    def matching_belief(
+        self, existing: list[dict[str, object]], memory: ExtractedMemory
+    ) -> tuple[dict[str, object] | None, float]:
+        proposed_key = normalize_key(memory.key)
+        for item in existing:
+            existing_key = str(item["decision_key"])
+            if normalize_key(existing_key) == proposed_key:
+                return item, 1.0
+        return None, 0.0
 
     async def record_memories(
         self, session: AsyncSession, memories: list[ExtractedMemory]
     ) -> list[Conflict]:
         conflicts: list[Conflict] = []
-        to_append: list[ExtractedMemory] = []
         for memory in memories:
-            existing = await self.active_decisions(session, memory.key)
             normalized = normalize(memory.value)
-            if any(normalize(value) == normalized for _, value in existing):
+            match, _ = await self.find_matching_belief(session, memory)
+            if match and normalize(str(match["decision"])) == normalized:
                 continue
-            if existing:
+            if match:
+                existing_key = str(match["decision_key"])
                 result = await session.execute(
                     text(
                         "INSERT INTO memory_conflicts "
@@ -82,8 +123,8 @@ class MemoryStore:
                         "RETURNING id"
                     ),
                     {
-                        "key": memory.key,
-                        "existing_id": existing[0][0],
+                        "key": existing_key,
+                        "existing_id": match["id"],
                         "value": memory.value,
                         "rationale": memory.rationale,
                         "project": memory.project,
@@ -91,19 +132,31 @@ class MemoryStore:
                     },
                 )
                 conflicts.append(
-                    Conflict(memory.key, existing[0][1], memory.value, existing[0][0], int(result.scalar_one()))
+                    Conflict(
+                        existing_key,
+                        str(match["decision"]),
+                        memory.value,
+                        int(str(match["id"])),
+                        int(result.scalar_one()),
+                    )
                 )
             else:
-                to_append.append(memory)
-        for memory in to_append:
-            await self.append_decision(session, memory)
+                canonical = ExtractedMemory(
+                    normalize_key(memory.key),
+                    memory.value,
+                    memory.rationale,
+                    memory.project,
+                    memory.source,
+                )
+                await self.append_decision(session, canonical)
         return conflicts
 
     async def decisions(self, session: AsyncSession) -> list[dict[str, object]]:
         result = await session.execute(
             text(
-                "SELECT id, decision_key, decision, rationale, project, source "
-                "FROM decisions WHERE superseded_by IS NULL ORDER BY id DESC"
+                "SELECT d.id, d.decision_key, d.decision, d.rationale, d.project, d.source "
+                "FROM decisions d LEFT JOIN decision_forgets f ON f.decision_id = d.id "
+                "WHERE d.superseded_by IS NULL AND f.id IS NULL ORDER BY d.id DESC"
             )
         )
         return [dict(row._mapping) for row in result]
@@ -114,7 +167,8 @@ class MemoryStore:
                 "SELECT c.id, c.decision_key, c.existing_decision_id, d.decision AS existing_value, "
                 "c.proposed_value, c.proposed_rationale, c.proposed_project, c.proposed_source "
                 "FROM memory_conflicts c JOIN decisions d ON d.id = c.existing_decision_id "
-                "WHERE c.resolution_decision_id IS NULL ORDER BY c.id DESC"
+                "LEFT JOIN decision_forgets f ON f.decision_id = d.id "
+                "WHERE c.resolution_decision_id IS NULL AND f.id IS NULL ORDER BY c.id DESC"
             )
         )
         return [dict(row._mapping) for row in result]
@@ -164,6 +218,22 @@ class MemoryStore:
             {"new_id": new_id, "id": conflict_id},
         )
         return new_id
+
+    async def forget_decision(self, session: AsyncSession, decision_id: int) -> None:
+        result = await session.execute(
+            text(
+                "SELECT d.id FROM decisions d LEFT JOIN decision_forgets f "
+                "ON f.decision_id = d.id WHERE d.id = :id AND d.superseded_by IS NULL "
+                "AND f.id IS NULL"
+            ),
+            {"id": decision_id},
+        )
+        if result.scalar_one_or_none() is None:
+            raise ValueError("invalid or already forgotten decision")
+        await session.execute(
+            text("INSERT INTO decision_forgets (decision_id) VALUES (:id)"),
+            {"id": decision_id},
+        )
 
     async def add_chunk(
         self,
