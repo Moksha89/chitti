@@ -2,7 +2,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
 
@@ -45,12 +45,20 @@ class ModelCompletion:
     cost_usd: float
     finish_reason: str | None = None
     message_fields: tuple[str, ...] = ()
+    tool_calls: tuple["ModelToolCall", ...] = ()
+
+
+@dataclass(frozen=True)
+class ModelToolCall:
+    id: str
+    name: str
+    arguments: dict[str, object]
 
 
 class ModelProvider(Protocol):
     async def validate_gateway(self) -> None: ...
 
-    async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str: ...
+    async def chat(self, system: str, messages: list[dict[str, object]], role: str) -> str: ...
 
     async def plan(
         self, brief: str, project: str, beliefs: list[dict[str, object]], rejection: str | None = None
@@ -65,7 +73,11 @@ class ModelProvider(Protocol):
     ) -> list[ExtractedMemory]: ...
 
     async def agent_completion(
-        self, messages: list[dict[str, str]], role: str
+        self,
+        messages: list[dict[str, object]],
+        role: str,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> ModelCompletion: ...
 
 
@@ -78,6 +90,41 @@ def _diagnostic_message_fields(message: dict[object, object]) -> tuple[str, ...]
             and value not in (None, "", [], {})
         )
     )
+
+
+def _extract_tool_calls(message: dict[object, object]) -> tuple[ModelToolCall, ...]:
+    raw_calls = message.get("tool_calls")
+    if not isinstance(raw_calls, list):
+        return ()
+    calls: list[ModelToolCall] = []
+    for raw_call in raw_calls:
+        if not isinstance(raw_call, dict):
+            raise ValueError("model tool call was not an object")
+        function = raw_call.get("function")
+        if not isinstance(function, dict):
+            raise ValueError("model tool call did not contain a function")
+        name = function.get("name")
+        raw_arguments = function.get("arguments", "{}")
+        if not isinstance(name, str) or not name:
+            raise ValueError("model tool call did not contain a function name")
+        if isinstance(raw_arguments, str):
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError as exc:
+                raise ValueError("model tool call arguments were not valid JSON") from exc
+        else:
+            arguments = raw_arguments
+        if not isinstance(arguments, dict):
+            raise ValueError("model tool call arguments must be an object")
+        call_id = raw_call.get("id")
+        calls.append(
+            ModelToolCall(
+                id=str(call_id) if call_id else f"call-{len(calls)}",
+                name=name,
+                arguments={str(key): value for key, value in arguments.items()},
+            )
+        )
+    return tuple(calls)
 
 
 def _json_payload(text: str) -> object:
@@ -137,23 +184,31 @@ class LiteLLMProvider:
                 f"gateway routes unavailable: {', '.join(missing)}"
             )
 
-    async def _completion(self, messages: list[dict[str, str]], role: str) -> str:
+    async def _completion(self, messages: list[dict[str, object]], role: str) -> str:
         return (await self.agent_completion(messages, role)).content
 
     async def agent_completion(
-        self, messages: list[dict[str, str]], role: str
+        self,
+        messages: list[dict[str, object]],
+        role: str,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> ModelCompletion:
+        request: dict[str, object] = {
+            "model": role,
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": 1200 if role == "reviewer" else CODER_MAX_OUTPUT_TOKENS,
+        }
+        if tools is not None:
+            request["tools"] = tools
+        if tool_choice is not None:
+            request["tool_choice"] = tool_choice
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
                 self.url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": role,
-                    "messages": messages,
-                    "temperature": 0.2,
-                    "max_tokens": 1200 if role == "reviewer" else CODER_MAX_OUTPUT_TOKENS,
-                    "thinking": {"type": "disabled"},
-                },
+                json=request,
             )
             response.raise_for_status()
             body = response.json()
@@ -162,6 +217,7 @@ class LiteLLMProvider:
             if not isinstance(message, dict):
                 message = {}
             content = message.get("content")
+            native_tool_calls = _extract_tool_calls(message)
             usage = body.get("usage") or {}
             prompt_tokens = int(usage.get("prompt_tokens", 0))
             completion_tokens = int(usage.get("completion_tokens", 0))
@@ -180,9 +236,10 @@ class LiteLLMProvider:
                     else None
                 ),
                 message_fields=_diagnostic_message_fields(message),
+                tool_calls=native_tool_calls,
             )
 
-    async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str:
+    async def chat(self, system: str, messages: list[dict[str, object]], role: str) -> str:
         return await self._completion([{"role": "system", "content": system}, *messages], role)
 
     async def plan(
@@ -259,7 +316,7 @@ class FakeProvider:
     async def validate_gateway(self) -> None:
         return
 
-    async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str:
+    async def chat(self, system: str, messages: list[dict[str, object]], role: str) -> str:
         latest = messages[-1]["content"] if messages else ""
         return f"[fake:{role}] I heard you: {latest}"
 
@@ -320,15 +377,53 @@ class FakeProvider:
         return memories
 
     async def agent_completion(
-        self, messages: list[dict[str, str]], role: str
+        self,
+        messages: list[dict[str, object]],
+        role: str,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> ModelCompletion:
+        if role != "coder":
+            content = json.dumps(
+                {
+                    "verdict": "pass",
+                    "findings": [],
+                    "evidence_limitations": [],
+                    "summary": "Fake provider reviewer passed the task.",
+                }
+            )
+            prompt_tokens = sum(
+                len(item_content)
+                for item in messages
+                if isinstance(item_content := item.get("content"), str)
+            )
+            return ModelCompletion(
+                content=content,
+                model=f"fake:{role}",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=12,
+                total_tokens=prompt_tokens + 12,
+                cost_usd=0.0,
+                finish_reason="stop",
+            )
+        prompt_tokens = sum(
+            len(item_content)
+            for item in messages
+            if isinstance(item_content := item.get("content"), str)
+        )
         return ModelCompletion(
-            content=json.dumps(
-                {"tool": "finish", "arguments": {"summary": "Fake provider completed the task."}}
-            ),
+            content="",
             model=f"fake:{role}",
-            prompt_tokens=sum(len(item["content"]) for item in messages),
+            prompt_tokens=prompt_tokens,
             completion_tokens=12,
-            total_tokens=sum(len(item["content"]) for item in messages) + 12,
+            total_tokens=prompt_tokens + 12,
             cost_usd=0.0,
+            finish_reason="tool_calls",
+            tool_calls=(
+                ModelToolCall(
+                    id="fake-finish",
+                    name="finish",
+                    arguments={"summary": "Fake provider completed the task."},
+                ),
+            ),
         )

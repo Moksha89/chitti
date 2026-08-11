@@ -2,10 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from chitti.provider import ModelCompletion
+from chitti.provider import ModelCompletion, ModelToolCall
 from chitti.worker import (
     DockerSandboxDispatcher,
     WorkerLimits,
+    _assistant_tool_message,
     _bounded_artifact,
     _compact_model_messages,
     _confined_path,
@@ -13,6 +14,7 @@ from chitti.worker import (
     _model_response_failure,
     _parse_tool_call,
     _task_done_checks,
+    _tool_exchange,
 )
 
 
@@ -62,6 +64,55 @@ def test_model_history_compaction_keeps_prefix_recent_and_feedback() -> None:
     assert any("COMPACTION:" in item["content"] for item in compacted)
 
 
+def test_model_history_compaction_keeps_native_tool_exchange_together() -> None:
+    completion = ModelCompletion(
+        content="",
+        model="coder",
+        prompt_tokens=1,
+        completion_tokens=1,
+        total_tokens=2,
+        cost_usd=0,
+        tool_calls=(
+            ModelToolCall(
+                id="call-1", name="list_files", arguments={"path": "."}
+            ),
+        ),
+    )
+    messages = [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "old"},
+        *_tool_exchange(completion, "[\"package.json\"]", completion.tool_calls[0]),
+        {"role": "assistant", "content": "recent"},
+    ]
+    compacted, changed, _ = _compact_model_messages(messages, recent_turns=2)
+    assert changed
+    assistant_index = next(
+        index for index, item in enumerate(compacted) if item.get("tool_calls")
+    )
+    assert compacted[assistant_index + 1]["role"] == "tool"
+    assert compacted[assistant_index + 1]["tool_call_id"] == "call-1"
+
+
+def test_native_tool_call_message_is_represented_for_provider_history() -> None:
+    completion = ModelCompletion(
+        content="",
+        model="coder",
+        prompt_tokens=1,
+        completion_tokens=1,
+        total_tokens=2,
+        cost_usd=0,
+        tool_calls=(
+            ModelToolCall(
+                id="call-1", name="finish", arguments={"summary": "done"}
+            ),
+        ),
+    )
+    message = _assistant_tool_message(completion)
+    assert message["role"] == "assistant"
+    assert message["tool_calls"][0]["function"]["name"] == "finish"
+    assert _model_response_failure(completion) is None
+
 def test_model_tool_parser_rejects_malformed_and_unknown_shape() -> None:
     with pytest.raises(ValueError, match="valid JSON"):
         _parse_tool_call("not json")
@@ -87,7 +138,7 @@ def test_truncated_model_response_is_reported_distinctly() -> None:
     assert not completion.message_fields
 
 
-def test_empty_content_with_alternate_fields_is_reported() -> None:
+def test_empty_content_with_reasoning_but_no_tool_call_is_nonproductive() -> None:
     completion = ModelCompletion(
         content="",
         model="coder",
@@ -97,10 +148,7 @@ def test_empty_content_with_alternate_fields_is_reported() -> None:
         cost_usd=0.01,
         message_fields=("reasoning_content",),
     )
-    assert _model_response_failure(completion) == (
-        "model response had no visible content; "
-        "alternate message fields present: reasoning_content"
-    )
+    assert _model_response_failure(completion) == "model response had no visible content"
 
 
 def test_circular_file_rewrites_are_stopped() -> None:
