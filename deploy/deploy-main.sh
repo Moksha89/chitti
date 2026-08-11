@@ -120,6 +120,16 @@ docker compose ps
 
 litellm_container="$(docker compose ps -q litellm)"
 [[ -n "${litellm_container}" ]]
+for _ in {1..60}; do
+  if [[ "$(docker inspect -f '{{.State.Health.Status}}' "${litellm_container}")" == "healthy" ]]; then
+    break
+  fi
+  sleep 2
+done
+if [[ "$(docker inspect -f '{{.State.Health.Status}}' "${litellm_container}")" != "healthy" ]]; then
+  echo "LiteLLM did not become healthy before loaded-route assertion" >&2
+  exit 1
+fi
 docker exec "${litellm_container}" test -s /app/litellm/config.yaml
 gateway_models="$(
   curl --fail --silent --show-error --max-time 15 \

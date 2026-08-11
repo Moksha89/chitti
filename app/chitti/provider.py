@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 CODER_ROUTE = "coder"
 REVIEWER_ROUTE = "reviewer"
 REQUIRED_GATEWAY_ROUTES = frozenset({CODER_ROUTE, REVIEWER_ROUTE})
+CODER_MAX_OUTPUT_TOKENS = 8192
 
 
 class GatewayValidationError(RuntimeError):
@@ -42,6 +43,8 @@ class ModelCompletion:
     completion_tokens: int
     total_tokens: int
     cost_usd: float
+    finish_reason: str | None = None
+    message_fields: tuple[str, ...] = ()
 
 
 class ModelProvider(Protocol):
@@ -137,24 +140,37 @@ class LiteLLMProvider:
                     "model": role,
                     "messages": messages,
                     "temperature": 0.2,
-                    "max_tokens": 1200 if role == "reviewer" else 4096,
+                    "max_tokens": 1200 if role == "reviewer" else CODER_MAX_OUTPUT_TOKENS,
                     "thinking": {"type": "disabled"},
                 },
             )
             response.raise_for_status()
             body = response.json()
+            choice = body["choices"][0]
+            message = choice.get("message") or {}
+            if not isinstance(message, dict):
+                message = {}
+            content = message.get("content")
             usage = body.get("usage") or {}
             prompt_tokens = int(usage.get("prompt_tokens", 0))
             completion_tokens = int(usage.get("completion_tokens", 0))
             total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens))
             cost = body.get("cost", response.headers.get("x-litellm-response-cost", 0.0))
             return ModelCompletion(
-                content=str(body["choices"][0]["message"]["content"]),
+                content=content if isinstance(content, str) else "",
                 model=str(body.get("model", role)),
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
                 cost_usd=float(cost or 0.0),
+                finish_reason=(
+                    str(choice["finish_reason"])
+                    if choice.get("finish_reason") is not None
+                    else None
+                ),
+                message_fields=tuple(
+                    sorted(str(field) for field in message if field != "content")
+                ),
             )
 
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str:

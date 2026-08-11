@@ -35,6 +35,38 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+NONPRODUCTIVE_TURN_LIMIT = 3
+MAX_FILE_REWRITES_WITHOUT_COMMAND = 4
+MAX_FILE_WRITES_WITHOUT_COMMAND = 24
+
+
+class ModelProgressError(RuntimeError):
+    """The model loop stopped because it was not making useful progress."""
+
+
+def _model_response_failure(completion: ModelCompletion) -> str | None:
+    if completion.finish_reason == "length":
+        detail = "model response truncated at the output limit"
+    elif not completion.content.strip():
+        detail = "model response had no visible content"
+    else:
+        return None
+    if completion.message_fields:
+        detail += "; alternate message fields present: " + ", ".join(
+            completion.message_fields
+        )
+    return detail
+
+
+def _file_write_stall(path: str, path_writes: int, total_writes: int) -> str | None:
+    if path_writes >= MAX_FILE_REWRITES_WITHOUT_COMMAND:
+        return (
+            f"{path} was rewritten {path_writes} times without running a command"
+        )
+    if total_writes >= MAX_FILE_WRITES_WITHOUT_COMMAND:
+        return f"stopped after {total_writes} file writes without running a command"
+    return None
+
 
 @dataclass(frozen=True)
 class WorkerLimits:
@@ -267,6 +299,9 @@ class DockerSandboxDispatcher:
         operation_index = 1
         for task in revision.document.tasks:
             completed_commands: set[str] = set()
+            file_write_counts: dict[str, int] = {}
+            file_writes_without_command = 0
+            nonproductive_turns = 0
             route = CODER_ROUTE
             failures = 0
             messages = [
@@ -295,6 +330,17 @@ class DockerSandboxDispatcher:
                         "model_context_compacted",
                         f"compacted model history: removed {removed_chars} characters",
                         task_id=task_id,
+                    )
+
+            async def record_nonproductive(detail: str, task_id: str = task_id) -> None:
+                nonlocal failures, nonproductive_turns
+                failures += 1
+                nonproductive_turns += 1
+                await self._event(run_id, "model_tool_failed", detail, task_id=task_id)
+                if nonproductive_turns >= NONPRODUCTIVE_TURN_LIMIT:
+                    raise RuntimeError(
+                        f"task {task_id} stopped after {nonproductive_turns} "
+                        f"nonproductive model turns: {detail}"
                     )
 
             for iteration in range(1, limits.model_iterations + 1):
@@ -334,6 +380,18 @@ class DockerSandboxDispatcher:
                     raise RuntimeError("model token budget exceeded")
                 if spent > limits.model_spend_usd:
                     raise RuntimeError("model spend budget exceeded")
+                response_failure = _model_response_failure(completion)
+                if response_failure is not None:
+                    detail = response_failure
+                    if completion.message_fields:
+                        await self._event(run_id, "model_tool_failed", detail, task_id=task.id)
+                        raise ModelProgressError(
+                            f"task {task.id} stopped: {detail}"
+                        )
+                    await record_nonproductive(detail)
+                    messages.append({"role": "user", "content": f"TOOL FAILURE: {detail}"})
+                    await compact_history()
+                    continue
                 if route == REVIEWER_ROUTE:
                     messages.extend(
                         [
@@ -352,11 +410,10 @@ class DockerSandboxDispatcher:
                 try:
                     tool, arguments = _parse_tool_call(completion.content)
                 except ValueError as exc:
-                    await self._event(
-                        run_id, "model_tool_failed", str(exc)[:1000], task_id=task.id
-                    )
+                    detail = str(exc)[:1000]
+                    await record_nonproductive(detail)
                     messages.append(
-                        {"role": "user", "content": f"TOOL FAILURE: {str(exc)[:1000]}"}
+                        {"role": "user", "content": f"TOOL FAILURE: {detail}"}
                     )
                     await compact_history()
                     continue
@@ -368,9 +425,8 @@ class DockerSandboxDispatcher:
                     done = True
                     break
                 if tool == "finish":
-                    failures += 1
                     result_text = "TOOL FAILURE: done condition requires successful build and test commands"
-                    await self._event(run_id, "model_tool_failed", result_text, task_id=task.id)
+                    await record_nonproductive(result_text)
                     messages.extend(
                         [
                             {"role": "assistant", "content": completion.content[:16000]},
@@ -389,11 +445,25 @@ class DockerSandboxDispatcher:
                         raise RuntimeError("model write-byte budget exceeded")
                     if tool == "run_command":
                         completed_commands.add(str(arguments.get("name", "")))
+                        file_writes_without_command = 0
+                    elif tool == "write_file":
+                        path = str(arguments.get("path", ""))
+                        file_writes_without_command += 1
+                        file_write_counts[path] = file_write_counts.get(path, 0) + 1
+                        stall = _file_write_stall(
+                            path, file_write_counts[path], file_writes_without_command
+                        )
+                        if stall is not None:
+                            raise ModelProgressError(
+                                f"task {task.id} stopped: {stall}"
+                            )
                     failures = 0
+                    nonproductive_turns = 0
                 except Exception as exc:
-                    failures += 1
+                    if isinstance(exc, ModelProgressError):
+                        raise
                     result_text = f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
-                    await self._event(run_id, "model_tool_failed", result_text, task_id=task.id)
+                    await record_nonproductive(result_text)
                     if failures >= 2 and route == CODER_ROUTE:
                         route = REVIEWER_ROUTE
                         await self._event(
@@ -705,9 +775,11 @@ class DockerSandboxDispatcher:
                 text(
                     "INSERT INTO worker_model_calls "
                     "(run_id, task_id, iteration, route, model, prompt_tokens, "
-                    "completion_tokens, total_tokens, cost_usd) VALUES "
+                    "completion_tokens, total_tokens, cost_usd, finish_reason, "
+                    "message_fields) VALUES "
                     "(:run_id, :task_id, :iteration, :route, :model, :prompt_tokens, "
-                    ":completion_tokens, :total_tokens, :cost_usd) RETURNING id"
+                    ":completion_tokens, :total_tokens, :cost_usd, :finish_reason, "
+                    "CAST(:message_fields AS jsonb)) RETURNING id"
                 ),
                 {
                     "run_id": run_id, "task_id": task_id, "iteration": iteration,
@@ -716,6 +788,8 @@ class DockerSandboxDispatcher:
                     "completion_tokens": completion.completion_tokens,
                     "total_tokens": completion.total_tokens,
                     "cost_usd": completion.cost_usd,
+                    "finish_reason": completion.finish_reason,
+                    "message_fields": json.dumps(completion.message_fields),
                 },
             )
             call_id = int(result.scalar_one())
