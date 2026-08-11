@@ -48,6 +48,10 @@ services:
       LITELLM_BASE_URL: http://litellm:4000
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       CHITTI_PROVIDER: ${CHITTI_PROVIDER:-litellm}
+      CHITTI_USERNAME: ${CHITTI_USERNAME:-akirah}
+      CHITTI_PASSWORD_HASH: ${CHITTI_PASSWORD_HASH}
+      CHITTI_SESSION_TTL_MINUTES: ${CHITTI_SESSION_TTL_MINUTES:-480}
+      CHITTI_AUTH_STATE_PATH: ${CHITTI_AUTH_STATE_PATH:-/app/data/auth_state.json}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       ALLOWED_TELEGRAM_USER_IDS: ${ALLOWED_TELEGRAM_USER_IDS}
       PROFILE_PATH: ${PROFILE_PATH:-/app/profile/PROFILE.md}
@@ -58,6 +62,7 @@ services:
     volumes:
       - ./profile:/app/profile:ro
       - ./projects:/app/projects
+      - chitti_state:/app/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -70,9 +75,9 @@ services:
     restart: unless-stopped
     environment:
       DOMAIN: ${DOMAIN:-localhost}
-    # Intentionally no host ports in Phase 1. Caddy is retained as an
-    # internal, disabled-by-default preview-site seam; Chitti is reachable
-    # only through Telegram or an SSH tunnel to 127.0.0.1:8000.
+    ports:
+      - "80:80"
+      - "443:443"
     expose:
       - "80"
       - "443"
@@ -88,3 +93,4 @@ volumes:
   postgres_data:
   caddy_data:
   caddy_config:
+  chitti_state:

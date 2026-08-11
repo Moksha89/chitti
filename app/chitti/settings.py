@@ -8,6 +8,10 @@ class Settings(BaseSettings):
     litellm_base_url: str = "http://localhost:4000"
     litellm_master_key: str = ""
     chitti_provider: str = "litellm"
+    chitti_username: str = "akirah"
+    chitti_password_hash: str = ""
+    chitti_session_ttl_minutes: int = 480
+    chitti_auth_state_path: str = "/app/data/auth_state.json"
     telegram_bot_token: str = ""
     allowed_telegram_user_ids: str = ""
     profile_path: str = "/app/profile/PROFILE.md"

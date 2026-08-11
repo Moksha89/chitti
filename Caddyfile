@@ -1,19 +1,3 @@
-# Phase 1 intentionally has no public HTTP route. Do not add a reverse_proxy
-# to chitti:8000 here: Chitti is reachable only through Telegram or SSH
-# forwarding to 127.0.0.1:8000.
-:80 {
-    respond 404
+{$DOMAIN:localhost} {
+    reverse_proxy chitti:8000
 }
-
-# Future preview-site configuration (disabled):
-#
-# {$DOMAIN} {
-#     tls {
-#         dns <provider> {env.DNS_API_TOKEN}
-#     }
-#     reverse_proxy <preview-router>:80
-# }
-#
-# Enabling this requires a real DOMAIN, DNS-01 credentials (for example
-# DNS_API_TOKEN), and a Caddy image built with the selected DNS provider
-# module. HTTP-01 cannot issue *.dev.<DOMAIN> wildcard certificates.

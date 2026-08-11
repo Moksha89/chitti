@@ -47,15 +47,12 @@ and per-deployment budget are configured in `litellm/config.yaml`.
 
 ```bash
 cp .env.example .env
-# Set POSTGRES_PASSWORD and LITELLM_MASTER_KEY to local dummy values.
+# Set POSTGRES_PASSWORD, LITELLM_MASTER_KEY, and an Argon2id
+# CHITTI_PASSWORD_HASH (never put a plaintext password in .env).
 make up
 make migrate
 make test
 make lint
-curl -s http://127.0.0.1:8000/health
-curl -s -X POST http://127.0.0.1:8000/chat \
-  -H 'content-type: application/json' \
-  -d '{"message":"I prefer a dark, minimal interface.","project":"demo"}'
 ```
 
 With empty provider keys, the gateway will reject real model requests. Tests
@@ -82,12 +79,29 @@ facts, detects contradictions against active decisions, and asks the user to
 resolve a contradiction instead of silently overwriting history. This path is
 covered by tests.
 
+## Web interface and authentication
+
+Caddy is the only public surface. It publishes the server-rendered Chitti
+login and chat UI over HTTPS, while Chitti, LiteLLM, and PostgreSQL remain
+loopback-only. Set `DOMAIN` to the hostname used by Caddy. For an IP-only
+deployment, an `sslip.io` hostname derived from the server address can be
+placed in the server-side `.env`; the concrete hostname must never be
+committed.
+
+The single configured user is `akirah`. `CHITTI_PASSWORD_HASH` must contain an
+Argon2id hash, never a plaintext password. The first generated password is
+forced to change at first login. Sessions are server-side, expire, use
+HttpOnly/Secure/SameSite cookies, and require CSRF tokens for state changes.
+Repeated login failures trigger a temporary lockout. The dashboard shows live
+decisions and unresolved contradictions; choosing a resolution appends a new
+decision and supersedes the prior one.
+
 ## Telegram
 
-Set `TELEGRAM_BOT_TOKEN` and a comma-separated
+Telegram is retained as an opt-in secondary interface. Set
+`TELEGRAM_BOT_TOKEN` and a comma-separated
 `ALLOWED_TELEGRAM_USER_IDS`. Messages from every other Telegram user/chat ID
 are ignored. The polling loop is inside the Chitti service and stops cleanly.
-The local `/chat` endpoint is the deterministic test surface.
 
 ## Deployment
 
@@ -108,12 +122,8 @@ docker compose exec -T postgres pg_restore -U "$POSTGRES_USER" \
 Review it before running on a real VPS. It intentionally refuses to disable
 password authentication when no authorized key is present.
 
-Phase 1 deliberately does not publish Caddy ports or proxy Chitti. Use
-Telegram or an SSH tunnel such as
-`ssh -L 8000:127.0.0.1:8000 administrator@host`. The Caddy service and its
-disabled preview-site template remain as a later-phase seam. Wildcard
-`*.dev.<DOMAIN>` certificates require DNS-01 credentials and a Caddy image
-with the matching DNS provider module; HTTP-01 cannot issue them.
+The Chitti, LiteLLM, and PostgreSQL host ports remain loopback-only. Caddy
+publishes only ports 80 and 443 and proxies to the authenticated Chitti app.
 
 ## Later-phase seams
 

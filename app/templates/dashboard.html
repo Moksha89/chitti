@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Chitti{% endblock %}
+{% block body %}
+<header class="row">
+  <h1>Chitti</h1>
+  <form method="post" action="/logout">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="secondary" type="submit">Log out</button>
+  </form>
+</header>
+<section class="card">
+  <h2>Chat</h2>
+  <div id="reply" class="chat muted">Ask Chitti something.</div>
+  <form id="chat-form">
+    <input type="hidden" id="csrf-token" value="{{ csrf_token }}">
+    <label>Project (optional) <input id="project" name="project"></label>
+    <label>Command <textarea id="message" name="message" rows="4" required></textarea></label>
+    <button type="submit">Send</button>
+  </form>
+</section>
+<section class="card">
+  <h2>What Chitti believes</h2>
+  {% if decisions %}
+  <ul>{% for decision in decisions %}<li><strong>{{ decision.decision_key }}</strong>: {{ decision.decision }} <span class="muted">({{ decision.source }})</span></li>{% endfor %}</ul>
+  {% else %}<p class="muted">No active decisions yet.</p>{% endif %}
+</section>
+<section class="card">
+  <h2>Unresolved contradictions</h2>
+  {% if conflicts %}
+  {% for conflict in conflicts %}
+  <div class="card">
+    <p><strong>{{ conflict.decision_key }}</strong></p>
+    <p>Current: {{ conflict.existing_value }}</p>
+    <p>Proposed: {{ conflict.proposed_value }}</p>
+    <div class="row">
+      <form method="post" action="/memory/conflicts/{{ conflict.id }}/resolve">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="choice" value="existing">
+        <button class="secondary" type="submit">Keep current</button>
+      </form>
+      <form method="post" action="/memory/conflicts/{{ conflict.id }}/resolve">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="choice" value="proposed">
+        <button type="submit">Use proposed</button>
+      </form>
+    </div>
+  </div>
+  {% endfor %}
+  {% else %}<p class="muted">No unresolved contradictions.</p>{% endif %}
+</section>
+<script>
+document.getElementById("chat-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const reply = document.getElementById("reply");
+  reply.textContent = "Thinking…";
+  const response = await fetch("/chat", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-CSRF-Token": document.getElementById("csrf-token").value},
+    body: JSON.stringify({message: document.getElementById("message").value, project: document.getElementById("project").value || null, history: []})
+  });
+  const body = await response.json();
+  reply.textContent = response.ok ? body.reply : (body.detail || "Request failed");
+  if (response.ok && body.conflicts && body.conflicts.length) window.location.reload();
+});
+</script>
+{% endblock %}
