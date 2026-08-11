@@ -30,6 +30,7 @@ from .provider import (
     ModelCompletion,
     ModelProvider,
     ModelToolCall,
+    ModelTransportError,
 )
 
 if TYPE_CHECKING:
@@ -45,6 +46,12 @@ MAX_FILE_WRITES_WITHOUT_COMMAND = 24
 
 class ModelProgressError(RuntimeError):
     """The model loop stopped because it was not making useful progress."""
+
+
+def _model_call_failure_detail(route: str, exc: Exception) -> str:
+    if isinstance(exc, ModelTransportError):
+        return f"model transport failure on route {route}: {exc}"
+    return f"model response processing failed on route {route}: {exc}"
 
 
 def _progress_counters(
@@ -98,7 +105,7 @@ class WorkerLimits:
     model_tokens: int = 300000
     model_write_bytes: int = 2 * 1024 * 1024
     model_spend_usd: float = 0.75
-    run_timeout_seconds: int = 1800
+    run_timeout_seconds: int = 7200
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -139,7 +146,7 @@ class WorkerLimits:
             model_tokens=int(cast(int, values.get("model_tokens", 300000))),
             model_write_bytes=int(cast(int, values.get("model_write_bytes", 2 * 1024 * 1024))),
             model_spend_usd=float(cast(float, values.get("model_spend_usd", 0.75))),
-            run_timeout_seconds=int(cast(int, values.get("run_timeout_seconds", 1800))),
+            run_timeout_seconds=int(cast(int, values.get("run_timeout_seconds", 7200))),
         )
 
 
@@ -418,8 +425,9 @@ class DockerSandboxDispatcher:
                         tool_choice="required" if route == CODER_ROUTE else None,
                     )
                 except Exception as exc:
+                    detail = _model_call_failure_detail(route, exc)
                     failure = ModelCompletion(
-                        content=f"model call failed: {str(exc)[:1000]}",
+                        content=detail[:1000],
                         model=route,
                         prompt_tokens=0,
                         completion_tokens=0,
@@ -432,7 +440,7 @@ class DockerSandboxDispatcher:
                     )
                     await self._event(
                         run_id, "model_tool_failed",
-                        f"model call failed on route {route}: {str(exc)[:1000]}",
+                        detail[:1000],
                         task_id=task.id,
                     )
                     raise
