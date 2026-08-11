@@ -15,6 +15,9 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    networks:
+      chitti_net:
+        ipv4_address: 172.31.250.3
 
   litellm:
     image: ghcr.io/berriai/litellm:v1.80.0-stable.1
@@ -43,6 +46,9 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    networks:
+      chitti_net:
+        ipv4_address: 172.31.250.4
 
   redis:
     image: redis:7.4-alpine
@@ -57,6 +63,9 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    networks:
+      chitti_net:
+        ipv4_address: 172.31.250.6
 
   chitti:
     build:
@@ -72,6 +81,7 @@ services:
       CHITTI_PASSWORD_HASH: ${CHITTI_PASSWORD_HASH}
       CHITTI_SESSION_TTL_MINUTES: ${CHITTI_SESSION_TTL_MINUTES:-480}
       CHITTI_AUTH_STATE_PATH: ${CHITTI_AUTH_STATE_PATH:-/app/data/auth_state.json}
+      CHITTI_TRUSTED_PROXY_IP: ${CHITTI_TRUSTED_PROXY_IP:-172.31.250.2}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       ALLOWED_TELEGRAM_USER_IDS: ${ALLOWED_TELEGRAM_USER_IDS}
       PROFILE_PATH: ${PROFILE_PATH:-/app/profile/PROFILE.md}
@@ -89,9 +99,15 @@ services:
       litellm:
         condition: service_healthy
     command: ["sh", "-c", "alembic upgrade head && uvicorn chitti.main:app --host 0.0.0.0 --port 8000"]
+    networks:
+      chitti_net:
+        ipv4_address: 172.31.250.5
 
   caddy:
-    image: caddy:2.9.1-alpine
+    build:
+      context: ./deploy/caddy
+      dockerfile: Dockerfile
+    image: chitti-caddy:2.9.1-ratelimit
     restart: unless-stopped
     environment:
       DOMAIN: ${DOMAIN:-localhost}
@@ -108,9 +124,17 @@ services:
     depends_on:
       chitti:
         condition: service_started
+    networks:
+      chitti_net:
+        ipv4_address: 172.31.250.2
 
 volumes:
   postgres_data:
   caddy_data:
   caddy_config:
   chitti_state:
+networks:
+  chitti_net:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
