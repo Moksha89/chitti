@@ -23,7 +23,12 @@ from .plans import (
     validate_approval_binding,
 )
 from .previews import copy_export, remove_preview
-from .provider import ModelCompletion, ModelProvider
+from .provider import (
+    CODER_ROUTE,
+    REVIEWER_ROUTE,
+    ModelCompletion,
+    ModelProvider,
+)
 
 if TYPE_CHECKING:
     from .db import Database
@@ -262,7 +267,7 @@ class DockerSandboxDispatcher:
         operation_index = 1
         for task in revision.document.tasks:
             completed_commands: set[str] = set()
-            route = "coder"
+            route = CODER_ROUTE
             failures = 0
             messages = [
                 {"role": "system", "content": stable},
@@ -329,7 +334,7 @@ class DockerSandboxDispatcher:
                     raise RuntimeError("model token budget exceeded")
                 if spent > limits.model_spend_usd:
                     raise RuntimeError("model spend budget exceeded")
-                if route == "reviewer":
+                if route == REVIEWER_ROUTE:
                     messages.extend(
                         [
                             {"role": "assistant", "content": completion.content[:16000]},
@@ -342,7 +347,7 @@ class DockerSandboxDispatcher:
                             },
                         ]
                     )
-                    route = "coder"
+                    route = CODER_ROUTE
                     continue
                 try:
                     tool, arguments = _parse_tool_call(completion.content)
@@ -389,8 +394,8 @@ class DockerSandboxDispatcher:
                     failures += 1
                     result_text = f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
                     await self._event(run_id, "model_tool_failed", result_text, task_id=task.id)
-                    if failures >= 2 and route == "coder":
-                        route = "reviewer"
+                    if failures >= 2 and route == CODER_ROUTE:
+                        route = REVIEWER_ROUTE
                         await self._event(
                             run_id, "model_route_switched",
                             "switched to reviewer after two failures on the same task",
@@ -511,7 +516,7 @@ class DockerSandboxDispatcher:
             maximum = min(int(cast(int, arguments.get("max_bytes", 65536))), 65536)
             return path.read_bytes()[:maximum].decode("utf-8", errors="replace"), 0, operation_index
         if tool == "write_file":
-            if route != "coder":
+            if route != CODER_ROUTE:
                 raise ValueError("reviewer route cannot write files")
             path = _confined_path(workspace, str(arguments.get("path", "")))
             content = str(arguments.get("content", ""))
@@ -600,18 +605,20 @@ class DockerSandboxDispatcher:
             },
         ]
         try:
-            completion = await self.model_provider.agent_completion(review_messages, "reviewer")
+            completion = await self.model_provider.agent_completion(
+                review_messages, REVIEWER_ROUTE
+            )
         except Exception as exc:
             failure = ModelCompletion(
                 content=f"reviewer call failed: {str(exc)[:1000]}",
-                model="reviewer",
+                model=REVIEWER_ROUTE,
                 prompt_tokens=0,
                 completion_tokens=0,
                 total_tokens=0,
                 cost_usd=0.0,
             )
             await self._record_model_call(
-                run_id, "review", calls + 1, "reviewer", failure,
+                run_id, "review", calls + 1, REVIEWER_ROUTE, failure,
                 kind="reviewer_report",
                 prompt=json.dumps(review_messages, separators=(",", ":")),
             )
@@ -621,7 +628,7 @@ class DockerSandboxDispatcher:
         if spent + completion.cost_usd > limits.model_spend_usd:
             raise RuntimeError("model spend budget exceeded during review")
         await self._record_model_call(
-            run_id, "review", calls + 1, "reviewer", completion,
+            run_id, "review", calls + 1, REVIEWER_ROUTE, completion,
             kind="reviewer_report",
             prompt=json.dumps(review_messages, separators=(",", ":")),
         )

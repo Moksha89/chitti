@@ -111,6 +111,52 @@ done
 docker compose ps --status running --services | grep -qx chitti
 
 docker build --quiet -t chitti-sandbox:latest sandbox >/dev/null
+runner_image="chitti-chitti:latest"
+
+# Recreate LiteLLM so it cannot retain a process or file-mounted config from
+# an earlier checkout.
+docker compose up -d --build --force-recreate litellm
+docker compose ps
+
+litellm_container="$(docker compose ps -q litellm)"
+[[ -n "${litellm_container}" ]]
+docker exec "${litellm_container}" test -s /app/litellm/config.yaml
+gateway_models="$(
+  curl --fail --silent --show-error --max-time 15 \
+    -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+    "http://127.0.0.1:${LITELLM_PORT:-4000}/v1/models"
+)"
+missing_gateway_routes="$(
+  printf '%s' "${gateway_models}" |
+    docker run --rm -i --entrypoint python "${runner_image}" -c \
+      'import json
+import sys
+from chitti.provider import REQUIRED_GATEWAY_ROUTES
+
+payload = json.load(sys.stdin)
+model_ids = {
+    str(item["id"])
+    for item in payload.get("data", [])
+    if isinstance(item, dict) and "id" in item
+}
+print("\n".join(sorted(REQUIRED_GATEWAY_ROUTES - model_ids)))'
+)"
+if [[ -n "${missing_gateway_routes}" ]]; then
+  echo "gateway loaded-route assertion failed; missing: ${missing_gateway_routes}" >&2
+  exit 1
+fi
+echo "Gateway loaded-route assertions passed."
+
+caddy_container="$(docker compose ps -q caddy)"
+[[ -n "${caddy_container}" ]]
+caddy_loaded_config="$(
+  docker exec "${caddy_container}" \
+    wget -qO- http://127.0.0.1:2019/config/
+)"
+printf '%s' "${caddy_loaded_config}" | grep -q '"apps"'
+curl --fail --silent --show-error --max-time 15 \
+  "https://${DOMAIN:-localhost}/login" >/dev/null
+echo "Caddy loaded configuration and served the login page."
 
 if [[ ! -x "${RUNNER_PYTHON}" ]]; then
   if ! python3 -m venv "${RUNNER_VENV_DIR}"; then
@@ -285,7 +331,6 @@ END
 $$;
 SQL
 
-runner_image="chitti-chitti:latest"
 [[ -n "${runner_image}" ]]
 docker run --rm --network host --env-file "${RUNNER_ENV}" \
   --entrypoint python "${runner_image}" -c '
