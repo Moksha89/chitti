@@ -1,5 +1,7 @@
 import os
 import subprocess
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import pytest
 from sqlalchemy import text
@@ -16,11 +18,22 @@ from chitti.plans import (
     revision_by_id,
     validate_approval_binding,
 )
+from chitti.runner import cancellation_requested, next_queued_run
 from chitti.worker import approved_revision
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("RUN_DB_TESTS"), reason="set RUN_DB_TESTS=1 to run PostgreSQL integration tests"
 )
+
+
+class _DatabaseAdapter:
+    def __init__(self, engine) -> None:
+        self.engine = engine
+
+    @asynccontextmanager
+    async def sessions(self) -> AsyncIterator[object]:
+        async with self.engine.begin() as session:
+            yield session
 
 
 @pytest.fixture
@@ -120,6 +133,13 @@ async def test_worker_artifact_payload_retention_preserves_audit_record(database
             ),
             {"run": run_id},
         )
+        await session.execute(
+            text(
+                "INSERT INTO worker_run_events (run_id, status, detail) "
+                "VALUES (:run, 'operation_running', 'later event must not erase intent')"
+            ),
+            {"run": run_id},
+        )
         artifact_result = await session.execute(
             text(
                 "INSERT INTO worker_artifacts "
@@ -145,3 +165,45 @@ async def test_worker_artifact_payload_retention_preserves_audit_record(database
             {"artifact": artifact_id},
         )
         assert record.one() == ("a" * 64, 4)
+    assert await cancellation_requested(_DatabaseAdapter(database), run_id)
+
+
+async def test_runner_claim_is_atomic_and_cancellation_is_sticky(database) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(session, "runner", "Build fixture.", document())
+        result = await session.execute(
+            text(
+                "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
+                "VALUES (:revision, CAST(:limits AS json), 'runner-test') RETURNING id"
+            ),
+            {"revision": revision_id, "limits": '{"cpus": 1.0}'},
+        )
+        run_id = int(result.scalar_one())
+        await session.execute(
+            text(
+                "INSERT INTO worker_run_events (run_id, status, detail) "
+                "VALUES (:run, 'queued', 'test')"
+            ),
+            {"run": run_id},
+        )
+    adapter = _DatabaseAdapter(database)
+    claimed = await next_queued_run(adapter)  # type: ignore[arg-type]
+    assert claimed is not None
+    assert int(claimed["id"]) == run_id
+    async with database.begin() as session:
+        await session.execute(
+            text(
+                "INSERT INTO worker_run_events (run_id, status, detail) "
+                "VALUES (:run, 'cancel_requested', 'test')"
+            ),
+            {"run": run_id},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO worker_run_events (run_id, status, detail) "
+                "VALUES (:run, 'operation_running', 'later event')"
+            ),
+            {"run": run_id},
+        )
+    assert await cancellation_requested(adapter, run_id)  # type: ignore[arg-type]
+    assert await next_queued_run(adapter) is None  # type: ignore[arg-type]

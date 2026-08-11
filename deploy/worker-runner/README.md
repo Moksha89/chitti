@@ -1,7 +1,8 @@
 # Chitti host runner
 
 The internet-facing `chitti` container never receives Docker access. Install
-the unit as root on the host and provide `/etc/chitti/worker-runner.env` with
+the deployed application under `/opt/chitti`, install the unit as root on the
+host, and provide `/etc/chitti/worker-runner.env` with
 the runner-only database URL:
 
 ```text
@@ -19,6 +20,10 @@ containers. The worker container itself remains non-root and receives no
 Docker socket.
 
 `StateDirectory=chitti-worker` provides `/var/lib/chitti-worker`; the runner
-uses `/var/lib/chitti-worker/runs`. It must be
-visible to the host Docker daemon; do not place it under a private container
-volume or a systemd-private `/tmp` path.
+uses `/var/lib/chitti-worker/runs`. It must be visible to the host Docker
+daemon; do not place it under a private container volume or a
+systemd-private `/tmp` path. `ProtectHome=true` is therefore compatible with
+the runner. `ProtectSystem=full` leaves the state directory writable through
+`ReadWritePaths`, and `NoNewPrivileges=true` is safe because the unit starts
+as root and neither Docker CLI access nor the existing mount capabilities
+require acquiring new privileges.

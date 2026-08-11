@@ -41,6 +41,7 @@ def test_worker_limits_are_recorded_as_explicit_sandbox_contract() -> None:
     assert values["pids"] == 128
     assert values["non_root_uid"] == 65532
     assert values["artifact_bytes"] > 0
+    assert WorkerLimits.from_json(values) == limits
 
 
 def test_fixed_operations_are_deterministic_and_include_preview() -> None:

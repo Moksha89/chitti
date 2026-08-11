@@ -7,9 +7,9 @@ Requires=docker.service
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/ubuntu/chitti/app
+WorkingDirectory=/opt/chitti/app
 EnvironmentFile=/etc/chitti/worker-runner.env
-Environment=PYTHONPATH=/home/ubuntu/chitti/app
+Environment=PYTHONPATH=/opt/chitti/app
 RuntimeDirectory=chitti-worker
 StateDirectory=chitti-worker
 ExecStart=/usr/bin/python3 -m chitti.runner
@@ -19,7 +19,9 @@ StandardOutput=journal
 StandardError=journal
 PrivateTmp=true
 ProtectHome=true
-NoNewPrivileges=false
+ProtectSystem=full
+ReadWritePaths=/var/lib/chitti-worker
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target

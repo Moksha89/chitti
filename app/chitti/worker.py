@@ -6,10 +6,11 @@ import json
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Protocol
+from typing import IO, TYPE_CHECKING, Protocol, cast
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,6 +48,18 @@ class WorkerLimits:
             "network_policy": "public_egress_default_bridge",
             "non_root_uid": 65532,
         }
+
+    @classmethod
+    def from_json(cls, values: Mapping[str, object]) -> WorkerLimits:
+        return cls(
+            cpus=float(cast(float, values["cpus"])),
+            memory=str(values["memory"]),
+            pids=int(cast(int, values["pids"])),
+            timeout_seconds=int(cast(int, values["timeout_seconds"])),
+            nofile=int(cast(int, values["nofile"])),
+            artifact_bytes=int(cast(int, values["artifact_bytes"])),
+            shm_size=str(values["shm_size"]),
+        )
 
 
 @dataclass(frozen=True)

@@ -10,4 +10,9 @@ GRANT SELECT ON plan_revisions, plan_approvals, worker_runs,
 GRANT INSERT ON worker_run_events, worker_operations, worker_artifacts,
     worker_artifact_payloads TO chitti_runner;
 GRANT DELETE ON worker_artifact_payloads TO chitti_runner;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO chitti_runner;
+GRANT USAGE, SELECT ON SEQUENCE
+    plan_task_events_id_seq,
+    worker_run_events_id_seq,
+    worker_operations_id_seq,
+    worker_artifacts_id_seq
+    TO chitti_runner;

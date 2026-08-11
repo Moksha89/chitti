@@ -31,7 +31,7 @@ async def next_queued_run(database: Database) -> Mapping[str, object] | None:
                 "  WHERE run_id = r.id ORDER BY id DESC LIMIT 1"
                 ") latest ON latest.status = 'queued' "
                 "ORDER BY r.id "
-                "LIMIT 1"
+                "LIMIT 1 FOR UPDATE OF r SKIP LOCKED"
             )
         )
         row = result.mappings().one_or_none()
@@ -48,17 +48,18 @@ async def next_queued_run(database: Database) -> Mapping[str, object] | None:
         return cast(Mapping[str, object], row)
 
 
-async def latest_status(database: Database, run_id: int) -> str | None:
+async def cancellation_requested(database: Database, run_id: int) -> bool:
     async with database.sessions() as session:
         result = await session.execute(
             text(
-                "SELECT status FROM worker_run_events "
-                "WHERE run_id = :run_id ORDER BY id DESC LIMIT 1"
+                "SELECT EXISTS ("
+                "  SELECT 1 FROM worker_run_events "
+                "  WHERE run_id = :run_id AND status = 'cancel_requested'"
+                ")"
             ),
             {"run_id": run_id},
         )
-        value = result.scalar_one_or_none()
-        return str(value) if value is not None else None
+        return bool(result.scalar_one())
 
 
 async def record_event(database: Database, run_id: int, status: str, detail: str) -> None:
@@ -120,7 +121,7 @@ async def execute_run(
         if isinstance(raw_limits, Mapping)
         else json.loads(str(raw_limits))
     )
-    limits = WorkerLimits(**limits_data)
+    limits = WorkerLimits.from_json(limits_data)
     async with database.sessions() as session:
         revision = await approved_revision(session, revision_id)
 
@@ -128,7 +129,7 @@ async def execute_run(
     try:
         while not task.done():
             await asyncio.sleep(1)
-            if await latest_status(database, run_id) == "cancel_requested":
+            if await cancellation_requested(database, run_id):
                 await dispatcher.cancel(run_id)
         await task
     except asyncio.CancelledError:
