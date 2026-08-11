@@ -111,6 +111,8 @@ class WorkerDispatcher(Protocol):
 class DockerSandboxDispatcher:
     """Host-side cage controller; the worker container receives no Docker socket."""
 
+    _HOST_MOUNT_NAMESPACE = "/proc/1/ns/mnt"
+
     def __init__(
         self,
         database: Database,
@@ -782,13 +784,15 @@ class DockerSandboxDispatcher:
         try:
             await asyncio.to_thread(
                 subprocess.run,
-                [
-                    "mount",
-                    "-o",
-                    "loop,nodev,nosuid",
-                    str(image),
-                    str(workspace),
-                ],
+                self._host_command(
+                    [
+                        "mount",
+                        "-o",
+                        "loop,nodev,nosuid",
+                        str(image),
+                        str(workspace),
+                    ]
+                ),
                 check=True,
             )
             await asyncio.to_thread(
@@ -796,6 +800,11 @@ class DockerSandboxDispatcher:
                 ["chown", "65532:65532", str(workspace)],
                 check=True,
             )
+            source, filesystem, options = await asyncio.to_thread(
+                self._mounted_details, workspace
+            )
+            self._assert_quota_mount(source, filesystem, options)
+            await asyncio.to_thread(self._verify_worker_mount, workspace)
         except Exception:
             await self._cleanup_workspace(workspace)
             raise
@@ -803,53 +812,163 @@ class DockerSandboxDispatcher:
     async def _unmount_workspace(self, workspace: Path) -> None:
         image = self._workspace_image(workspace)
         source = await asyncio.to_thread(self._mounted_source, workspace)
+        unmount_result: subprocess.CompletedProcess[str] | None = None
         if source is not None:
-            await asyncio.to_thread(
-                subprocess.run, ["umount", str(workspace)], check=False
+            unmount_result = await asyncio.to_thread(
+                subprocess.run,
+                self._host_command(["umount", str(workspace)]),
+                capture_output=True,
+                text=True,
+                check=False,
             )
         for _ in range(20):
             if await asyncio.to_thread(self._mounted_source, workspace) is None:
                 break
             await asyncio.sleep(0.1)
         else:
-            raise RuntimeError(f"workspace mount remains active: {workspace}")
+            detail = ""
+            if unmount_result is not None:
+                detail = (
+                    f" (umount exit={unmount_result.returncode}, "
+                    f"stderr={unmount_result.stderr.strip()!r})"
+                )
+            raise RuntimeError(f"workspace mount remains active: {workspace}{detail}")
+        if unmount_result is not None and unmount_result.returncode != 0:
+            raise RuntimeError(
+                f"workspace unmount failed: {workspace} "
+                f"(exit={unmount_result.returncode}, "
+                f"stderr={unmount_result.stderr.strip()!r})"
+            )
 
         loops = await asyncio.to_thread(self._workspace_loops, image)
         if source is not None and source.startswith("/dev/loop") and source not in loops:
             loops = (source, *loops)
+        detach_failures: list[str] = []
         for loop_device in loops:
-            await asyncio.to_thread(
-                subprocess.run, ["losetup", "--detach", loop_device], check=False
+            result = await asyncio.to_thread(
+                subprocess.run,
+                self._host_command(["losetup", "--detach", loop_device]),
+                capture_output=True,
+                text=True,
+                check=False,
             )
+            if result.returncode != 0:
+                detach_failures.append(
+                    f"{loop_device}: exit={result.returncode}, "
+                    f"stderr={result.stderr.strip()!r}"
+                )
         for _ in range(20):
             remaining = await asyncio.to_thread(self._workspace_loops, image)
             if not remaining:
+                if detach_failures:
+                    raise RuntimeError(
+                        f"workspace loop detach failed: {'; '.join(detach_failures)}"
+                    )
                 return
             await asyncio.sleep(0.1)
-        raise RuntimeError(f"workspace loop device remains active: {image}")
+        detail = f"; detach errors={'; '.join(detach_failures)}" if detach_failures else ""
+        raise RuntimeError(f"workspace loop device remains active: {image}{detail}")
 
     @staticmethod
-    def _mounted_source(workspace: Path) -> str | None:
+    def _host_command(command: list[str]) -> list[str]:
+        return [
+            "nsenter",
+            f"--mount={DockerSandboxDispatcher._HOST_MOUNT_NAMESPACE}",
+            "--",
+            *command,
+        ]
+
+    @staticmethod
+    def _assert_quota_mount(
+        source: str | None, filesystem: str, options: str
+    ) -> None:
+        if (
+            source is None
+            or not source.startswith("/dev/loop")
+            or filesystem != "ext4"
+            or "nodev" not in options.split(",")
+            or "nosuid" not in options.split(",")
+        ):
+            raise RuntimeError(
+                "workspace quota mount verification failed: "
+                f"source={source!r} filesystem={filesystem!r} options={options!r}"
+            )
+
+    @classmethod
+    def _mounted_details(cls, workspace: Path) -> tuple[str | None, str, str]:
+        result = subprocess.run(
+            cls._host_command(
+                [
+                    "findmnt",
+                    "--noheadings",
+                    "--output",
+                    "SOURCE,FSTYPE,OPTIONS",
+                    "--mountpoint",
+                    str(workspace),
+                ]
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        fields = result.stdout.strip().split()
+        if len(fields) < 3:
+            return None, "", ""
+        return fields[0], fields[1], fields[2]
+
+    @classmethod
+    def _mounted_source(cls, workspace: Path) -> str | None:
+        return cls._mounted_details(workspace)[0]
+
+    @classmethod
+    def _verify_worker_mount(cls, workspace: Path) -> None:
+        probe = (
+            "for line in open('/proc/self/mountinfo', encoding='utf-8'):\n"
+            "    fields = line.rstrip().split(' - ', 1)\n"
+            "    if len(fields) != 2:\n"
+            "        continue\n"
+            "    mount = fields[0].split()\n"
+            "    source = fields[1].split()\n"
+            "    if len(mount) > 4 and mount[4] == '/workspace':\n"
+            "        if source[0] != 'ext4' or not source[1].startswith('/dev/loop'):\n"
+            "            raise SystemExit(f'unexpected worker mount: {line.strip()}')\n"
+            "        print(line.strip())\n"
+            "        raise SystemExit(0)\n"
+            "raise SystemExit('worker mount was not visible')\n"
+        )
         result = subprocess.run(
             [
-                "findmnt",
-                "--noheadings",
-                "--output",
-                "SOURCE",
-                "--mountpoint",
-                str(workspace),
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--read-only",
+                "--user",
+                "65532:65532",
+                "--mount",
+                f"type=bind,src={workspace},dst=/workspace",
+                "chitti-sandbox:latest",
+                "python3",
+                "-c",
+                probe,
             ],
             capture_output=True,
             text=True,
             check=False,
         )
-        source = result.stdout.strip()
-        return source or None
+        if result.returncode != 0:
+            raise RuntimeError(
+                "worker quota mount verification failed: "
+                f"exit={result.returncode}, stderr={result.stderr.strip()!r}"
+            )
 
     @staticmethod
     def _associated_loops(image: Path) -> tuple[str, ...]:
         result = subprocess.run(
-            ["losetup", "--associated", str(image)],
+            DockerSandboxDispatcher._host_command(
+                ["losetup", "--associated", str(image)]
+            ),
             capture_output=True,
             text=True,
             check=False,
@@ -869,7 +988,9 @@ class DockerSandboxDispatcher:
     @staticmethod
     def _backing_loops(root: Path) -> dict[Path, tuple[str, ...]]:
         result = subprocess.run(
-            ["losetup", "--list", "--noheadings", "--output", "NAME,BACK-FILE"],
+            DockerSandboxDispatcher._host_command(
+                ["losetup", "--list", "--noheadings", "--output", "NAME,BACK-FILE"]
+            ),
             capture_output=True,
             text=True,
             check=False,
@@ -888,7 +1009,9 @@ class DockerSandboxDispatcher:
     @staticmethod
     def _mounted_workspaces(root: Path) -> set[Path]:
         result = subprocess.run(
-            ["findmnt", "--noheadings", "--output", "TARGET,SOURCE"],
+            DockerSandboxDispatcher._host_command(
+                ["findmnt", "--noheadings", "--output", "TARGET,SOURCE"]
+            ),
             capture_output=True,
             text=True,
             check=False,
