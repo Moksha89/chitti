@@ -2,9 +2,11 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -302,7 +304,20 @@ async def dashboard_context(request: Request, session: Session) -> dict[str, obj
     async with database.sessions() as db_session:
         decisions = await memory.decisions(db_session)
         conflicts = await memory.conflicts(db_session)
-    return {"csrf_token": session.csrf_token, "decisions": decisions, "conflicts": conflicts}
+    now = datetime.now(ZoneInfo(request.app.state.settings.display_timezone))
+    if now.hour < 12:
+        greeting = "Good morning"
+    elif now.hour < 18:
+        greeting = "Good afternoon"
+    else:
+        greeting = "Good evening"
+    return {
+        "csrf_token": session.csrf_token,
+        "decisions": decisions,
+        "conflicts": conflicts,
+        "greeting": greeting,
+        "display_timezone": request.app.state.settings.display_timezone,
+    }
 
 
 @app.get("/", response_class=HTMLResponse, response_model=None)
@@ -332,10 +347,39 @@ async def resolve_conflict(conflict_id: int, request: Request) -> RedirectRespon
     require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
     choice = str(form.get("choice", ""))
     database: Database = request.app.state.database
-    memory = MemoryStore(FakeEmbedder())
+    memory = MemoryStore(
+        FakeEmbedder()
+        if request.app.state.settings.chitti_provider == "fake"
+        else get_embedder(request.app.state.settings.embedding_model)
+    )
     async with database.sessions() as db_session:
         try:
             await memory.resolve_conflict(db_session, conflict_id, choice)
+            await db_session.commit()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/memory/decisions/{decision_id}/forget")
+async def forget_decision(decision_id: int, request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    if auth_manager(request).must_change_password:
+        return RedirectResponse("/change-password", status_code=303)
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    database: Database = request.app.state.database
+    memory = MemoryStore(
+        FakeEmbedder()
+        if request.app.state.settings.chitti_provider == "fake"
+        else get_embedder(request.app.state.settings.embedding_model)
+    )
+    async with database.sessions() as db_session:
+        try:
+            await memory.forget_decision(db_session, decision_id)
             await db_session.commit()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

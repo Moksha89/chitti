@@ -22,7 +22,11 @@ class ModelProvider(Protocol):
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str: ...
 
     async def extract_memories(
-        self, profile: str, user_message: str, assistant_message: str
+        self,
+        profile: str,
+        user_message: str,
+        assistant_message: str,
+        existing_keys: list[str] | None = None,
     ) -> list[ExtractedMemory]: ...
 
 
@@ -57,13 +61,21 @@ class LiteLLMProvider:
         return await self._completion([{"role": "system", "content": system}, *messages], role)
 
     async def extract_memories(
-        self, profile: str, user_message: str, assistant_message: str
+        self,
+        profile: str,
+        user_message: str,
+        assistant_message: str,
+        existing_keys: list[str] | None = None,
     ) -> list[ExtractedMemory]:
+        keys = ", ".join(existing_keys or []) or "(none)"
         prompt = (
             "Extract only durable facts, preferences, or decisions from this turn. "
             "Return a JSON array of objects with key, value, rationale, project, source. "
             "Use source user_stated when the user explicitly states it, otherwise "
-            "chitti_inferred. Return [] when there is nothing durable.\n"
+            "chitti_inferred. Return [] when there is nothing durable. "
+            "When a fact matches an existing key, reuse that key exactly instead of "
+            "creating a synonym. Existing active keys:\n"
+            f"{keys}\n"
             f"PROFILE:\n{profile}\nUSER:\n{user_message}\nASSISTANT:\n{assistant_message}"
         )
         raw = await self._completion(
@@ -95,7 +107,11 @@ class FakeProvider:
         return f"[fake:{role}] I heard you: {latest}"
 
     async def extract_memories(
-        self, profile: str, user_message: str, assistant_message: str
+        self,
+        profile: str,
+        user_message: str,
+        assistant_message: str,
+        existing_keys: list[str] | None = None,
     ) -> list[ExtractedMemory]:
         lowered = user_message.lower()
         memories: list[ExtractedMemory] = []

@@ -48,7 +48,10 @@ class ChittiService:
         await self.memory.add_chunk(
             session, reply, "conversation_assistant", project, {"project": project}
         )
-        extracted = await self.provider.extract_memories(self.profile, user_message, reply)
+        existing_keys = await self.memory.active_keys(session)
+        extracted = await self.provider.extract_memories(
+            self.profile, user_message, reply, existing_keys
+        )
         conflicts = await self.memory.record_memories(session, extracted)
         await session.commit()
         if conflicts:

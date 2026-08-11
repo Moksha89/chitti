@@ -133,6 +133,9 @@ def test_unauthenticated_page_routes_redirect_to_login(tmp_path) -> None:
     assert client.post("/memory/conflicts/1/resolve", follow_redirects=False).headers["location"] == (
         "/login?next=%2Fmemory%2Fconflicts%2F1%2Fresolve"
     )
+    assert client.post("/memory/decisions/1/forget", follow_redirects=False).headers["location"] == (
+        "/login?next=%2Fmemory%2Fdecisions%2F1%2Fforget"
+    )
 
 
 def test_unauthenticated_api_routes_keep_generic_401(tmp_path) -> None:

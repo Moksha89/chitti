@@ -56,3 +56,23 @@ async def test_append_only_and_retrieval(store) -> None:
         await session.rollback()
         recalled = await memory.recall(session, "FastAPI", 1)
         assert recalled and "FastAPI" in recalled[0].content
+
+
+async def test_rephrased_key_conflicts_and_forget_hides_without_deleting(store) -> None:
+    engine, memory = store
+    async with engine.begin() as session:
+        first = await memory.append_decision(
+            session,
+            ExtractedMemory(
+                "preferred_stack.frontend_framework", "SvelteKit", "user stated", None, "user_stated"
+            ),
+        )
+        conflicts = await memory.record_memories(
+            session,
+            [ExtractedMemory("preferred_frontend_framework", "Next.js", "replacement", None, "user_stated")],
+        )
+        assert conflicts and conflicts[0].key == "preferred_stack.frontend_framework"
+        await memory.forget_decision(session, first)
+        assert await memory.decisions(session) == []
+        result = await session.execute(text("SELECT id FROM decisions WHERE id = :id"), {"id": first})
+        assert result.scalar_one() == first

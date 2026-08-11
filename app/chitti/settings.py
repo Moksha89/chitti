@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     profile_path: str = "/app/profile/PROFILE.md"
     project_root: str = "/app/projects"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    display_timezone: str = "Asia/Dubai"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
