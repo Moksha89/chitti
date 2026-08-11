@@ -9,6 +9,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field
 
 from .auth import AuthManager, Session
@@ -151,6 +152,11 @@ template_directory = "/app/templates"
 if not Path(template_directory).exists():
     template_directory = str(Path(__file__).resolve().parents[1] / "templates")
 templates = Jinja2Templates(directory=template_directory)
+markdown = MarkdownIt("commonmark", {"html": False, "breaks": True}).enable("table")
+
+
+def render_markdown(value: str) -> str:
+    return cast(str, markdown.render(value))
 
 
 @app.middleware("http")
@@ -356,7 +362,11 @@ async def chat(payload: ChatRequest, request: Request) -> dict[str, object]:
     except Exception as exc:
         logging.getLogger(__name__).exception("chat_provider_failed")
         raise HTTPException(status_code=503, detail="model provider unavailable") from exc
-    return {"reply": result.reply, "conflicts": [asdict(item) for item in result.conflicts]}
+    return {
+        "reply": result.reply,
+        "reply_html": render_markdown(result.reply),
+        "conflicts": [asdict(item) for item in result.conflicts],
+    }
 
 
 @app.get("/projects/{project}/state")
