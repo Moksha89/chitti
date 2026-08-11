@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+exec </dev/null
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/chitti}"
 REMOTE_BRANCH="${REMOTE_BRANCH:-main}"
@@ -10,6 +11,7 @@ RUNNER_ROLE_SQL="${RUNNER_ROLE_SQL:-deploy/worker-runner/runner-role.sql}"
 RUNNER_UNIT_SOURCE="${RUNNER_UNIT_SOURCE:-deploy/worker-runner/chitti-worker-runner.service}"
 RUNNER_VENV_DIR="${RUNNER_VENV_DIR:-/opt/chitti-runner}"
 RUNNER_PYTHON="${RUNNER_PYTHON:-/opt/chitti-runner/bin/python}"
+DEPLOY_COMPLETION_MARKER="CHITTI_DEPLOY_COMPLETE"
 fresh_clone=0
 real_checkout=0
 if [[ -e "${INSTALL_DIR}/.git" ]] &&
@@ -39,6 +41,7 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
       "Would create or verify the runner-only database role" \
       "Would verify schema, privileges, and container network boundaries"
   fi
+  echo "${DEPLOY_COMPLETION_MARKER}"
   exit 0
 fi
 
@@ -139,9 +142,8 @@ gateway_models="$(
     "http://127.0.0.1:${LITELLM_PORT:-4000}/v1/models"
 )"
 missing_gateway_routes="$(
-  printf '%s' "${gateway_models}" |
-    docker run --rm -i --entrypoint python "${runner_image}" -c \
-      'import json
+  docker run --rm -i --entrypoint python "${runner_image}" -c \
+    'import json
 import sys
 from chitti.provider import REQUIRED_GATEWAY_ROUTES
 
@@ -152,6 +154,7 @@ model_ids = {
     if isinstance(item, dict) and "id" in item
 }
 print("\n".join(sorted(REQUIRED_GATEWAY_ROUTES - model_ids)))'
+  < <(printf '%s' "${gateway_models}")
 )"
 if [[ -n "${missing_gateway_routes}" ]]; then
   echo "gateway loaded-route assertion failed; missing: ${missing_gateway_routes}" >&2
@@ -490,3 +493,4 @@ asyncio.run(main())
 systemctl is-enabled --quiet "${RUNNER_UNIT}"
 systemctl is-active --quiet "${RUNNER_UNIT}"
 echo "Deployment and post-deploy boundary checks completed."
+echo "${DEPLOY_COMPLETION_MARKER}"
