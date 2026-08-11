@@ -564,6 +564,8 @@ class DockerSandboxDispatcher:
         ):
             raise RuntimeError("reviewer returned an incomplete structured verdict")
         await self._event(run_id, "review_complete", json.dumps(verdict)[:4000])
+        if verdict["verdict"] == "fail":
+            raise RuntimeError(f"reviewer verdict fail: {verdict['summary'][:1000]}")
 
     async def _review_evidence(self, run_id: int, workspace: Path) -> str:
         async with self.database.sessions() as session:
@@ -1203,7 +1205,8 @@ def _model_system_prompt() -> str:
         "Use local geometry, lights, CSS, and ASCII text so the page renders "
         "offline inside the cage. Replace the starter's fixture copy and "
         "placeholder content with original task-specific copy; do not claim "
-        "inherited fixture text as authored work."
+        "inherited fixture text as authored work. Run npm install before build "
+        "or test so dependency failures are avoided."
     )
 
 
