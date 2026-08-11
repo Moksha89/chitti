@@ -423,10 +423,11 @@ async def approve_plan(revision_id: int, request: Request) -> RedirectResponse:
         return RedirectResponse("/change-password", status_code=303)
     form = await request.form()
     require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    reason = str(form.get("reason", "")).strip() or None
     database: Database = request.app.state.database
     async with database.sessions() as db_session:
         try:
-            await approve_revision(db_session, revision_id)
+            await approve_revision(db_session, revision_id, reason)
             await db_session.commit()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

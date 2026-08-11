@@ -77,6 +77,35 @@ def test_finished_run_without_export_manifest_is_not_promotable() -> None:
     assert "Approve result" not in rendered
 
 
+def test_plan_approval_reason_is_rendered() -> None:
+    revision = SimpleNamespace(
+        id=3,
+        project="demo",
+        revision=1,
+        brief="Build a demo.",
+        content_hash="a" * 64,
+        document=SimpleNamespace(
+            title="Demo",
+            summary="A demo.",
+            memory_decisions=[],
+            tasks=[],
+        ),
+    )
+    rendered = templates.get_template("plan.html").render(
+        csrf_token="csrf",
+        revision=revision,
+        approval={
+            "decision": "approved",
+            "reason": "Approved on the owner's behalf.",
+            "content_hash": "a" * 64,
+        },
+        task_statuses={},
+        runs=[],
+    )
+
+    assert "Approved on the owner&#39;s behalf." in rendered
+
+
 def test_finished_run_with_manifest_without_approval_can_be_approved() -> None:
     rendered = _render_plan_run(_finished_run({"manifest_id": 4, "approval_id": None}))
 

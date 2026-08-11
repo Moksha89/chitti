@@ -19,7 +19,13 @@ from .previews import (
     preview_id,
     remove_preview,
 )
-from .provider import FakeProvider, LiteLLMProvider
+from .provider import (
+    FakeProvider,
+    GatewayMisconfigurationError,
+    GatewayTransientError,
+    LiteLLMProvider,
+    ModelProvider,
+)
 from .settings import Settings, get_settings
 from .worker import (
     DockerSandboxDispatcher,
@@ -340,6 +346,7 @@ async def execute_run(
     database: Database,
     dispatcher: DockerSandboxDispatcher,
     row: Mapping[str, object],
+    provider: ModelProvider,
 ) -> None:
     run_id = int(cast(int, row["id"]))
     revision_id = int(cast(int, row["revision_id"]))
@@ -350,6 +357,14 @@ async def execute_run(
         else json.loads(str(raw_limits))
     )
     limits = WorkerLimits.from_json(limits_data)
+    try:
+        await provider.validate_gateway()
+    except GatewayMisconfigurationError as exc:
+        await record_event(database, run_id, "failed", f"gateway misconfiguration: {exc}")
+        return
+    except GatewayTransientError as exc:
+        await record_event(database, run_id, "failed", f"gateway temporarily unavailable: {exc}")
+        return
     async with database.sessions() as session:
         revision = await approved_revision(session, revision_id)
 
@@ -391,6 +406,7 @@ async def run_forever() -> None:
         model_provider=provider,
     )
     try:
+        await provider.validate_gateway()
         await dispatcher.cleanup_stale_workspaces()
         while True:
             await dispatcher.cleanup_expired_previews()
@@ -400,7 +416,7 @@ async def run_forever() -> None:
                 await asyncio.sleep(POLL_SECONDS)
                 continue
             try:
-                await execute_run(database, dispatcher, row)
+                await execute_run(database, dispatcher, row, provider)
             except Exception:
                 logger.exception("worker run failed outside durable event handling")
     finally:

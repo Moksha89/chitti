@@ -148,14 +148,26 @@ if [[ "${role_exists}" == "1" ]]; then
     -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <"${runner_sql_tmp}" >/dev/null
   rm -f "${runner_sql_tmp}"
   trap - EXIT
+  runner_env_tmp="$(mktemp /etc/chitti/worker-runner.env.XXXXXX)"
+  trap 'rm -f "${runner_env_tmp:-}"' EXIT
+  sed \
+    -e '/^LITELLM_BASE_URL=/d' \
+    -e '/^LITELLM_MASTER_KEY=/d' \
+    "${RUNNER_ENV}" >"${runner_env_tmp}"
+  printf 'LITELLM_BASE_URL=http://127.0.0.1:%s\nLITELLM_MASTER_KEY=%s\n' \
+    "${LITELLM_PORT:-4000}" "${LITELLM_MASTER_KEY}" >>"${runner_env_tmp}"
+  chmod 0600 "${runner_env_tmp}"
+  install -o root -g root -m 0600 "${runner_env_tmp}" "${RUNNER_ENV}"
+  rm -f "${runner_env_tmp}"
+  trap - EXIT
 else
   runner_password="$(openssl rand -hex 32)"
   runner_env_tmp="$(mktemp /etc/chitti/worker-runner.env.XXXXXX)"
   runner_sql_tmp="$(mktemp /etc/chitti/runner-role.sql.XXXXXX)"
   trap 'rm -f "${runner_env_tmp:-}" "${runner_sql_tmp:-}"' EXIT
 
-  printf 'DATABASE_URL=postgresql+asyncpg://chitti_runner:%s@127.0.0.1:5432/%s\nPREVIEW_ROOT=/var/lib/chitti-previews\nPREVIEW_STAGING_ROOT=/var/lib/chitti-preview-staging\n' \
-    "${runner_password}" "${POSTGRES_DB}" >"${runner_env_tmp}"
+  printf 'DATABASE_URL=postgresql+asyncpg://chitti_runner:%s@127.0.0.1:5432/%s\nPREVIEW_ROOT=/var/lib/chitti-previews\nPREVIEW_STAGING_ROOT=/var/lib/chitti-preview-staging\nLITELLM_BASE_URL=http://127.0.0.1:%s\nLITELLM_MASTER_KEY=%s\n' \
+    "${runner_password}" "${POSTGRES_DB}" "${LITELLM_PORT:-4000}" "${LITELLM_MASTER_KEY}" >"${runner_env_tmp}"
   chmod 0600 "${runner_env_tmp}"
 
   sed "s/REPLACE_WITH_A_RANDOM_SECRET/${runner_password}/" \
@@ -173,7 +185,8 @@ install -o root -g root -m 0644 \
   "${RUNNER_UNIT_SOURCE}" \
   "/etc/systemd/system/${RUNNER_UNIT}"
 systemctl daemon-reload
-systemctl enable --now "${RUNNER_UNIT}"
+systemctl enable "${RUNNER_UNIT}"
+systemctl restart "${RUNNER_UNIT}"
 
 app_container="$(docker compose ps -q chitti)"
 [[ -n "${app_container}" ]]

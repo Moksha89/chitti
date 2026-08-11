@@ -9,6 +9,18 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+class GatewayValidationError(RuntimeError):
+    """Base error for runner gateway preflight failures."""
+
+
+class GatewayMisconfigurationError(GatewayValidationError):
+    """The configured gateway credential or routes cannot be used."""
+
+
+class GatewayTransientError(GatewayValidationError):
+    """The gateway could not be checked due to a temporary failure."""
+
+
 @dataclass(frozen=True)
 class ExtractedMemory:
     key: str
@@ -29,6 +41,8 @@ class ModelCompletion:
 
 
 class ModelProvider(Protocol):
+    async def validate_gateway(self) -> None: ...
+
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str: ...
 
     async def plan(
@@ -61,8 +75,49 @@ def _json_payload(text: str) -> object:
 
 class LiteLLMProvider:
     def __init__(self, base_url: str, api_key: str) -> None:
-        self.url = base_url.rstrip("/") + "/v1/chat/completions"
+        self.base_url = base_url.rstrip("/")
+        self.url = self.base_url + "/v1/chat/completions"
         self.api_key = api_key
+
+    async def validate_gateway(self) -> None:
+        if not self.api_key.strip():
+            raise GatewayMisconfigurationError("gateway credential is missing")
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.get(
+                    self.base_url + "/v1/models",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise GatewayTransientError("gateway did not respond during preflight") from exc
+        except httpx.HTTPError as exc:
+            raise GatewayTransientError("gateway request failed during preflight") from exc
+        if response.status_code in {401, 403}:
+            raise GatewayMisconfigurationError("gateway credential was rejected")
+        if response.status_code >= 500:
+            raise GatewayTransientError(
+                f"gateway returned HTTP {response.status_code} during preflight"
+            )
+        if response.status_code >= 400:
+            raise GatewayMisconfigurationError(
+                f"gateway rejected the preflight request with HTTP {response.status_code}"
+            )
+        try:
+            payload = response.json()
+            model_ids = {
+                str(item["id"])
+                for item in payload.get("data", [])
+                if isinstance(item, dict) and "id" in item
+            }
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise GatewayMisconfigurationError(
+                "gateway returned an invalid model list"
+            ) from exc
+        missing = sorted({"coder", "reviewer"} - model_ids)
+        if missing:
+            raise GatewayMisconfigurationError(
+                f"gateway routes unavailable: {', '.join(missing)}"
+            )
 
     async def _completion(self, messages: list[dict[str, str]], role: str) -> str:
         return (await self.agent_completion(messages, role)).content
@@ -172,6 +227,9 @@ class LiteLLMProvider:
 
 
 class FakeProvider:
+    async def validate_gateway(self) -> None:
+        return
+
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str:
         latest = messages[-1]["content"] if messages else ""
         return f"[fake:{role}] I heard you: {latest}"
