@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     display_timezone: str = "Asia/Dubai"
     preview_root: str = "/app/previews"
+    preview_staging_root: str = "/app/preview-staging"
     preview_ttl_hours: int = 72
     preview_max_bytes: int = 200 * 1024 * 1024
     preview_max_count: int = 4

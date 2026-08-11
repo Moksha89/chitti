@@ -11,6 +11,7 @@ WorkingDirectory=/opt/chitti/app
 EnvironmentFile=/etc/chitti/worker-runner.env
 Environment=PYTHONPATH=/opt/chitti/app
 Environment=PREVIEW_ROOT=/var/lib/chitti-previews
+Environment=PREVIEW_STAGING_ROOT=/var/lib/chitti-preview-staging
 Environment=PREVIEW_TTL_HOURS=72
 Environment=PREVIEW_MAX_BYTES=209715200
 Environment=PREVIEW_MAX_COUNT=4
@@ -24,7 +25,7 @@ StandardError=journal
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/chitti-worker /var/lib/chitti-previews
+ReadWritePaths=/var/lib/chitti-worker /var/lib/chitti-previews /var/lib/chitti-preview-staging
 NoNewPrivileges=true
 
 [Install]

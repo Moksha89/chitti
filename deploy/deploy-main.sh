@@ -96,7 +96,8 @@ set +a
 git -c safe.directory="${INSTALL_DIR}" fetch --quiet origin "${REMOTE_BRANCH}"
 git -c safe.directory="${INSTALL_DIR}" checkout --quiet --detach "origin/${REMOTE_BRANCH}"
 
-install -d -o root -g root -m 0750 /var/lib/chitti-previews
+install -d -o root -g root -m 0750 \
+  /var/lib/chitti-previews /var/lib/chitti-preview-staging
 
 docker compose up -d --build
 docker compose ps
@@ -153,7 +154,7 @@ else
   runner_sql_tmp="$(mktemp /etc/chitti/runner-role.sql.XXXXXX)"
   trap 'rm -f "${runner_env_tmp:-}" "${runner_sql_tmp:-}"' EXIT
 
-  printf 'DATABASE_URL=postgresql+asyncpg://chitti_runner:%s@127.0.0.1:5432/%s\nPREVIEW_ROOT=/var/lib/chitti-previews\n' \
+  printf 'DATABASE_URL=postgresql+asyncpg://chitti_runner:%s@127.0.0.1:5432/%s\nPREVIEW_ROOT=/var/lib/chitti-previews\nPREVIEW_STAGING_ROOT=/var/lib/chitti-preview-staging\n' \
     "${runner_password}" "${POSTGRES_DB}" >"${runner_env_tmp}"
   chmod 0600 "${runner_env_tmp}"
 

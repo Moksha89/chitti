@@ -129,6 +129,9 @@ def test_expired_preview_is_not_active() -> None:
 
 
 class _PreviewSession:
+    def __init__(self, active_preview: int | None = 1):
+        self.active_preview = active_preview
+
     async def __aenter__(self) -> "_PreviewSession":
         return self
 
@@ -136,17 +139,23 @@ class _PreviewSession:
         return None
 
     async def execute(self, *_args: object, **_kwargs: object) -> "_PreviewResult":
-        return _PreviewResult()
+        return _PreviewResult(self.active_preview)
 
 
 class _PreviewResult:
-    def scalar_one_or_none(self) -> int:
-        return 1
+    def __init__(self, active_preview: int | None):
+        self.active_preview = active_preview
+
+    def scalar_one_or_none(self) -> int | None:
+        return self.active_preview
 
 
 class _PreviewDatabase:
+    def __init__(self, active_preview: int | None = 1):
+        self.active_preview = active_preview
+
     def sessions(self) -> _PreviewSession:
-        return _PreviewSession()
+        return _PreviewSession(self.active_preview)
 
 
 def test_authenticated_preview_serves_entry_and_nested_asset(
@@ -184,3 +193,38 @@ def test_authenticated_preview_serves_entry_and_nested_asset(
     assert entry.text == directory.text == "<h1>home</h1>"
     assert asset.status_code == 200
     assert asset.text == "console.log('ok')"
+
+
+@pytest.mark.parametrize("directory_name", ["staging-run", "unrecorded"])
+def test_preview_route_refuses_unpublished_directories(
+    tmp_path: Path, directory_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    published_root = tmp_path / "published"
+    staging_root = tmp_path / "staging"
+    (staging_root / directory_name).mkdir(parents=True)
+    (staging_root / directory_name / "index.html").write_text("not published")
+    (published_root / directory_name).mkdir(parents=True)
+    (published_root / directory_name / "index.html").write_text("not recorded")
+    auth = AuthManager(
+        "test-user",
+        PasswordHasher().hash("x"),
+        str(tmp_path / "state.json"),
+        1,
+    )
+    auth.initialize()
+    auth.must_change_password = False
+    token, _ = auth.create_session("test-user")
+    monkeypatch.setattr(app.state, "auth", auth, raising=False)
+    monkeypatch.setattr(
+        app.state, "database", _PreviewDatabase(active_preview=None), raising=False
+    )
+    monkeypatch.setattr(
+        app.state,
+        "settings",
+        SimpleNamespace(preview_root=str(published_root)),
+        raising=False,
+    )
+    client = TestClient(app)
+    client.cookies.set("chitti_session", token)
+
+    assert client.get(f"/previews/{directory_name}").status_code == 404

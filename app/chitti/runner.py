@@ -386,6 +386,7 @@ async def run_forever() -> None:
     dispatcher = DockerSandboxDispatcher(
         database,
         preview_root=Path(settings.preview_root),
+        preview_staging_root=Path(settings.preview_staging_root),
         preview_ttl_hours=settings.preview_ttl_hours,
         model_provider=provider,
     )

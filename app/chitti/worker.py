@@ -117,6 +117,7 @@ class DockerSandboxDispatcher:
         image: str = "chitti-sandbox:latest",
         workspace_root: Path = Path("/var/lib/chitti-worker/runs"),
         preview_root: Path = Path("/var/lib/chitti-previews"),
+        preview_staging_root: Path = Path("/var/lib/chitti-preview-staging"),
         preview_ttl_hours: int = 72,
         model_provider: ModelProvider | None = None,
     ) -> None:
@@ -124,6 +125,7 @@ class DockerSandboxDispatcher:
         self.image = image
         self.workspace_root = workspace_root
         self.preview_root = preview_root
+        self.preview_staging_root = preview_staging_root
         self.preview_ttl_hours = preview_ttl_hours
         self.model_provider = model_provider
         self._containers: dict[int, str] = {}
@@ -442,7 +444,7 @@ class DockerSandboxDispatcher:
             raise RuntimeError(
                 "run is not promotable: static export output is missing"
             )
-        staging = self.preview_root / "staging" / str(run_id)
+        staging = self.preview_staging_root / str(run_id)
         try:
             manifest = await asyncio.to_thread(copy_export, export_root, staging)
             async with self.database.sessions() as session:
@@ -929,8 +931,7 @@ class DockerSandboxDispatcher:
             raise RuntimeError("; ".join(failures))
 
         self.preview_root.mkdir(parents=True, exist_ok=True)
-        staging = self.preview_root / "staging"
-        staging.mkdir(parents=True, exist_ok=True)
+        self.preview_staging_root.mkdir(parents=True, exist_ok=True)
         async with self.database.sessions() as session:
             manifests = await session.execute(
                 text("SELECT staging_path, created_at FROM export_manifests")
@@ -950,12 +951,10 @@ class DockerSandboxDispatcher:
                 for row in previews
                 if row.expires_at > now
             }
-        for child in staging.iterdir():
+        for child in self.preview_staging_root.iterdir():
             if child not in known_staging:
                 await asyncio.to_thread(remove_preview, child)
         for child in self.preview_root.iterdir():
-            if child.name == "staging":
-                continue
             if child.name not in known_previews:
                 await asyncio.to_thread(remove_preview, child)
 
