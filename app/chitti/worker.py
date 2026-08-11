@@ -138,6 +138,32 @@ class FixedOperation:
     network: str = "none"
 
 
+MODEL_COMMANDS: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "sync-lockfile": (
+        "sync-lockfile",
+        (
+            "sh",
+            "-c",
+            "npm install --package-lock-only --ignore-scripts "
+            "--no-audit --no-fund",
+        ),
+        "bridge",
+    ),
+    "install": (
+        "npm-install",
+        ("sh", "-c", "npm ci --ignore-scripts --no-audit --no-fund"),
+        "bridge",
+    ),
+    "build": ("next-build", ("sh", "-c", "npm run build"), "none"),
+    "test": (
+        "run-tests",
+        ("sh", "-c", "CHITTI_MODEL_LOOP=1 npm test"),
+        "none",
+    ),
+    "export": ("static-export", ("sh", "-c", "test -f out/index.html"), "none"),
+}
+
+
 class WorkerDispatcher(Protocol):
     async def dispatch(
         self, revision: PlanRevision, run_id: int, limits: WorkerLimits
@@ -761,23 +787,9 @@ class DockerSandboxDispatcher:
             name = str(arguments.get("name", ""))
             if arguments.get("args", []) not in ([], None):
                 raise ValueError("arbitrary command arguments are not allowed")
-            commands = {
-                "install": ("npm-install", ("sh", "-c", "npm ci --ignore-scripts --no-audit --no-fund"), "bridge"),
-                "build": ("next-build", ("sh", "-c", "npm run build"), "none"),
-                "test": (
-                    "run-tests",
-                    ("sh", "-c", "CHITTI_MODEL_LOOP=1 npm test"),
-                    "none",
-                ),
-                "export": (
-                    "static-export",
-                    ("sh", "-c", "test -f out/index.html"),
-                    "none",
-                ),
-            }
-            if name not in commands:
+            if name not in MODEL_COMMANDS:
                 raise ValueError("unknown allowlisted command")
-            op_name, command, network = commands[name]
+            op_name, command, network = MODEL_COMMANDS[name]
             operation = FixedOperation(task_id, op_name, command, network=network)
             result, stdout, stderr = await self._run_container(
                 run_id, self._docker_command(operation, workspace, run_id, limits), limits
@@ -789,7 +801,8 @@ class DockerSandboxDispatcher:
                 result.returncode, datetime.now(UTC),
             )
             if result.returncode:
-                raise RuntimeError((stderr or stdout)[-2000:] or f"{name} failed")
+                detail = (stderr or stdout)[-2000:] or f"{name} failed"
+                raise RuntimeError(_install_failure_detail(name, detail))
             return (stdout or "command passed")[-4000:], 0, operation_index
         if tool == "finish":
             return str(arguments.get("summary", "")), 0, operation_index
@@ -1933,8 +1946,14 @@ def _model_system_prompt() -> str:
         "Use local geometry, lights, CSS, and ASCII text so the page renders "
         "offline inside the cage. Replace the starter's fixture copy and "
         "placeholder content with original task-specific copy; do not claim "
-        "inherited fixture text as authored work. Run npm install before build "
-        "or test so dependency failures are avoided. Run export after build and "
+        "inherited fixture text as authored work. The workspace starts with a "
+        "package.json and matching package-lock.json. If you add or change "
+        "dependencies in package.json, run the allowlisted sync-lockfile "
+        "operation before install; it derives the lockfile from package.json. "
+        "Then run install, which is the strict reproducible npm ci gate. Run "
+        "install before build or test so dependency failures are avoided. If "
+        "install reports that package.json and package-lock.json are out of "
+        "sync, run sync-lockfile and retry install. Run export after build and "
         "confirm that out/index.html exists; a project that cannot produce a "
         "complete static export is not promotable."
     )
@@ -1966,12 +1985,55 @@ def _starter_context(workspace: Path) -> str:
     listing = sorted(item.name for item in workspace.iterdir())[:200]
     files = ("package.json", "app/page.js", "app/layout.js", "app/globals.css", "next.config.mjs")
     sections = [f"FILES:\n{json.dumps(listing)}"]
+    package_path = workspace / "package.json"
+    if package_path.is_file():
+        try:
+            package = json.loads(package_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            package = {}
+        dependencies = package.get("dependencies", {})
+        dev_dependencies = package.get("devDependencies", {})
+        if isinstance(dependencies, dict) and isinstance(dev_dependencies, dict):
+            direct_dependencies = {
+                **{str(key): str(value) for key, value in dependencies.items()},
+                **{
+                    str(key): str(value)
+                    for key, value in dev_dependencies.items()
+                },
+            }
+            sections.append(
+                "LOCKED DIRECT DEPENDENCIES:\n"
+                + json.dumps(dict(sorted(direct_dependencies.items())))
+            )
     for relative in files:
         path = workspace / relative
         if path.is_file():
             content = path.read_bytes()[:12000].decode("utf-8", errors="replace")
             sections.append(f"FILE {relative}:\n{content}")
     return "\n\n".join(sections)
+
+
+def _is_lockfile_mismatch(detail: str) -> bool:
+    lowered = detail.lower()
+    return (
+        "package.json and package-lock.json" in lowered
+        and "sync" in lowered
+    ) or (
+        "missing:" in lowered
+        and "lock file" in lowered
+    ) or (
+        "invalid:" in lowered
+        and "lock file" in lowered
+    )
+
+
+def _install_failure_detail(name: str, detail: str) -> str:
+    if name == "install" and _is_lockfile_mismatch(detail):
+        return (
+            f"{detail}\nDependency manifest mismatch: run the "
+            "`sync-lockfile` operation, then run `install` again."
+        )
+    return detail
 
 
 def _reviewer_system_prompt() -> str:

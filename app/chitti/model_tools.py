@@ -58,7 +58,13 @@ MODEL_TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
                 "properties": {
                     "name": {
                         "type": "string",
-                        "enum": ["install", "build", "test", "export"],
+                        "enum": [
+                            "sync-lockfile",
+                            "install",
+                            "build",
+                            "test",
+                            "export",
+                        ],
                     },
                     "args": {"type": "array", "items": {}},
                 },

@@ -11,15 +11,60 @@ from chitti.worker import (
     _compact_model_messages,
     _confined_path,
     _file_write_stall,
+    _install_failure_detail,
+    _is_lockfile_mismatch,
     _model_response_failure,
+    _model_system_prompt,
     _parse_tool_call,
     _reviewer_diagnosis_messages,
+    _starter_context,
     _task_done_checks,
     _tool_exchange,
     _tool_rejection_exchange,
     _tool_result_message,
     _unexecuted_tool_results,
 )
+
+
+def test_lockfile_sync_operation_is_allowlisted_and_has_no_arguments() -> None:
+    from chitti.model_tools import model_tool_schemas
+    from chitti.worker import MODEL_COMMANDS
+
+    operation, command, network = MODEL_COMMANDS["sync-lockfile"]
+    assert operation == "sync-lockfile"
+    assert command == (
+        "sh",
+        "-c",
+        "npm install --package-lock-only --ignore-scripts --no-audit --no-fund",
+    )
+    assert network == "bridge"
+    schema = next(
+        tool for tool in model_tool_schemas()
+        if tool["function"]["name"] == "run_command"
+    )
+    assert "sync-lockfile" in schema["function"]["parameters"]["properties"]["name"]["enum"]
+
+
+def test_install_mismatch_feedback_names_lockfile_sync_operation() -> None:
+    detail = (
+        "npm ci can only install packages when your package.json and "
+        "package-lock.json are in sync."
+    )
+    assert _is_lockfile_mismatch(detail)
+    assert "sync-lockfile" in _install_failure_detail("install", detail)
+    assert _install_failure_detail("build", detail) == detail
+    assert "sync-lockfile" in _model_system_prompt()
+
+
+def test_starter_context_summarizes_direct_dependencies(tmp_path) -> None:
+    (tmp_path / "package.json").write_text(
+        '{"dependencies":{"next":"14.2.35"},'
+        '"devDependencies":{"tailwindcss":"3.4.17"}}'
+    )
+    context = _starter_context(tmp_path)
+    assert "LOCKED DIRECT DEPENDENCIES" in context
+    assert '"next": "14.2.35"' in context
+    assert '"tailwindcss": "3.4.17"' in context
 
 
 def test_model_limits_round_trip() -> None:

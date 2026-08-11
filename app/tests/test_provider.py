@@ -5,6 +5,7 @@ import pytest
 
 from chitti.provider import (
     CODER_MAX_OUTPUT_TOKENS,
+    REVIEWER_MAX_OUTPUT_TOKENS,
     FakeProvider,
     GatewayMisconfigurationError,
     GatewayTransientError,
@@ -26,6 +27,11 @@ class _Client:
         return None
 
     async def get(self, *_args, **_kwargs):
+        if self.error:
+            raise self.error
+        return self.response
+
+    async def post(self, *_args, **_kwargs):
         if self.error:
             raise self.error
         return self.response
@@ -144,6 +150,41 @@ def test_agent_completion_records_native_tool_calls_and_request_schema(monkeypat
     assert calls[0][1]["json"]["tools"][0]["function"]["name"] == "list_files"
     assert calls[0][1]["json"]["tool_choice"] == "required"
     assert "thinking" not in calls[0][1]["json"]
+
+
+def test_reviewer_request_uses_headroom_below_provider_ceiling(monkeypatch) -> None:
+    response = httpx.Response(
+        200,
+        request=httpx.Request("POST", "http://127.0.0.1:4000/v1/chat/completions"),
+        json={
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": '{"verdict":"pass"}'},
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
+    )
+    calls = []
+
+    class Client(_Client):
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return response
+
+    monkeypatch.setattr(
+        "chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client()
+    )
+    asyncio.run(
+        LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+            [{"role": "user", "content": "diagnose"}], "reviewer"
+        )
+    )
+
+    assert REVIEWER_MAX_OUTPUT_TOKENS == 4096
+    assert REVIEWER_MAX_OUTPUT_TOKENS < 8192
+    assert calls[0][1]["json"]["max_tokens"] == REVIEWER_MAX_OUTPUT_TOKENS
 
 
 def test_coder_output_ceiling_leaves_reasoning_and_write_headroom() -> None:
