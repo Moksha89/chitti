@@ -1,14 +1,18 @@
 {% extends "base.html" %}
 {% block title %}Sign in · Chitti{% endblock %}
 {% block body %}
-<main class="card">
-  <h1>Sign in to Chitti</h1>
-  {% if error %}<p class="error">{{ error }}</p>{% endif %}
-  <form method="post" action="/login">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label>Username <input name="username" autocomplete="username" required autofocus></label>
-    <label>Password <input type="password" name="password" autocomplete="current-password" required></label>
-    <button type="submit">Sign in</button>
-  </form>
+<main class="auth-shell">
+  <section class="auth-card">
+    <div class="brand"><div class="brand-mark">C/</div><div><div class="brand-name">Chitti</div><div class="brand-sub">mission control</div></div></div>
+    <div style="margin-top:34px"><div class="kicker">Private command surface</div><h1>Sign in to Chitti</h1><p class="subhead">Your workspace for conversations, decisions, and memory.</p></div>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <form method="post" action="/login" style="margin-top:26px">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="next" value="{{ next }}">
+      <label>Username<input name="username" autocomplete="username" required autofocus></label>
+      <label>Password<input type="password" name="password" autocomplete="current-password" required></label>
+      <button class="primary-button" type="submit">Enter mission control <span aria-hidden="true">↗</span></button>
+    </form>
+  </section>
 </main>
 {% endblock %}

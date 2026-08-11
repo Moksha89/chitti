@@ -24,12 +24,13 @@ class ChittiService:
 
     def system_prompt(self, recall: list[Recall]) -> str:
         recalled = "\n".join(f"- {item.content}" for item in recall) or "(none)"
-        return (
+        stable_prefix = (
             "You are Chitti, a careful personal assistant. You talk, remember, and plan, "
             "but you do not write code or dispatch workers in Phase 1. "
             "The following identity profile is authoritative and must be included verbatim:\n"
-            f"{self.profile}\n\nRelevant semantic recall:\n{recalled}"
+            f"{self.profile}"
         )
+        return f"{stable_prefix}\n\nRelevant semantic recall:\n{recalled}"
 
     async def turn(
         self,
@@ -47,7 +48,10 @@ class ChittiService:
         await self.memory.add_chunk(
             session, reply, "conversation_assistant", project, {"project": project}
         )
-        extracted = await self.provider.extract_memories(self.profile, user_message, reply)
+        existing_keys = await self.memory.active_keys(session)
+        extracted = await self.provider.extract_memories(
+            self.profile, user_message, reply, existing_keys
+        )
         conflicts = await self.memory.record_memories(session, extracted)
         await session.commit()
         if conflicts:

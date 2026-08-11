@@ -1,66 +1,39 @@
 {% extends "base.html" %}
-{% block title %}Chitti{% endblock %}
+{% block title %}Mission control · Chitti{% endblock %}
 {% block body %}
-<header class="row">
-  <h1>Chitti</h1>
-  <form method="post" action="/logout">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button class="secondary" type="submit">Log out</button>
-  </form>
-</header>
-<section class="card">
-  <h2>Chat</h2>
-  <div id="reply" class="chat muted">Ask Chitti something.</div>
-  <form id="chat-form">
-    <input type="hidden" id="csrf-token" value="{{ csrf_token }}">
-    <label>Project (optional) <input id="project" name="project"></label>
-    <label>Command <textarea id="message" name="message" rows="4" required></textarea></label>
-    <button type="submit">Send</button>
-  </form>
-</section>
-<section class="card">
-  <h2>What Chitti believes</h2>
-  {% if decisions %}
-  <ul>{% for decision in decisions %}<li><strong>{{ decision.decision_key }}</strong>: {{ decision.decision }} <span class="muted">({{ decision.source }})</span></li>{% endfor %}</ul>
-  {% else %}<p class="muted">No active decisions yet.</p>{% endif %}
-</section>
-<section class="card">
-  <h2>Unresolved contradictions</h2>
-  {% if conflicts %}
-  {% for conflict in conflicts %}
-  <div class="card">
-    <p><strong>{{ conflict.decision_key }}</strong></p>
-    <p>Current: {{ conflict.existing_value }}</p>
-    <p>Proposed: {{ conflict.proposed_value }}</p>
-    <div class="row">
-      <form method="post" action="/memory/conflicts/{{ conflict.id }}/resolve">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input type="hidden" name="choice" value="existing">
-        <button class="secondary" type="submit">Keep current</button>
-      </form>
-      <form method="post" action="/memory/conflicts/{{ conflict.id }}/resolve">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input type="hidden" name="choice" value="proposed">
-        <button type="submit">Use proposed</button>
-      </form>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">C/</div><div><div class="brand-name">Chitti</div><div class="brand-sub">mission control</div></div></div>
+    <div><div class="nav-label">Workspace</div><nav class="nav" aria-label="Workspace navigation"><a class="nav-item active" href="/"><span>Command center</span><span class="nav-status">●</span></a><span class="nav-item"><span>Projects</span><span class="nav-status">—</span></span><span class="nav-item"><span>Plans &amp; tasks</span><span class="nav-status">—</span></span><span class="nav-item"><span>Agent fabric</span><span class="nav-status">—</span></span></nav></div>
+    <div class="sidebar-foot">PHASE 1 / TALK + REMEMBER<br>WORKER SYSTEMS NOT YET ACTIVE</div>
+  </aside>
+  <main class="main">
+    <header class="topbar"><div><div class="kicker">Command center / online</div><h1>{{ greeting }}, Akirah.</h1><p class="subhead">Direct the work. Chitti will keep the signal.</p></div><div class="top-actions"><span class="status-pill"><span class="status-dot"></span>memory link active</span><form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="icon-button" type="submit">Log out</button></form></div></header>
+    <div class="mission-grid">
+      <section class="panel">
+        <div class="panel-head"><div class="panel-title"><span class="panel-index">01</span><div><h2>Live channel</h2><div class="panel-meta">private conversation / model response</div></div></div><span class="panel-meta" id="transcript-count">0 turns</span></div>
+        <div id="transcript" class="transcript" aria-live="polite"><div class="transcript-empty" id="transcript-empty"><div><strong>Channel ready.</strong><span>Ask about a decision, a project, or what needs attention.</span><div class="suggestions"><button type="button" data-prompt="What do you remember about me?">Inspect memory</button><button type="button" data-prompt="Help me plan my next project.">Start a plan</button></div></div></div></div>
+        <div class="composer"><form id="chat-form"><input type="hidden" id="csrf-token" value="{{ csrf_token }}"><div class="composer-row"><div class="field command-field"><label for="message">Command</label><textarea id="message" name="message" placeholder="Tell Chitti what needs your attention…" required></textarea></div><div class="field project-field"><label for="project">Project scope</label><input id="project" name="project" placeholder="optional"><label class="plan-toggle" for="plan-requested"><input id="plan-requested" type="checkbox"> Plan brief</label></div><button class="send-button" id="send-button" type="submit">Send <span aria-hidden="true">↗</span></button></div><div class="composer-foot"><span>Enter to send · Shift + Enter for a new line</span><span id="composer-status">secure channel</span></div></form></div>
+      </section>
+      <aside class="rail">
+        {% if conflicts %}<section class="panel conflict-panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">!</span><div><h2>Resolve signal conflict</h2><div class="panel-meta">your decision is required</div></div></div></div><div class="panel-body">{% for conflict in conflicts %}<article class="conflict"><div class="conflict-key">{{ conflict.display_key }} / contradiction detected</div><div class="compare"><div class="compare-item"><div class="compare-label">Current belief</div><div class="compare-value">{{ conflict.display_existing }}</div></div><div class="compare-item"><div class="compare-label">Proposed belief</div><div class="compare-value">{{ conflict.display_proposed }}</div></div></div><div class="resolution-actions"><form method="post" action="/memory/conflicts/{{ conflict.id }}/resolve"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="choice" value="existing"><button class="button-secondary" type="submit">Keep current</button></form><form method="post" action="/memory/conflicts/{{ conflict.id }}/resolve"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="choice" value="proposed"><button class="send-button" type="submit">Use proposed</button></form></div></article>{% endfor %}</div></section>{% endif %}
+        <section class="panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">02</span><div><h2>Memory state</h2><div class="panel-meta">what Chitti currently believes</div></div></div></div><div class="panel-body">
+          {% if decisions %}{% for decision in decisions %}<article class="belief"><div class="eyebrow">{{ decision.display_key }}</div><p class="belief-value">{{ decision.display_value }}</p><div class="belief-meta"><span class="tag">{{ decision.source }}</span>{% if decision.project %}<span class="tag">{{ decision.project }}</span>{% endif %}<form method="post" action="/memory/decisions/{{ decision.id }}/forget"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="forget-button" type="submit">Forget</button></form></div></article>{% endfor %}{% else %}<div class="empty-state"><strong>No active beliefs recorded.</strong>Durable preferences and decisions will appear here with their provenance.</div>{% endif %}
+        </div></section>
+        <section class="panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">03</span><div><h2>Systems coming online</h2><div class="panel-meta">the cockpit has room to grow</div></div></div></div><div class="panel-body capability-list"><div class="capability"><span>Project planning</span><span class="capability-status">phase 2</span></div><div class="capability"><span>Task orchestration</span><span class="capability-status">phase 2</span></div><div class="capability"><span>Worker agents</span><span class="capability-status">phase 3</span></div></div></section>
+        {% for plan in plans %}<section class="panel plan-panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">04</span><div><h2>{{ plan.document.title }}</h2><div class="panel-meta">{{ plan.project }} / revision {{ plan.revision }} / immutable snapshot</div></div></div><span class="capability-status">{{ plan.content_hash[:12] }}</span></div><div class="panel-body"><p class="plan-summary">{{ plan.document.summary }}</p><div class="plan-memory"><span class="eyebrow">Memory constraints used</span>{% if plan.document.memory_decisions %}{% for item in plan.document.memory_decisions %}<div class="tag">{{ item.decision_key }} · {{ item.influence }}</div>{% endfor %}{% else %}<span class="empty-state">None recorded.</span>{% endif %}</div><ol class="plan-tasks">{% for task in plan.document.tasks %}<li><strong>{{ task.title }}</strong><span>{{ task.description }}</span><small>Done when: {{ task.done_condition }}{% if task.dependencies %} · Depends on {{ task.dependencies|join(", ") }}{% endif %}</small><em>{{ plan.task_statuses.get(task.id, "unknown") }} · execution not implemented</em></li>{% endfor %}</ol>{% if plan.approval %}<div class="plan-approval"><strong>{{ plan.approval.decision }}</strong>{% if plan.approval.reason %}<span>{{ plan.approval.reason }}</span>{% endif %}<small>bound to {{ plan.approval.content_hash[:12] }}</small></div>{% else %}<div class="resolution-actions"><form method="post" action="/plans/{{ plan.id }}/approve"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="send-button" type="submit">Approve plan</button></form><form method="post" action="/plans/{{ plan.id }}/reject"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="reason" placeholder="Reason for changes" required><button class="button-secondary" type="submit">Reject and revise</button></form></div>{% endif %}</div></section>{% endfor %}
+      </aside>
     </div>
-  </div>
-  {% endfor %}
-  {% else %}<p class="muted">No unresolved contradictions.</p>{% endif %}
-</section>
+  </main>
+</div>
 <script>
-document.getElementById("chat-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const reply = document.getElementById("reply");
-  reply.textContent = "Thinking…";
-  const response = await fetch("/chat", {
-    method: "POST",
-    headers: {"Content-Type": "application/json", "X-CSRF-Token": document.getElementById("csrf-token").value},
-    body: JSON.stringify({message: document.getElementById("message").value, project: document.getElementById("project").value || null, history: []})
-  });
-  const body = await response.json();
-  reply.textContent = response.ok ? body.reply : (body.detail || "Request failed");
-  if (response.ok && body.conflicts && body.conflicts.length) window.location.reload();
-});
+(() => {
+  const form=document.getElementById("chat-form"), message=document.getElementById("message"), project=document.getElementById("project"), planRequested=document.getElementById("plan-requested"), transcript=document.getElementById("transcript"), empty=document.getElementById("transcript-empty"), button=document.getElementById("send-button"), count=document.getElementById("transcript-count"), status=document.getElementById("composer-status"), csrf=document.getElementById("csrf-token").value, history=[];
+  document.querySelectorAll("[data-prompt]").forEach(item=>item.addEventListener("click",()=>{message.value=item.dataset.prompt;message.focus()}));
+  function addMessage(role,content,html){if(empty)empty.remove();const item=document.createElement("article");item.className=`message message-${role}`;const avatar=document.createElement("div");avatar.className="message-avatar";avatar.textContent=role==="user"?"YOU":"C/";const body=document.createElement("div");body.className="message-body";const label=document.createElement("div");label.className="message-label";label.textContent=role==="user"?"you":"chitti";body.appendChild(label);const node=document.createElement("div");if(html)node.innerHTML=html;else node.textContent=content;body.appendChild(node);item.append(avatar,body);transcript.appendChild(item);transcript.scrollTop=transcript.scrollHeight}
+  message.addEventListener("keydown",event=>{if(event.key==="Enter"&&!event.shiftKey){event.preventDefault();form.requestSubmit()}});
+  async function waitForPlan(jobId){for(let attempt=0;attempt<60;attempt++){await new Promise(resolve=>window.setTimeout(resolve,1000));const response=await fetch(`/plans/jobs/${jobId}`);if(!response.ok)return;const job=await response.json();if(job.status==="complete"||job.status==="failed"){window.location.reload();return}}}
+  form.addEventListener("submit",async event=>{event.preventDefault();const text=message.value.trim();if(!text||button.disabled)return;if(planRequested.checked&&!project.value.trim()){status.className="";status.textContent="name the project before planning";project.focus();return}addMessage("user",text);history.push({role:"user",content:text});message.value="";button.disabled=true;const started=Date.now(),timer=window.setInterval(()=>{status.className="thinking";status.textContent=`thinking · ${Math.floor((Date.now()-started)/1000)}s`},250);status.textContent="thinking · 0s";try{const response=await fetch("/chat",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":csrf},body:JSON.stringify({message:text,project:project.value.trim()||null,plan_requested:planRequested.checked,history})});const body=await response.json();if(!response.ok)throw new Error(body.detail||"Request failed");addMessage("assistant",body.reply,body.reply_html);history.push({role:"assistant",content:body.reply});count.textContent=`${history.length/2} turn${history.length===2?"":"s"}`;status.className="";status.textContent=body.plan_job_id?"planning · awaiting approval":"secure channel";if(body.plan_job_id)waitForPlan(body.plan_job_id);if(body.conflicts&&body.conflicts.length)window.setTimeout(()=>window.location.reload(),700)}catch(error){addMessage("assistant",error.message||"The channel returned an error.");status.className="";status.textContent="channel error"}finally{window.clearInterval(timer);button.disabled=false;message.focus()}});
+})();
 </script>
 {% endblock %}
