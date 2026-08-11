@@ -5,6 +5,7 @@ SERVICE_USER="${SERVICE_USER:-chitti}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/chitti}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/chitti}"
 RETENTION_DAYS="${RETENTION_DAYS:-14}"
+SSH_USER="${SSH_USER:-${SUDO_USER:-administrator}}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this script as root." >&2
@@ -34,12 +35,19 @@ fi
 
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${INSTALL_DIR}" "${BACKUP_DIR}"
 
-# Do not lock out the operator: only disable password authentication when a
-# usable authorized_keys file already exists.
-AUTHORIZED_KEYS="/root/.ssh/authorized_keys"
+# Do not lock out the operator: only disable password authentication when the
+# actual login account has a usable authorized_keys file already installed.
+if ! id "${SSH_USER}" >/dev/null 2>&1; then
+  echo "SSH_USER=${SSH_USER} does not exist; retaining password SSH auth." >&2
+  exit 1
+fi
+SSH_HOME="$(getent passwd "${SSH_USER}" | cut -d: -f6)"
+AUTHORIZED_KEYS="${SSH_HOME}/.ssh/authorized_keys"
 if [[ -s "${AUTHORIZED_KEYS}" ]]; then
   install -d -m 0700 /etc/ssh/sshd_config.d
-  cat >/etc/ssh/sshd_config.d/99-chitti-hardening.conf <<'EOF'
+  # Ubuntu cloud-init may install a later PasswordAuthentication setting.
+  # Use a lexically-early drop-in because sshd applies the first value seen.
+  cat >/etc/ssh/sshd_config.d/00-chitti-hardening.conf <<'EOF'
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
@@ -48,7 +56,7 @@ EOF
   sshd -t
   systemctl reload ssh
 else
-  echo "No /root/.ssh/authorized_keys found; retaining password SSH auth." >&2
+  echo "No usable ${AUTHORIZED_KEYS} found; retaining password SSH auth." >&2
 fi
 
 ufw --force reset
@@ -63,7 +71,7 @@ systemctl enable --now fail2ban
 
 install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${BACKUP_DIR}"
 cat >/etc/cron.d/chitti-postgres-backup <<EOF
-17 2 * * * ${SERVICE_USER} BACKUP_DIR=${BACKUP_DIR} RETENTION_DAYS=${RETENTION_DAYS} ${INSTALL_DIR}/deploy/backup-postgres.sh
+17 2 * * * root set -a; . ${INSTALL_DIR}/.env; set +a; BACKUP_DIR=${BACKUP_DIR} RETENTION_DAYS=${RETENTION_DAYS} ${INSTALL_DIR}/deploy/backup-postgres.sh
 EOF
 chmod 0644 /etc/cron.d/chitti-postgres-backup
 
