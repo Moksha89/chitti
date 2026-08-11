@@ -5,9 +5,11 @@ import pytest
 
 from chitti.provider import (
     CODER_MAX_OUTPUT_TOKENS,
+    FakeProvider,
     GatewayMisconfigurationError,
     GatewayTransientError,
     LiteLLMProvider,
+    ModelToolCall,
     _diagnostic_message_fields,
 )
 
@@ -79,7 +81,7 @@ def test_gateway_preflight_uses_models_endpoint_and_both_routes(monkeypatch) -> 
     ]
 
 
-def test_agent_completion_records_stop_reason_and_message_fields(monkeypatch) -> None:
+def test_agent_completion_records_native_tool_calls_and_request_schema(monkeypatch) -> None:
     response = httpx.Response(
         200,
         request=httpx.Request("POST", "http://127.0.0.1:4000/v1/chat/completions"),
@@ -91,7 +93,16 @@ def test_agent_completion_records_stop_reason_and_message_fields(monkeypatch) ->
                     "message": {
                         "content": "",
                         "reasoning_content": "hidden",
-                        "tool_calls": [],
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "list_files",
+                                    "arguments": "{\"path\":\".\"}",
+                                },
+                            }
+                        ],
                     },
                 }
             ],
@@ -114,14 +125,23 @@ def test_agent_completion_records_stop_reason_and_message_fields(monkeypatch) ->
     )
     completion = asyncio.run(
         LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
-            [{"role": "user", "content": "work"}], "coder"
+            [{"role": "user", "content": "work"}],
+            "coder",
+            tools=[{"type": "function", "function": {"name": "list_files"}}],
+            tool_choice="required",
         )
     )
 
     assert completion.content == ""
     assert completion.finish_reason == "length"
-    assert completion.message_fields == ("reasoning_content",)
+    assert completion.message_fields == ("reasoning_content", "tool_calls")
+    assert completion.tool_calls == (
+        ModelToolCall(id="call-1", name="list_files", arguments={"path": "."}),
+    )
     assert calls[0][1]["json"]["max_tokens"] == CODER_MAX_OUTPUT_TOKENS
+    assert calls[0][1]["json"]["tools"][0]["function"]["name"] == "list_files"
+    assert calls[0][1]["json"]["tool_choice"] == "required"
+    assert "thinking" not in calls[0][1]["json"]
 
 
 def test_diagnostic_fields_ignore_structural_and_empty_message_values() -> None:
@@ -134,3 +154,23 @@ def test_diagnostic_fields_ignore_structural_and_empty_message_values() -> None:
             "reasoning_content": "useful hidden text",
         }
     ) == ("reasoning_content",)
+
+
+def test_fake_provider_emits_native_completion_tool_call() -> None:
+    completion = asyncio.run(
+        FakeProvider().agent_completion(
+            [{"role": "user", "content": "work"}],
+            "coder",
+            tools=[{"type": "function"}],
+            tool_choice="required",
+        )
+    )
+    assert completion.content == ""
+    assert completion.finish_reason == "tool_calls"
+    assert completion.tool_calls == (
+        ModelToolCall(
+            id="fake-finish",
+            name="finish",
+            arguments={"summary": "Fake provider completed the task."},
+        ),
+    )

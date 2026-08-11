@@ -40,7 +40,11 @@ class ChittiService:
         history: list[dict[str, str]] | None = None,
     ) -> TurnResult:
         recall = await self.memory.recall(session, user_message)
-        messages = [*(history or []), {"role": "user", "content": user_message}]
+        messages: list[dict[str, object]] = [
+            {"role": item["role"], "content": item["content"]}
+            for item in history or []
+        ]
+        messages.append({"role": "user", "content": user_message})
         reply = await self.provider.chat(self.system_prompt(recall), messages, "chitti-chat")
         await self.memory.add_chunk(
             session, user_message, "conversation_user", project, {"project": project}

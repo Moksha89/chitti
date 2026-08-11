@@ -16,6 +16,7 @@ from typing import IO, TYPE_CHECKING, Protocol, cast
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .model_tools import model_tool_names, model_tool_schemas
 from .plans import (
     PlanApproval,
     PlanRevision,
@@ -28,6 +29,7 @@ from .provider import (
     REVIEWER_ROUTE,
     ModelCompletion,
     ModelProvider,
+    ModelToolCall,
 )
 
 if TYPE_CHECKING:
@@ -47,14 +49,10 @@ class ModelProgressError(RuntimeError):
 def _model_response_failure(completion: ModelCompletion) -> str | None:
     if completion.finish_reason == "length":
         detail = "model response truncated at the output limit"
-    elif not completion.content.strip():
+    elif not completion.content.strip() and not completion.tool_calls:
         detail = "model response had no visible content"
     else:
         return None
-    if completion.message_fields:
-        detail += "; alternate message fields present: " + ", ".join(
-            completion.message_fields
-        )
     return detail
 
 
@@ -304,7 +302,7 @@ class DockerSandboxDispatcher:
             nonproductive_turns = 0
             route = CODER_ROUTE
             failures = 0
-            messages = [
+            messages: list[dict[str, object]] = [
                 {"role": "system", "content": stable},
                 {
                     "role": "user",
@@ -349,7 +347,12 @@ class DockerSandboxDispatcher:
                 if calls >= limits.model_tool_calls:
                     raise RuntimeError("model tool-call budget exceeded")
                 try:
-                    completion = await self.model_provider.agent_completion(messages, route)
+                    completion = await self.model_provider.agent_completion(
+                        messages,
+                        route,
+                        tools=model_tool_schemas() if route == CODER_ROUTE else None,
+                        tool_choice="required" if route == CODER_ROUTE else None,
+                    )
                 except Exception as exc:
                     failure = ModelCompletion(
                         content=f"model call failed: {str(exc)[:1000]}",
@@ -383,37 +386,62 @@ class DockerSandboxDispatcher:
                 response_failure = _model_response_failure(completion)
                 if response_failure is not None:
                     detail = response_failure
-                    if completion.message_fields:
-                        await self._event(run_id, "model_tool_failed", detail, task_id=task.id)
-                        raise ModelProgressError(
-                            f"task {task.id} stopped: {detail}"
-                        )
                     await record_nonproductive(detail)
-                    messages.append({"role": "user", "content": f"TOOL FAILURE: {detail}"})
+                    messages.extend(
+                        _tool_rejection_exchange(completion, f"TOOL FAILURE: {detail}")
+                    )
                     await compact_history()
                     continue
                 if route == REVIEWER_ROUTE:
                     messages.extend(
-                        [
-                            {"role": "assistant", "content": completion.content[:16000]},
-                            {
-                                "role": "user",
-                                "content": (
-                                    "Diagnosis received. Return to the coder route and make "
-                                    "one corrective attempt using that diagnosis."
-                                ),
-                            },
-                        ]
+                        _tool_rejection_exchange(
+                            completion,
+                            "TOOL FAILURE: reviewer responses cannot invoke worker tools.",
+                        )
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Diagnosis received. Return to the coder route and make "
+                                "one corrective attempt using that diagnosis."
+                            ),
+                        }
                     )
                     route = CODER_ROUTE
                     continue
-                try:
-                    tool, arguments = _parse_tool_call(completion.content)
-                except ValueError as exc:
-                    detail = str(exc)[:1000]
+                native_call: ModelToolCall | None = None
+                if completion.tool_calls:
+                    if len(completion.tool_calls) != 1:
+                        detail = "model returned more than one tool call"
+                        await record_nonproductive(detail)
+                        messages.extend(
+                            _tool_rejection_exchange(
+                                completion, f"TOOL FAILURE: {detail}"
+                            )
+                        )
+                        await compact_history()
+                        continue
+                    native_call = completion.tool_calls[0]
+                    tool, arguments = native_call.name, native_call.arguments
+                else:
+                    try:
+                        tool, arguments = _parse_tool_call(completion.content)
+                    except ValueError as exc:
+                        detail = str(exc)[:1000]
+                        await record_nonproductive(detail)
+                        messages.append(
+                            {"role": "user", "content": f"TOOL FAILURE: {detail}"}
+                        )
+                        await compact_history()
+                        continue
+                if tool not in model_tool_names():
+                    detail = f"unknown model tool: {tool}"
                     await record_nonproductive(detail)
-                    messages.append(
-                        {"role": "user", "content": f"TOOL FAILURE: {detail}"}
+                    messages.extend(
+                        _tool_rejection_exchange(
+                            completion, f"TOOL FAILURE: {detail}"
+                        )
                     )
                     await compact_history()
                     continue
@@ -427,12 +455,7 @@ class DockerSandboxDispatcher:
                 if tool == "finish":
                     result_text = "TOOL FAILURE: done condition requires successful build and test commands"
                     await record_nonproductive(result_text)
-                    messages.extend(
-                        [
-                            {"role": "assistant", "content": completion.content[:16000]},
-                            {"role": "user", "content": result_text},
-                        ]
-                    )
+                    messages.extend(_tool_exchange(completion, result_text, native_call))
                     await compact_history()
                     continue
                 try:
@@ -472,10 +495,7 @@ class DockerSandboxDispatcher:
                             task_id=task.id,
                         )
                 messages.extend(
-                    [
-                        {"role": "assistant", "content": completion.content[:16000]},
-                        {"role": "user", "content": result_text[:16000]},
-                    ]
+                    _tool_exchange(completion, result_text[:16000], native_call)
                 )
                 await compact_history()
             if not done:
@@ -659,7 +679,7 @@ class DockerSandboxDispatcher:
     ) -> None:
         assert self.model_provider is not None
         evidence = await self._review_evidence(run_id, workspace)
-        review_messages = [
+        review_messages: list[dict[str, object]] = [
             {"role": "system", "content": _reviewer_system_prompt()},
             {
                 "role": "user",
@@ -769,7 +789,23 @@ class DockerSandboxDispatcher:
         prompt: str = "",
     ) -> None:
         prompt_bytes, prompt_size, prompt_truncated = _bounded_artifact(prompt)
-        content, content_size, content_truncated = _bounded_artifact(completion.content)
+        response_content = completion.content
+        if completion.tool_calls:
+            response_content = json.dumps(
+                {
+                    "content": completion.content,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        }
+                        for call in completion.tool_calls
+                    ],
+                },
+                separators=(",", ":"),
+            )
+        content, content_size, content_truncated = _bounded_artifact(response_content)
         async with self.database.sessions() as session:
             result = await session.execute(
                 text(
@@ -1583,6 +1619,64 @@ def _parse_tool_call(content: str) -> tuple[str, dict[str, object]]:
     return str(value["tool"]), {str(key): item for key, item in arguments.items()}
 
 
+def _assistant_tool_message(completion: ModelCompletion) -> dict[str, object]:
+    return {
+        "role": "assistant",
+        "content": completion.content[:16000],
+        "tool_calls": [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, separators=(",", ":")),
+                },
+            }
+            for call in completion.tool_calls
+        ],
+    }
+
+
+def _tool_exchange(
+    completion: ModelCompletion,
+    result_text: str,
+    native_call: ModelToolCall | None,
+) -> list[dict[str, object]]:
+    if native_call is None:
+        return [
+            {"role": "assistant", "content": completion.content[:16000]},
+            {"role": "user", "content": result_text},
+        ]
+    return [
+        _assistant_tool_message(completion),
+        {
+            "role": "tool",
+            "tool_call_id": native_call.id,
+            "content": result_text,
+        },
+    ]
+
+
+def _tool_rejection_exchange(
+    completion: ModelCompletion, result_text: str
+) -> list[dict[str, object]]:
+    if not completion.tool_calls:
+        return [
+            {"role": "assistant", "content": completion.content[:16000]},
+            {"role": "user", "content": result_text},
+        ]
+    exchange: list[dict[str, object]] = [_assistant_tool_message(completion)]
+    exchange.extend(
+        {
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": result_text,
+        }
+        for call in completion.tool_calls
+    )
+    return exchange
+
+
 def _task_done_checks(completed_commands: set[str]) -> bool:
     return {"build", "test", "export"} <= completed_commands
 
@@ -1593,18 +1687,26 @@ def _bounded_artifact(value: str, maximum: int = 16000) -> tuple[bytes, int, boo
 
 
 def _compact_model_messages(
-    messages: list[dict[str, str]], recent_turns: int = 8, max_preserved: int = 4
-) -> tuple[list[dict[str, str]], bool, int]:
+    messages: list[dict[str, object]], recent_turns: int = 8, max_preserved: int = 4
+) -> tuple[list[dict[str, object]], bool, int]:
     if len(messages) <= recent_turns + 3:
         return messages, False, 0
-    prefix = messages[:2]
-    older = messages[2:-recent_turns]
-    recent = messages[-recent_turns:]
-    important = [
-        {"role": item["role"], "content": item["content"][:3000]}
-        for item in older
+    prefix: list[dict[str, object]] = messages[:2]
+    units = _message_units(messages[2:])
+    recent_units: list[list[dict[str, object]]] = []
+    recent_count = 0
+    for unit in reversed(units):
+        recent_units.insert(0, unit)
+        recent_count += len(unit)
+        if recent_count >= recent_turns:
+            break
+    older_units = units[: len(units) - len(recent_units)]
+    important_units = [
+        unit
+        for unit in older_units
         if any(
-            marker in item["content"].lower()
+            marker in str(item.get("content", "")).lower()
+            for item in unit
             for marker in (
                 "tool failure",
                 "next-build",
@@ -1615,10 +1717,18 @@ def _compact_model_messages(
             )
         )
     ][-max_preserved:]
-    removed_chars = sum(len(item["content"]) for item in older) - sum(
-        len(item["content"]) for item in important
-    )
-    summary = {
+    important = [
+        {**item, "content": str(item.get("content", ""))[:3000]}
+        for unit in important_units
+        for item in unit
+    ]
+    recent = [item for unit in recent_units for item in unit]
+    removed_chars = sum(
+        len(str(item.get("content", "")))
+        for unit in older_units
+        for item in unit
+    ) - sum(len(str(item.get("content", ""))) for item in important)
+    summary: dict[str, object] = {
         "role": "user",
         "content": (
             "COMPACTION: older exploratory turns and superseded file contents were "
@@ -1629,16 +1739,42 @@ def _compact_model_messages(
     return prefix + [summary, *important, *recent], True, removed_chars
 
 
+def _message_units(messages: list[dict[str, object]]) -> list[list[dict[str, object]]]:
+    units: list[list[dict[str, object]]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        unit = [message]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            raw_calls = message.get("tool_calls")
+            call_ids = {
+                str(call.get("id"))
+                for call in raw_calls
+                if isinstance(call, dict) and call.get("id")
+            } if isinstance(raw_calls, list) else set()
+            index += 1
+            while index < len(messages):
+                following = messages[index]
+                if (
+                    following.get("role") == "tool"
+                    and str(following.get("tool_call_id")) in call_ids
+                ):
+                    unit.append(following)
+                    index += 1
+                    continue
+                break
+            units.append(unit)
+            continue
+        units.append(unit)
+        index += 1
+    return units
+
+
 def _model_system_prompt() -> str:
     return (
-        "Stable worker rules and tool schemas come first. Emit exactly one strict JSON "
-        "object per response and never emit shell commands. Tools:\n"
-        '{"tool":"list_files","arguments":{"path":"."}}\n'
-        '{"tool":"read_file","arguments":{"path":"app/page.js","max_bytes":65536}}\n'
-        '{"tool":"write_file","arguments":{"path":"app/page.js","content":"..."}}\n'
-        '{"tool":"run_command","arguments":{"name":"install|build|test|export","args":[]}}\n'
-        '{"tool":"capture_screenshot","arguments":{"route":"/","width":390}}\n'
-        '{"tool":"finish","arguments":{"summary":"done"}}\n'
+        "Stable worker rules come first. Use the provided native function tools and "
+        "return exactly one tool call per response; never emit shell commands. A JSON "
+        "tool object in visible content is accepted only as a compatibility fallback. "
         "All paths are relative to the disposable workspace. No .env, secrets, "
         "credentials, arbitrary argv, shell passthrough, or network tool exists. "
         "Write useful code early, then iterate using build and test feedback; do not "
