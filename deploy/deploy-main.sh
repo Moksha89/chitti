@@ -284,18 +284,31 @@ for target in os.environ["WORKER_TARGETS"].split(";"):
         raise SystemExit(f"worker reached {name}:{port} via {host}")
 '
 
+expected_migration="$(
+  docker run --rm --entrypoint python "${runner_image}" -c '
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+
+heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
+if len(heads) != 1:
+    raise SystemExit(f"expected exactly one migration head, found: {heads}")
+print(heads[0])
+'
+)"
+
+live_migration="$(
+  docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -At \
+    -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+    -c "SELECT version_num FROM alembic_version"
+)"
+if [[ "${live_migration}" != "${expected_migration}" ]]; then
+  echo \
+    "database migration mismatch: live ${live_migration:-<empty>}, " \
+    "expected ${expected_migration}" >&2
+  exit 1
+fi
 docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
   -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<'SQL' >/dev/null
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM alembic_version
-    WHERE version_num = '0011_preview_promotion'
-  ) THEN
-    RAISE EXCEPTION 'database is not at migration 0011_preview_promotion';
-  END IF;
-END
-$$;
 DO $$
 DECLARE
   required_table text;
@@ -373,12 +386,6 @@ async def main():
     ]
     updates = ["worker_runs"]  # SELECT ... FOR UPDATE OF worker_runs in runner.py
     deletes = ["worker_artifact_payloads"]
-    sequences = [
-        "plan_task_events_id_seq", "worker_run_events_id_seq",
-        "worker_operations_id_seq", "worker_artifacts_id_seq",
-        "worker_model_calls_id_seq", "export_manifests_id_seq",
-    ]
-
     async def require_table_privilege(table, privilege):
         allowed = await conn.fetchval(
             "SELECT has_table_privilege(current_user, $1, $2)", table, privilege
@@ -386,7 +393,21 @@ async def main():
         if not allowed:
             raise SystemExit(f"runner lacks {privilege} on {table}")
 
-    async def require_sequence_privilege(sequence):
+    async def require_sequence_privilege(table):
+        has_id = await conn.fetchval(
+            "SELECT EXISTS ("
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = $$public$$ AND table_name = $1 "
+            "AND column_name = $$id$$"
+            ")", table
+        )
+        if not has_id:
+            return
+        sequence = await conn.fetchval(
+            "SELECT pg_get_serial_sequence($1, $$id$$)", table
+        )
+        if sequence is None:
+            return
         allowed = await conn.fetchval(
             "SELECT has_sequence_privilege(current_user, $1, $$USAGE$$)",
             sequence,
@@ -402,8 +423,8 @@ async def main():
         await require_table_privilege(table, "UPDATE")
     for table in deletes:
         await require_table_privilege(table, "DELETE")
-    for sequence in sequences:
-        await require_sequence_privilege(sequence)
+    for table in inserts:
+        await require_sequence_privilege(table)
 
     negatives = [
         ("decisions", "INSERT"),
@@ -415,10 +436,16 @@ async def main():
         )
         if allowed:
             raise SystemExit(f"runner unexpectedly has {privilege} on {table}")
-    if await conn.fetchval(
-        "SELECT has_sequence_privilege(current_user, $$worker_runs_id_seq$$, $$USAGE$$)"
+    worker_runs_sequence = await conn.fetchval(
+        "SELECT pg_get_serial_sequence($1, $$id$$)", "worker_runs"
+    )
+    if worker_runs_sequence and await conn.fetchval(
+        "SELECT has_sequence_privilege(current_user, $1, $$USAGE$$)",
+        worker_runs_sequence,
     ):
-        raise SystemExit("runner unexpectedly has sequence usage on worker_runs_id_seq")
+        raise SystemExit(
+            f"runner unexpectedly has sequence usage on {worker_runs_sequence}"
+        )
 
     await conn.close()
 
