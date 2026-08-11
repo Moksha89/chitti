@@ -13,12 +13,26 @@ LITELLM_MASTER_KEY=<from the application environment>
 
 ## Repeatable deployment
 
-From the application checkout, run `deploy/deploy-main.sh` as root. The
-command fetches `main`, starts the stack so its normal startup migration path
-runs, builds `chitti-sandbox:latest`, installs this unit, provisions the
-runner-only database role on first use, and verifies the schema and container
-boundaries. Re-running it preserves the existing runner environment file and
-does not rotate that role's password.
+From the application checkout on the host, execute `deploy/deploy-main.sh` as
+root. The command fetches `main`, starts the stack so its normal startup
+migration path runs, builds `chitti-sandbox:latest`, installs this unit,
+provisions the runner-only database role on first use, and verifies the schema
+and container boundaries. Re-running it preserves the existing runner
+environment file and does not rotate that role's password.
+
+For a remote deployment, copy the script to the host and execute that file;
+do not stream it into `bash -s`. The repository wrapper performs that safe
+transfer and requires the script's completion marker:
+
+```sh
+deploy/deploy-remote.sh root@host /path/to/ssh-key
+```
+
+The wrapper gives the script a closed stdin, captures its output, and fails if
+the script exits non-zero or does not print `CHITTI_DEPLOY_COMPLETE` as its
+final line. The deploy script gives its stdin-consuming gateway assertion an
+explicit process-substitution input, so it cannot consume the script body even
+if an operator invokes the script through an unusual transport.
 
 The deployment recreates the LiteLLM gateway and verifies its authenticated
 loaded model routes after startup. If `litellm/config.yaml` changes, deploy
