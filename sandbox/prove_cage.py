@@ -36,15 +36,24 @@ async def main() -> None:
         pass
     workspace.chmod(0o770)
     try:
-        bounded = WorkerLimits(artifact_bytes=1024 * 1024, timeout_seconds=2)
+        bounded = WorkerLimits(
+            memory="2g",
+            cpus=2.0,
+            pids=512,
+            artifact_bytes=100 * 1024 * 1024,
+            output_bytes=1024 * 1024,
+            workspace_bytes=4 * 1024 * 1024 * 1024,
+            timeout_seconds=2,
+        )
         cases = {
             "memory-oom": FixedOperation("proof", "memory", (
-                "python", "-c",
+                "python3", "-c",
                 "x=[]; [x.append(bytearray(1024*1024)) for _ in range(256)]",
             )),
             "pid-limit": FixedOperation("proof", "pids", (
-                "python", "-c",
-                "import os; [os.fork() for _ in range(256)]",
+                "node", "-e",
+                "const {spawn}=require('child_process'); "
+                "for(let i=0;i<1024;i++) spawn(process.execPath,['-e','setInterval(()=>{},100000)']);",
             )),
             "output-quota": FixedOperation("proof", "output", (
                 "sh", "-c", "yes x",
@@ -52,10 +61,23 @@ async def main() -> None:
             "wall-clock": FixedOperation("proof", "timeout", (
                 "sh", "-c", "sleep 30",
             )),
+            "service-unreachability": FixedOperation("proof", "network", (
+                "node", "-e",
+                "const net=require('net'); "
+                "const hosts=[['postgres','172.31.250.3',5432],"
+                "['redis','172.31.250.6',6379],"
+                "['litellm','172.31.250.4',4000],"
+                "['chitti','172.31.250.5',8000]]; "
+                "let left=hosts.length, bad=false; "
+                "for(const [name,host,port] of hosts){const s=net.createConnection({host,port});"
+                "s.setTimeout(1000); s.on('connect',()=>{console.error(name+' reachable');bad=true;s.destroy()});"
+                "s.on('timeout',()=>s.destroy()); s.on('close',()=>{if(--left===0)process.exit(bad?1:0)});"
+                "s.on('error',()=>{});}",
+            ), network="bridge"),
         }
         for index, (name, operation) in enumerate(cases.items(), 1):
             limits = bounded if name != "memory-oom" else WorkerLimits(
-                memory="64m", pids=32, artifact_bytes=1024 * 1024, timeout_seconds=2
+                memory="64m", pids=32, output_bytes=1024 * 1024, timeout_seconds=10
             )
             try:
                 result = await run_command(dispatcher, workspace, index, operation, limits)

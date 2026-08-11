@@ -5,7 +5,6 @@ import hashlib
 import json
 import shutil
 import subprocess
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,12 +28,14 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class WorkerLimits:
     cpus: float = 1.0
-    memory: str = "512m"
-    pids: int = 128
-    timeout_seconds: int = 300
-    nofile: int = 256
-    artifact_bytes: int = 50 * 1024 * 1024
-    shm_size: str = "64m"
+    memory: str = "2g"
+    pids: int = 512
+    timeout_seconds: int = 900
+    nofile: int = 1024
+    artifact_bytes: int = 100 * 1024 * 1024
+    output_bytes: int = 100 * 1024 * 1024
+    workspace_bytes: int = 4 * 1024 * 1024 * 1024
+    shm_size: str = "256m"
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -44,6 +45,8 @@ class WorkerLimits:
             "timeout_seconds": self.timeout_seconds,
             "nofile": self.nofile,
             "artifact_bytes": self.artifact_bytes,
+            "output_bytes": self.output_bytes,
+            "workspace_bytes": self.workspace_bytes,
             "shm_size": self.shm_size,
             "network_policy": "public_egress_default_bridge",
             "non_root_uid": 65532,
@@ -51,13 +54,16 @@ class WorkerLimits:
 
     @classmethod
     def from_json(cls, values: Mapping[str, object]) -> WorkerLimits:
+        artifact_bytes = int(cast(int, values["artifact_bytes"]))
         return cls(
             cpus=float(cast(float, values["cpus"])),
             memory=str(values["memory"]),
             pids=int(cast(int, values["pids"])),
             timeout_seconds=int(cast(int, values["timeout_seconds"])),
             nofile=int(cast(int, values["nofile"])),
-            artifact_bytes=int(cast(int, values["artifact_bytes"])),
+            artifact_bytes=artifact_bytes,
+            output_bytes=int(cast(int, values.get("output_bytes", artifact_bytes))),
+            workspace_bytes=int(cast(int, values.get("workspace_bytes", artifact_bytes))),
             shm_size=str(values["shm_size"]),
         )
 
@@ -118,9 +124,8 @@ class DockerSandboxDispatcher:
         self, revision: PlanRevision, run_id: int, limits: WorkerLimits
     ) -> None:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
-        workspace = Path(
-            tempfile.mkdtemp(prefix=f"chitti-run-{run_id}-", dir=self.workspace_root)
-        )
+        workspace = self.workspace_root / f"chitti-run-{run_id}"
+        workspace.mkdir(parents=True, exist_ok=True)
         mounted = False
         try:
             await self._mount_workspace(workspace, limits)
@@ -163,7 +168,7 @@ class DockerSandboxDispatcher:
                 if status == "failed":
                     await self._event(run_id, "failed", f"operation failed: {operation.name}")
                     return
-                if _directory_size(workspace) > limits.artifact_bytes:
+                if _directory_size(workspace) > limits.workspace_bytes:
                     await self._task_event(
                         run_id, operation.task_id, "failed", "artifact quota exceeded"
                     )
@@ -175,26 +180,66 @@ class DockerSandboxDispatcher:
             if mounted:
                 await self._unmount_workspace(workspace)
             shutil.rmtree(workspace, ignore_errors=True)
+            self._workspace_image(workspace).unlink(missing_ok=True)
 
     async def _mount_workspace(self, workspace: Path, limits: WorkerLimits) -> None:
+        image = self._workspace_image(workspace)
+        mounted = False
         await asyncio.to_thread(
             subprocess.run,
             [
-                "mount",
-                "-t",
-                "tmpfs",
-                "-o",
-                f"size={limits.artifact_bytes},uid=65532,gid=65532,mode=0770",
-                "tmpfs",
-                str(workspace),
+                "truncate",
+                "-s",
+                str(limits.workspace_bytes),
+                str(image),
             ],
             check=True,
         )
+        await asyncio.to_thread(
+            subprocess.run,
+            ["mkfs.ext4", "-q", "-F", "-m", "0", str(image)],
+            check=True,
+        )
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                [
+                    "mount",
+                    "-o",
+                    "loop,nodev,nosuid",
+                    str(image),
+                    str(workspace),
+                ],
+                check=True,
+            )
+            mounted = True
+            await asyncio.to_thread(
+                subprocess.run,
+                ["chown", "65532:65532", str(workspace)],
+                check=True,
+            )
+        except Exception:
+            if mounted:
+                await self._unmount_workspace(workspace)
+            raise
 
     async def _unmount_workspace(self, workspace: Path) -> None:
         await asyncio.to_thread(
             subprocess.run, ["umount", str(workspace)], check=False
         )
+
+    def _workspace_image(self, workspace: Path) -> Path:
+        return workspace.with_name(f"{workspace.name}.img")
+
+    async def cleanup_stale_workspaces(self) -> None:
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        for image in self.workspace_root.glob("chitti-run-*.img"):
+            workspace = image.with_suffix("")
+            run_id = image.stem.removeprefix("chitti-run-")
+            await self._remove_container(f"chitti-worker-{run_id}")
+            await self._unmount_workspace(workspace)
+            shutil.rmtree(workspace, ignore_errors=True)
+            image.unlink(missing_ok=True)
 
     async def _run_container(
         self, run_id: int, command: list[str], limits: WorkerLimits
@@ -206,12 +251,12 @@ class DockerSandboxDispatcher:
         try:
             stdout_task = asyncio.create_task(
                 asyncio.to_thread(
-                    self._read_limited, process.stdout, max(1, limits.artifact_bytes // 2)
+                    self._read_limited, process.stdout, max(1, limits.output_bytes // 2)
                 )
             )
             stderr_task = asyncio.create_task(
                 asyncio.to_thread(
-                    self._read_limited, process.stderr, max(1, limits.artifact_bytes // 2)
+                    self._read_limited, process.stderr, max(1, limits.output_bytes // 2)
                 )
             )
             try:
@@ -416,7 +461,11 @@ class DockerSandboxDispatcher:
         self, run_id: int, workspace: Path, limits: WorkerLimits
     ) -> None:
         for path in workspace.rglob("*"):
-            if not path.is_file() or path.stat().st_size > limits.artifact_bytes:
+            if not path.is_file() or (
+                path.suffix != ".png" and path.name != "workspace.diff"
+            ):
+                continue
+            if path.stat().st_size > limits.artifact_bytes:
                 continue
             content = path.read_bytes()
             kind = "screenshot" if path.suffix == ".png" else "diff"
@@ -549,31 +598,34 @@ def fixed_operations(revision: PlanRevision) -> tuple[FixedOperation, ...]:
         FixedOperation(
             first.id, "write-fixture", (
                 "sh", "-c",
-                "printf '%s\\n' '<!doctype html><title>Chitti preview</title>' "
-                "> /workspace/index.html",
+                "cp -r /opt/fixture/. /workspace/",
             ),
         ),
         FixedOperation(
             first.id,
-            "install-fixture-dependency",
+            "install-node-dependencies",
             (
                 "sh",
                 "-c",
-                "python -m pip install --no-cache-dir --target /workspace/.deps "
-                "colorama==0.4.6",
+                "npm ci --ignore-scripts --no-audit --no-fund",
             ),
             network="bridge",
         ),
+        FixedOperation(first.id, "next-build", (
+            "sh", "-c", "npm run build",
+        )),
         FixedOperation(first.id, "browser-preview", (
-            "python", "/opt/screenshot.py",
+            "python3", "/opt/next_screenshot.py",
         )),
         FixedOperation(first.id, "run-tests", (
-            "python", "-m", "compileall", "-q", "/workspace",
+            "node", "-e", "const p=require('./package.json'); "
+            "if (!p.dependencies.next || !p.dependencies['@react-three/fiber'] || "
+            "!p.dependencies['@react-three/drei']) process.exit(1)",
         )),
         FixedOperation(first.id, "git-diff", (
             "sh", "-c", "cd /workspace && git -c safe.directory=/workspace "
-            "add -N index.html && git -c safe.directory=/workspace diff "
-            "--no-ext-diff > workspace.diff || true",
+            "add -A && git -c safe.directory=/workspace diff --cached "
+            "--no-ext-diff > workspace.diff",
         )),
     )
 

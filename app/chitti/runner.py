@@ -146,6 +146,7 @@ async def run_forever() -> None:
     database = Database(get_settings())
     dispatcher = DockerSandboxDispatcher(database)
     try:
+        await dispatcher.cleanup_stale_workspaces()
         while True:
             row = await next_queued_run(database)
             if row is None:
