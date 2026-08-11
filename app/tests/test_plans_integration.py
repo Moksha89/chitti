@@ -16,6 +16,7 @@ from chitti.plans import (
     revision_by_id,
     validate_approval_binding,
 )
+from chitti.worker import approved_revision
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("RUN_DB_TESTS"), reason="set RUN_DB_TESTS=1 to run PostgreSQL integration tests"
@@ -78,4 +79,24 @@ async def test_rejection_and_approval_are_append_only_and_hash_bound(database) -
                 text("UPDATE plan_revisions SET content = '{}'::jsonb WHERE id = :id"),
                 {"id": first_id},
             )
+        await session.rollback()
+
+
+async def test_worker_approval_gate_rechecks_exact_content_hash(database) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(
+            session, "sandbox", "Build fixture.", document()
+        )
+        with pytest.raises(ValueError, match="not approved"):
+            await approved_revision(session, revision_id)
+        await session.execute(
+            text(
+                "INSERT INTO plan_approvals "
+                "(revision_id, decision, content_hash) "
+                "VALUES (:revision, 'approved', :content_hash)"
+            ),
+            {"revision": revision_id, "content_hash": "0" * 64},
+        )
+        with pytest.raises(ValueError, match="no longer matches"):
+            await approved_revision(session, revision_id)
         await session.rollback()
