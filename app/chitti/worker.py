@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import shutil
 import subprocess
 import time
@@ -25,6 +26,8 @@ from .provider import ModelCompletion, ModelProvider
 
 if TYPE_CHECKING:
     from .db import Database
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -840,29 +843,40 @@ class DockerSandboxDispatcher:
         images.update(self._backing_loops(self.workspace_root))
         workspaces = {image.with_suffix("") for image in images}
         workspaces.update(self._mounted_workspaces(self.workspace_root))
+        failures: list[str] = []
         for workspace in workspaces:
             run_id = workspace.name.removeprefix("chitti-run-")
             await self._remove_container(f"chitti-worker-{run_id}")
             try:
                 await self._cleanup_workspace(workspace)
             except Exception as exc:
-                await self._record_cleanup_failure(
-                    run_id, f"stale workspace cleanup failed: {str(exc)[:1000]}"
-                )
-                raise
+                detail = f"stale workspace cleanup failed: {str(exc)[:1000]}"
+                failures.append(f"{workspace}: {detail}")
+                await self._record_cleanup_failure(run_id, detail)
+        if failures:
+            raise RuntimeError("; ".join(failures))
 
     async def _record_cleanup_failure(self, run_id: str, detail: str) -> None:
-        if self.database is None:
+        try:
+            numeric_run_id = int(run_id)
+        except (TypeError, ValueError):
+            logger.error("workspace cleanup failure for non-run %s: %s", run_id, detail)
             return
-        async with self.database.sessions() as session:
-            await session.execute(
-                text(
-                    "INSERT INTO worker_run_events (run_id, status, detail) "
-                    "VALUES (:run_id, 'failed', :detail)"
-                ),
-                {"run_id": int(run_id), "detail": detail},
-            )
-            await session.commit()
+        if self.database is None:
+            logger.error("workspace cleanup failure for run %s: %s", run_id, detail)
+            return
+        try:
+            async with self.database.sessions() as session:
+                await session.execute(
+                    text(
+                        "INSERT INTO worker_run_events (run_id, status, detail) "
+                        "VALUES (:run_id, 'failed', :detail)"
+                    ),
+                    {"run_id": numeric_run_id, "detail": detail},
+                )
+                await session.commit()
+        except Exception:
+            logger.exception("could not record workspace cleanup failure for run %s", run_id)
 
     async def _run_container(
         self, run_id: int, command: list[str], limits: WorkerLimits

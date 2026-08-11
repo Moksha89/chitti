@@ -96,3 +96,48 @@ def test_failed_unmount_keeps_workspace_image(monkeypatch, tmp_path) -> None:
         asyncio.run(dispatcher._cleanup_workspace(workspace))
 
     assert image.exists()
+
+
+def test_stale_cleanup_attempts_every_workspace_before_failing(monkeypatch, tmp_path) -> None:
+    dispatcher = DockerSandboxDispatcher(None)  # type: ignore[arg-type]
+    dispatcher.workspace_root = tmp_path
+    workspaces = {tmp_path / "chitti-run-proof-a", tmp_path / "chitti-run-proof-b"}
+    attempted: list[str] = []
+    recorded: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(dispatcher, "_backing_loops", lambda _root: {})
+    monkeypatch.setattr(dispatcher, "_mounted_workspaces", lambda _root: workspaces)
+
+    async def remove_container(_container):
+        return None
+
+    async def fail_cleanup(workspace):
+        attempted.append(workspace.name)
+        raise RuntimeError("mount remains")
+
+    async def record_failure(run_id, detail):
+        recorded.append((run_id, detail))
+
+    monkeypatch.setattr(dispatcher, "_remove_container", remove_container)
+    monkeypatch.setattr(dispatcher, "_cleanup_workspace", fail_cleanup)
+    monkeypatch.setattr(dispatcher, "_record_cleanup_failure", record_failure)
+
+    with pytest.raises(RuntimeError, match="proof-a|proof-b"):
+        asyncio.run(dispatcher.cleanup_stale_workspaces())
+
+    assert set(attempted) == {workspace.name for workspace in workspaces}
+    assert {run_id for run_id, _detail in recorded} == {"proof-a", "proof-b"}
+
+
+def test_cleanup_failure_recorder_logs_non_run_id_without_raising(caplog) -> None:
+    dispatcher = DockerSandboxDispatcher(None)  # type: ignore[arg-type]
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(
+            dispatcher._record_cleanup_failure(
+                "proof-quota", "workspace mount remains active"
+            )
+        )
+
+    assert "proof-quota" in caplog.text
+    assert "workspace mount remains active" in caplog.text
