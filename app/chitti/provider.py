@@ -69,6 +69,17 @@ class ModelProvider(Protocol):
     ) -> ModelCompletion: ...
 
 
+def _diagnostic_message_fields(message: dict[object, object]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            str(field)
+            for field, value in message.items()
+            if field not in {"content", "role"}
+            and value not in (None, "", [], {})
+        )
+    )
+
+
 def _json_payload(text: str) -> object:
     match = re.search(r"\[[\s\S]*\]", text)
     if not match:
@@ -168,9 +179,7 @@ class LiteLLMProvider:
                     if choice.get("finish_reason") is not None
                     else None
                 ),
-                message_fields=tuple(
-                    sorted(str(field) for field in message if field != "content")
-                ),
+                message_fields=_diagnostic_message_fields(message),
             )
 
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str:

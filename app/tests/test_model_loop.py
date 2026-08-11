@@ -84,6 +84,7 @@ def test_truncated_model_response_is_reported_distinctly() -> None:
     assert _model_response_failure(completion) == (
         "model response truncated at the output limit"
     )
+    assert not completion.message_fields
 
 
 def test_empty_content_with_alternate_fields_is_reported() -> None:
@@ -94,11 +95,11 @@ def test_empty_content_with_alternate_fields_is_reported() -> None:
         completion_tokens=20,
         total_tokens=30,
         cost_usd=0.01,
-        message_fields=("reasoning_content", "tool_calls"),
+        message_fields=("reasoning_content",),
     )
     assert _model_response_failure(completion) == (
         "model response had no visible content; "
-        "alternate message fields present: reasoning_content, tool_calls"
+        "alternate message fields present: reasoning_content"
     )
 
 

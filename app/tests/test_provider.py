@@ -8,6 +8,7 @@ from chitti.provider import (
     GatewayMisconfigurationError,
     GatewayTransientError,
     LiteLLMProvider,
+    _diagnostic_message_fields,
 )
 
 
@@ -119,5 +120,17 @@ def test_agent_completion_records_stop_reason_and_message_fields(monkeypatch) ->
 
     assert completion.content == ""
     assert completion.finish_reason == "length"
-    assert completion.message_fields == ("reasoning_content", "tool_calls")
+    assert completion.message_fields == ("reasoning_content",)
     assert calls[0][1]["json"]["max_tokens"] == CODER_MAX_OUTPUT_TOKENS
+
+
+def test_diagnostic_fields_ignore_structural_and_empty_message_values() -> None:
+    assert _diagnostic_message_fields(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [],
+            "refusal": None,
+            "reasoning_content": "useful hidden text",
+        }
+    ) == ("reasoning_content",)
