@@ -1,4 +1,4 @@
-from chitti.main import render_markdown
+from chitti.main import humanize_belief_key, humanize_belief_value, render_markdown
 
 
 def test_markdown_output_formats_code_and_escapes_html() -> None:
@@ -12,3 +12,10 @@ def test_markdown_output_formats_code_and_escapes_html() -> None:
     assert "&lt;unsafe&gt;" in rendered
     assert "<script>" not in rendered
     assert "&lt;script&gt;" in rendered
+
+
+def test_belief_presentation_keeps_keys_consistent_and_values_readable() -> None:
+    assert humanize_belief_key("hard_rules_meeting_start_time") == "Hard rules meeting start time"
+    assert humanize_belief_key("hard_rules.meeting_start_time") == "Hard rules meeting start time"
+    assert humanize_belief_value("hard_rules_meeting_start_time", "08:00") == "Meetings start at 08:00"
+    assert humanize_belief_value("deployment", "Docker Compose") == "Docker Compose"

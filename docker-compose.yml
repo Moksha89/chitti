@@ -73,13 +73,15 @@ services:
       context: .
       dockerfile: app/Dockerfile
     restart: unless-stopped
+    env_file:
+      - path: .env
+        format: raw
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       LITELLM_BASE_URL: http://litellm:4000
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       CHITTI_PROVIDER: ${CHITTI_PROVIDER:-litellm}
       CHITTI_USERNAME: ${CHITTI_USERNAME:-akirah}
-      CHITTI_PASSWORD_HASH: ${CHITTI_PASSWORD_HASH}
       CHITTI_SESSION_TTL_MINUTES: ${CHITTI_SESSION_TTL_MINUTES:-480}
       CHITTI_AUTH_STATE_PATH: ${CHITTI_AUTH_STATE_PATH:-/app/data/auth_state.json}
       CHITTI_TRUSTED_PROXY_IP: ${CHITTI_TRUSTED_PROXY_IP:-172.31.250.2}
