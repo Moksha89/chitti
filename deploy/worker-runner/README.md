@@ -41,6 +41,15 @@ running PID and a digest of the imported runner, worker, provider, and tool
 modules; deployment refuses to finish if it does not match the checked-out
 code.
 
+The digest hashes the source files resolved from those imported modules when
+the identity record is written; it is not a hash of already-executed bytecode.
+The runner writes the record as the first operation in `run_forever`, after
+module import and before database setup. This leaves only the small interval
+between import and record creation in which a source replacement could differ
+from the bytes already loaded by the interpreter. The PID check and removal of
+any stale identity record still require that this record come from the process
+started by the deployment.
+
 The runner requires host root because each workspace is a per-run ext4
 filesystem backed by a file under `/var/lib/chitti-worker/runs`. The backing
 file is mounted with a loop device and its exact size is the recorded workspace
