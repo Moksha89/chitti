@@ -53,3 +53,25 @@ The workspace filesystem is ext4 backed by a sparse per-run file. Ext4's
 filesystem limit makes writes fail inside the worker at the quota boundary;
 the runner's post-operation size check is only an audit guard, not the quota
 mechanism.
+
+Model coding runs add a second, runner-enforced budget document to the
+immutable `worker_runs.limits` JSON:
+
+- 40 model iterations per task and 120 total tool calls;
+- 300,000 total model tokens;
+- 2 MiB total model-authored writes;
+- 1,800 seconds overall run wall-clock, separate from each Docker operation's
+  900-second timeout;
+- $0.75 loop-side spend cap, with the `coder` and `reviewer` LiteLLM routes
+  capped at $5/day and $1/day respectively at the gateway. The loop-side cap
+  means one run can never spend more than $0.75, so $0.75 is the worst-case
+  cost of one run; daily route caps are an additional bad-day guard.
+
+Only the host runner constructs model prompts and holds the LiteLLM credential.
+The worker receives structured fixed tools, never a model key or arbitrary
+argv. Model prompts and responses are bounded append-only artifacts, with
+token/cost metadata in `worker_model_calls`; reviewer output is stored as a
+separate artifact. Older exploratory turns are compacted while the stable
+prompt prefix, task contract, recent turns, and build/test feedback remain;
+each compaction is recorded as a run event. Approval remains evidence review
+only: this slice does not publish, merge, or deploy sandbox output.
