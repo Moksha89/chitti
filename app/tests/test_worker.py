@@ -37,10 +37,11 @@ def test_worker_limits_are_recorded_as_explicit_sandbox_contract() -> None:
     limits = WorkerLimits()
     values = limits.as_json()
     assert values["cpus"] == 1.0
-    assert values["memory"] == "512m"
-    assert values["pids"] == 128
+    assert values["memory"] == "2g"
+    assert values["pids"] == 512
     assert values["non_root_uid"] == 65532
-    assert values["artifact_bytes"] > 0
+    assert values["workspace_bytes"] == 4 * 1024 * 1024 * 1024
+    assert values["output_bytes"] > 0
     assert WorkerLimits.from_json(values) == limits
 
 
@@ -50,7 +51,8 @@ def test_fixed_operations_are_deterministic_and_include_preview() -> None:
     assert [operation.name for operation in operations] == [
         "git-init",
         "write-fixture",
-        "install-fixture-dependency",
+        "install-node-dependencies",
+        "next-build",
         "browser-preview",
         "run-tests",
         "git-diff",
@@ -58,6 +60,10 @@ def test_fixed_operations_are_deterministic_and_include_preview() -> None:
     assert operations[2].network == "bridge"
     assert all(operation.network == "none" for operation in operations[:2])
     assert all(operation.network == "none" for operation in operations[3:])
+    assert "/workspace/artifacts" in operations[1].command[-1]
+    assert "node_modules" in operations[-1].command[-1]
+    assert ".next" in operations[-1].command[-1]
+    assert ".npm-cache" in operations[-1].command[-1]
 
 
 @pytest.mark.parametrize("network", ["chitti_net", "host"])
