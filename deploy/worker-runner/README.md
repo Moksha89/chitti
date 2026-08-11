@@ -9,6 +9,21 @@ the runner-only database URL:
 DATABASE_URL=postgresql+asyncpg://chitti_runner:<secret>@127.0.0.1:5432/chitti
 ```
 
+## Repeatable deployment
+
+From the application checkout, run `deploy/deploy-main.sh` as root. The
+command fetches `main`, starts the stack so its normal startup migration path
+runs, builds `chitti-sandbox:latest`, installs this unit, provisions the
+runner-only database role on first use, and verifies the schema and container
+boundaries. Re-running it preserves the existing runner environment file and
+does not rotate that role's password.
+
+The script's schema, role-privilege, Docker-socket, and isolated-worker
+network checks run on the host. The privileged ext4 mount, exact quota and
+disk-fill proofs, cancellation cleanup, restart recovery, and a real queued
+worker run still require the deployed host; CI intentionally does not claim
+those Docker, browser, or privileged-system checks.
+
 Apply `runner-role.sql` as the database administrator after replacing the
 placeholder password. The runner polls queued rows, claims one run at a time,
 observes durable `cancel_requested` events, and appends execution history.

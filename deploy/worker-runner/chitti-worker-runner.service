@@ -12,7 +12,7 @@ EnvironmentFile=/etc/chitti/worker-runner.env
 Environment=PYTHONPATH=/opt/chitti/app
 RuntimeDirectory=chitti-worker
 StateDirectory=chitti-worker
-ExecStart=/usr/bin/python3 -m chitti.runner
+ExecStart=/opt/chitti-runner/bin/python -m chitti.runner
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
