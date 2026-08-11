@@ -369,7 +369,7 @@ class DockerSandboxDispatcher:
             "--memory", limits.memory, "--pids-limit", str(limits.pids),
             "--ulimit", f"nofile={limits.nofile}:{limits.nofile}",
             "--shm-size", limits.shm_size, "--user", "65532:65532",
-            "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
+            "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
             "--mount", f"type=bind,src={workspace},dst=/workspace",
             self.image, *operation.command,
         ]
@@ -460,7 +460,10 @@ class DockerSandboxDispatcher:
     async def _capture_workspace_artifacts(
         self, run_id: int, workspace: Path, limits: WorkerLimits
     ) -> None:
-        for path in workspace.rglob("*"):
+        artifact_root = workspace / "artifacts"
+        if not artifact_root.is_dir():
+            return
+        for path in artifact_root.iterdir():
             if not path.is_file() or (
                 path.suffix != ".png" and path.name != "workspace.diff"
             ):
@@ -598,7 +601,7 @@ def fixed_operations(revision: PlanRevision) -> tuple[FixedOperation, ...]:
         FixedOperation(
             first.id, "write-fixture", (
                 "sh", "-c",
-                "cp -r /opt/fixture/. /workspace/",
+                "cp -r /opt/fixture/. /workspace/ && mkdir -p /workspace/artifacts",
             ),
         ),
         FixedOperation(
@@ -623,9 +626,15 @@ def fixed_operations(revision: PlanRevision) -> tuple[FixedOperation, ...]:
             "!p.dependencies['@react-three/drei']) process.exit(1)",
         )),
         FixedOperation(first.id, "git-diff", (
-            "sh", "-c", "cd /workspace && git -c safe.directory=/workspace "
-            "add -A && git -c safe.directory=/workspace diff --cached "
-            "--no-ext-diff > workspace.diff",
+                "sh", "-c", "cd /workspace && git -c safe.directory=/workspace "
+                "add -A -f -- . ':(exclude)node_modules' "
+                "':(exclude)node_modules/**' ':(exclude)**/node_modules/**' "
+                "':(exclude).next' ':(exclude).next/**' "
+                "':(exclude)**/.next/**' ':(exclude).npm-cache' "
+                "':(exclude).npm-cache/**' ':(exclude)**/.npm-cache/**' "
+                "':(exclude)artifacts' ':(exclude)artifacts/**' && "
+            "git -c safe.directory=/workspace diff --cached --no-ext-diff "
+            "> artifacts/workspace.diff",
         )),
     )
 

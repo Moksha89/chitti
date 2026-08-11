@@ -24,7 +24,7 @@ try:
                     if time.monotonic() >= deadline:
                         raise
                     time.sleep(0.5)
-            page.screenshot(path=f"/workspace/{name}.png", full_page=True)
+            page.screenshot(path=f"/workspace/artifacts/{name}.png", full_page=True)
             page.close()
         browser.close()
 finally:

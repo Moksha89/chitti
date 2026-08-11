@@ -60,6 +60,10 @@ def test_fixed_operations_are_deterministic_and_include_preview() -> None:
     assert operations[2].network == "bridge"
     assert all(operation.network == "none" for operation in operations[:2])
     assert all(operation.network == "none" for operation in operations[3:])
+    assert "/workspace/artifacts" in operations[1].command[-1]
+    assert "node_modules" in operations[-1].command[-1]
+    assert ".next" in operations[-1].command[-1]
+    assert ".npm-cache" in operations[-1].command[-1]
 
 
 @pytest.mark.parametrize("network", ["chitti_net", "host"])
