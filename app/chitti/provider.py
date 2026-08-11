@@ -18,6 +18,14 @@ class ExtractedMemory:
     source: str = "chitti_inferred"
 
 
+def readable_memory_value(key: str, value: str) -> str:
+    cleaned = value.strip()
+    if cleaned and not re.search(r"\s", cleaned):
+        label = re.sub(r"[_\.]+", " ", key).strip()
+        return f"{label}: {cleaned}"
+    return cleaned
+
+
 class ModelProvider(Protocol):
     async def chat(self, system: str, messages: list[dict[str, str]], role: str) -> str: ...
 
@@ -71,6 +79,10 @@ class LiteLLMProvider:
         prompt = (
             "Extract only durable facts, preferences, or decisions from this turn. "
             "Return a JSON array of objects with key, value, rationale, project, source. "
+            "Write each value as a complete, self-contained statement that a person can "
+            "understand without the key. Never return a bare time, color, product name, "
+            "framework name, version, or code; include the subject while preserving the "
+            "exact value. "
             "Use source user_stated when the user explicitly states it, otherwise "
             "chitti_inferred. Return [] when there is nothing durable. "
             "When a fact matches an existing key, reuse that key exactly instead of "
@@ -91,7 +103,7 @@ class LiteLLMProvider:
         return [
             ExtractedMemory(
                 key=str(item["key"]),
-                value=str(item["value"]),
+                value=readable_memory_value(str(item["key"]), str(item["value"])),
                 rationale=str(item["rationale"]) if item.get("rationale") else None,
                 project=str(item["project"]) if item.get("project") else None,
                 source=str(item.get("source", "chitti_inferred")),

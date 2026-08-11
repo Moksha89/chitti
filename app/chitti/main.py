@@ -307,17 +307,11 @@ async def dashboard_context(request: Request, session: Session) -> dict[str, obj
         conflicts = await memory.conflicts(db_session)
     for decision in decisions:
         decision["display_key"] = humanize_belief_key(str(decision["decision_key"]))
-        decision["display_value"] = humanize_belief_value(
-            str(decision["decision_key"]), str(decision["decision"])
-        )
+        decision["display_value"] = str(decision["decision"])
     for conflict in conflicts:
         conflict["display_key"] = humanize_belief_key(str(conflict["decision_key"]))
-        conflict["display_existing"] = humanize_belief_value(
-            str(conflict["decision_key"]), str(conflict["existing_value"])
-        )
-        conflict["display_proposed"] = humanize_belief_value(
-            str(conflict["decision_key"]), str(conflict["proposed_value"])
-        )
+        conflict["display_existing"] = str(conflict["existing_value"])
+        conflict["display_proposed"] = str(conflict["proposed_value"])
     now = datetime.now(ZoneInfo(request.app.state.settings.display_timezone))
     if now.hour < 12:
         greeting = "Good morning"
@@ -338,10 +332,6 @@ def humanize_belief_key(value: str) -> str:
     return re.sub(r"[_\.]+", " ", value).strip().capitalize()
 
 
-def humanize_belief_value(key: str, value: str) -> str:
-    if re.fullmatch(r"\d{1,2}:\d{2}", value.strip()) and "meeting" in key.lower():
-        return f"Meetings start at {value.strip()}"
-    return value
 
 
 @app.get("/", response_class=HTMLResponse, response_model=None)

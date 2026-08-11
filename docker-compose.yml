@@ -73,9 +73,6 @@ services:
       context: .
       dockerfile: app/Dockerfile
     restart: unless-stopped
-    env_file:
-      - path: .env
-        format: raw
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       LITELLM_BASE_URL: http://litellm:4000
