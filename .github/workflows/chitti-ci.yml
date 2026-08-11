@@ -1,0 +1,81 @@
+name: Chitti CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: lint, typecheck, tests, and compose validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/requirements.txt
+
+      - name: Install application and verification dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            -r app/requirements.txt \
+            "mypy==1.15.0" \
+            "pytest==8.3.5" \
+            "pytest-asyncio==0.25.3" \
+            "ruff==0.11.2"
+
+      - name: Run all required checks
+        env:
+          CHITTI_PROVIDER: fake
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci-postgres-password
+          POSTGRES_DB: chitti
+          REDIS_PASSWORD: ci-redis-password
+          GLM_CODING_API_KEY: ci-placeholder
+          DEEPSEEK_API_KEY: ci-placeholder
+          LITELLM_MASTER_KEY: ci-placeholder
+          TELEGRAM_BOT_TOKEN: ci-placeholder
+          ALLOWED_TELEGRAM_USER_IDS: "0"
+          RUN_DB_TESTS: "1"
+        run: |
+          set +e
+          status=0
+
+          echo "::group::Ruff"
+          ruff check . || status=$?
+          echo "::endgroup::"
+
+          echo "::group::Mypy"
+          (cd app && mypy chitti) || status=$?
+          echo "::endgroup::"
+
+          echo "::group::Unit tests"
+          (cd app && CHITTI_PROVIDER=fake pytest -q \
+            --ignore=tests/test_memory_integration.py \
+            --ignore=tests/test_plans_integration.py) || status=$?
+          echo "::endgroup::"
+
+          echo "::group::PostgreSQL/pgvector integration tests"
+          (cd app && RUN_DB_TESTS=1 pytest -q \
+            tests/test_memory_integration.py \
+            tests/test_plans_integration.py) || status=$?
+          echo "::endgroup::"
+
+          echo "::group::Compose validation"
+          docker compose config --quiet || status=$?
+          echo "::endgroup::"
+
+          exit "$status"
