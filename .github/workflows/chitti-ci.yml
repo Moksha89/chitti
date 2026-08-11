@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - main
-      - ci/github-actions
   workflow_dispatch:
 
 permissions:
@@ -41,7 +40,15 @@ jobs:
       - name: Run all required checks
         env:
           CHITTI_PROVIDER: fake
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci-postgres-password
+          POSTGRES_DB: chitti
           REDIS_PASSWORD: ci-redis-password
+          GLM_CODING_API_KEY: ci-placeholder
+          DEEPSEEK_API_KEY: ci-placeholder
+          LITELLM_MASTER_KEY: ci-placeholder
+          TELEGRAM_BOT_TOKEN: ci-placeholder
+          ALLOWED_TELEGRAM_USER_IDS: "0"
           RUN_DB_TESTS: "1"
         run: |
           set +e
