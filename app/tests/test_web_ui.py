@@ -77,7 +77,11 @@ def test_finished_run_without_export_manifest_is_not_promotable() -> None:
     assert "Approve result" not in rendered
 
 
-def test_plan_approval_reason_is_rendered() -> None:
+def test_plan_approval_reason_form_round_trips_to_plan_display() -> None:
+    unapproved = _render_plan_run(_finished_run())
+    assert 'name="reason"' in unapproved
+    assert 'action="/plans/3/approve"' in unapproved
+
     revision = SimpleNamespace(
         id=3,
         project="demo",

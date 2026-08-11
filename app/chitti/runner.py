@@ -23,6 +23,7 @@ from .provider import (
     FakeProvider,
     GatewayMisconfigurationError,
     GatewayTransientError,
+    GatewayValidationError,
     LiteLLMProvider,
     ModelProvider,
 )
@@ -406,7 +407,10 @@ async def run_forever() -> None:
         model_provider=provider,
     )
     try:
-        await provider.validate_gateway()
+        try:
+            await provider.validate_gateway()
+        except GatewayValidationError as exc:
+            logger.error("gateway startup preflight failed: %s", exc)
         await dispatcher.cleanup_stale_workspaces()
         while True:
             await dispatcher.cleanup_expired_previews()
