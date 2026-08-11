@@ -15,6 +15,7 @@ from chitti.worker import (
     _parse_tool_call,
     _task_done_checks,
     _tool_exchange,
+    _tool_rejection_exchange,
 )
 
 
@@ -112,6 +113,26 @@ def test_native_tool_call_message_is_represented_for_provider_history() -> None:
     assert message["role"] == "assistant"
     assert message["tool_calls"][0]["function"]["name"] == "finish"
     assert _model_response_failure(completion) is None
+
+
+def test_rejected_native_calls_are_answered_with_tool_results() -> None:
+    completion = ModelCompletion(
+        content="",
+        model="coder",
+        prompt_tokens=1,
+        completion_tokens=1,
+        total_tokens=2,
+        cost_usd=0,
+        tool_calls=(
+            ModelToolCall(id="call-1", name="unknown", arguments={}),
+            ModelToolCall(id="call-2", name="also-unknown", arguments={}),
+        ),
+    )
+    exchange = _tool_rejection_exchange(completion, "TOOL FAILURE: rejected")
+    assert exchange[0]["role"] == "assistant"
+    assert [item["tool_call_id"] for item in exchange[1:]] == ["call-1", "call-2"]
+    assert all(item["role"] == "tool" for item in exchange[1:])
+
 
 def test_model_tool_parser_rejects_malformed_and_unknown_shape() -> None:
     with pytest.raises(ValueError, match="valid JSON"):

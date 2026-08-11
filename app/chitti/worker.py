@@ -387,21 +387,26 @@ class DockerSandboxDispatcher:
                 if response_failure is not None:
                     detail = response_failure
                     await record_nonproductive(detail)
-                    messages.append({"role": "user", "content": f"TOOL FAILURE: {detail}"})
+                    messages.extend(
+                        _tool_rejection_exchange(completion, f"TOOL FAILURE: {detail}")
+                    )
                     await compact_history()
                     continue
                 if route == REVIEWER_ROUTE:
                     messages.extend(
-                        [
-                            {"role": "assistant", "content": completion.content[:16000]},
-                            {
-                                "role": "user",
-                                "content": (
-                                    "Diagnosis received. Return to the coder route and make "
-                                    "one corrective attempt using that diagnosis."
-                                ),
-                            },
-                        ]
+                        _tool_rejection_exchange(
+                            completion,
+                            "TOOL FAILURE: reviewer responses cannot invoke worker tools.",
+                        )
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Diagnosis received. Return to the coder route and make "
+                                "one corrective attempt using that diagnosis."
+                            ),
+                        }
                     )
                     route = CODER_ROUTE
                     continue
@@ -411,10 +416,9 @@ class DockerSandboxDispatcher:
                         detail = "model returned more than one tool call"
                         await record_nonproductive(detail)
                         messages.extend(
-                            [
-                                _assistant_tool_message(completion),
-                                {"role": "user", "content": f"TOOL FAILURE: {detail}"},
-                            ]
+                            _tool_rejection_exchange(
+                                completion, f"TOOL FAILURE: {detail}"
+                            )
                         )
                         await compact_history()
                         continue
@@ -435,12 +439,9 @@ class DockerSandboxDispatcher:
                     detail = f"unknown model tool: {tool}"
                     await record_nonproductive(detail)
                     messages.extend(
-                        [
-                            _assistant_tool_message(completion)
-                            if native_call
-                            else {"role": "assistant", "content": completion.content[:16000]},
-                            {"role": "user", "content": f"TOOL FAILURE: {detail}"},
-                        ]
+                        _tool_rejection_exchange(
+                            completion, f"TOOL FAILURE: {detail}"
+                        )
                     )
                     await compact_history()
                     continue
@@ -1654,6 +1655,26 @@ def _tool_exchange(
             "content": result_text,
         },
     ]
+
+
+def _tool_rejection_exchange(
+    completion: ModelCompletion, result_text: str
+) -> list[dict[str, object]]:
+    if not completion.tool_calls:
+        return [
+            {"role": "assistant", "content": completion.content[:16000]},
+            {"role": "user", "content": result_text},
+        ]
+    exchange: list[dict[str, object]] = [_assistant_tool_message(completion)]
+    exchange.extend(
+        {
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": result_text,
+        }
+        for call in completion.tool_calls
+    )
+    return exchange
 
 
 def _task_done_checks(completed_commands: set[str]) -> bool:
