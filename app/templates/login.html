@@ -1,14 +1,19 @@
 {% extends "base.html" %}
 {% block title %}Sign in · Chitti{% endblock %}
 {% block body %}
-<main class="card">
+<main class="auth-shell">
+<section class="card auth-card">
+  <p class="eyebrow">PERSONAL AI WORKSPACE</p>
   <h1>Sign in to Chitti</h1>
+  <p class="muted">Your private command center for conversations, decisions, and memory.</p>
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
   <form method="post" action="/login">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="next" value="{{ next }}">
     <label>Username <input name="username" autocomplete="username" required autofocus></label>
     <label>Password <input type="password" name="password" autocomplete="current-password" required></label>
     <button type="submit">Sign in</button>
   </form>
+</section>
 </main>
 {% endblock %}

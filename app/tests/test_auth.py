@@ -115,3 +115,48 @@ def test_cookie_secure_flag_matches_scheme(tmp_path) -> None:
     https_client = TestClient(app, base_url="https://testserver")
     https_cookie = https_client.get("/login").headers["set-cookie"]
     assert " Secure" in https_cookie
+
+
+def test_unauthenticated_page_routes_redirect_to_login(tmp_path) -> None:
+    make_auth(tmp_path)
+    client = TestClient(app, base_url="https://testserver")
+    assert client.get("/", follow_redirects=False).headers["location"] == "/login?next=%2F"
+    assert client.get("/change-password", follow_redirects=False).headers["location"] == "/login?next=%2Fchange-password"
+    assert client.post("/logout", follow_redirects=False).headers["location"] == "/login"
+    assert client.post("/memory/conflicts/1/resolve", follow_redirects=False).headers["location"] == (
+        "/login?next=%2Fmemory%2Fconflicts%2F1%2Fresolve"
+    )
+
+
+def test_unauthenticated_api_routes_keep_generic_401(tmp_path) -> None:
+    make_auth(tmp_path)
+    client = TestClient(app, base_url="https://testserver")
+    for response in (
+        client.get("/health"),
+        client.post("/chat", json={"message": "hello"}),
+        client.get("/projects/demo/state"),
+    ):
+        assert response.status_code == 401
+        assert response.json() == {"detail": "authentication required"}
+
+
+def test_expired_session_on_html_route_redirects(tmp_path) -> None:
+    auth, _ = make_auth(tmp_path)
+    token, _ = auth.create_session("akirah")
+    auth.sessions[token].expires_at = time.time() - 1
+    client = TestClient(app, base_url="https://testserver")
+    client.cookies.set("chitti_session", token)
+    response = client.get("/", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login?next=%2F"
+
+
+def test_authenticated_user_on_login_is_redirected(tmp_path) -> None:
+    auth, _ = make_auth(tmp_path)
+    auth.must_change_password = False
+    token, _ = auth.create_session("akirah")
+    client = TestClient(app, base_url="https://testserver")
+    client.cookies.set("chitti_session", token)
+    response = client.get("/login?next=%2Fchange-password", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"

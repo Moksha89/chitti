@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import cast
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -82,6 +83,36 @@ def current_session(request: Request) -> tuple[str, Session]:
     return token, session
 
 
+def safe_next_path(value: str | None) -> str:
+    candidate = value or "/"
+    if candidate.startswith("/") and not candidate.startswith("//"):
+        return candidate
+    return "/"
+
+
+def change_password_location(next_path: str) -> str:
+    if next_path == "/":
+        return "/change-password"
+    return f"/change-password?next={quote(next_path, safe='')}"
+
+
+def login_redirect(request: Request, *, include_next: bool = True) -> RedirectResponse:
+    if not include_next:
+        return RedirectResponse("/login", status_code=303)
+    destination = request.url.path
+    if request.url.query:
+        destination = f"{destination}?{request.url.query}"
+    return RedirectResponse(f"/login?next={quote(destination, safe='')}", status_code=303)
+
+
+def browser_session(request: Request, *, include_next: bool = True) -> tuple[str, Session] | RedirectResponse:
+    token = request.cookies.get(SESSION_COOKIE)
+    session = auth_manager(request).get_session(token)
+    if not token or session is None or session.username is None:
+        return login_redirect(request, include_next=include_next)
+    return token, session
+
+
 def require_csrf(request: Request, session: Session, form_token: str | None = None) -> None:
     token = form_token or request.headers.get("X-CSRF-Token")
     if not auth_manager(request).csrf_valid(session, token):
@@ -138,13 +169,22 @@ async def login_page(request: Request) -> HTMLResponse | RedirectResponse:
     manager = auth_manager(request)
     session = manager.get_session(request.cookies.get(SESSION_COOKIE))
     if session and session.username:
-        destination = "/change-password" if manager.must_change_password else "/"
+        next_path = safe_next_path(request.query_params.get("next"))
+        destination = (
+            change_password_location(next_path)
+            if manager.must_change_password
+            else "/"
+        )
         return RedirectResponse(destination, status_code=303)
     token, session = manager.create_session()
     response = templates.TemplateResponse(
         request=request,
         name="login.html",
-        context={"csrf_token": session.csrf_token, "error": None},
+        context={
+            "csrf_token": session.csrf_token,
+            "error": None,
+            "next": safe_next_path(request.query_params.get("next")),
+        },
     )
     set_session_cookie(response, token, request_is_https(request))
     return response
@@ -157,8 +197,9 @@ async def login(request: Request) -> HTMLResponse | RedirectResponse:
     old_token = request.cookies.get(SESSION_COOKIE)
     old_session = manager.get_session(old_token)
     csrf_token = str(form.get(CSRF_FIELD, ""))
+    next_path = safe_next_path(str(form.get("next", "")))
     if old_session is None:
-        response = RedirectResponse("/login", status_code=303)
+        response = RedirectResponse(f"/login?next={quote(next_path, safe='')}", status_code=303)
         clear_session_cookie(response)
         return response
     if not manager.csrf_valid(old_session, csrf_token):
@@ -169,11 +210,19 @@ async def login(request: Request) -> HTMLResponse | RedirectResponse:
         return templates.TemplateResponse(
             request=request,
             name="login.html",
-            context={"csrf_token": old_session.csrf_token, "error": "Invalid credentials or login temporarily locked."},
+            context={
+                "csrf_token": old_session.csrf_token,
+                "error": "Invalid credentials or login temporarily locked.",
+                "next": next_path,
+            },
             status_code=401,
         )
     token, session = manager.rotate_authenticated_session(old_token or "", manager.username)
-    destination = "/change-password" if manager.must_change_password else "/"
+    destination = (
+        change_password_location(next_path)
+        if manager.must_change_password
+        else next_path
+    )
     response = RedirectResponse(destination, status_code=303)
     set_session_cookie(response, token, request_is_https(request))
     return response
@@ -181,7 +230,10 @@ async def login(request: Request) -> HTMLResponse | RedirectResponse:
 
 @app.post("/logout")
 async def logout(request: Request) -> RedirectResponse:
-    token, session = current_session(request)
+    result = browser_session(request, include_next=False)
+    if isinstance(result, RedirectResponse):
+        return result
+    token, session = result
     form = await request.form()
     require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
     manager = auth_manager(request)
@@ -192,31 +244,46 @@ async def logout(request: Request) -> RedirectResponse:
 
 
 @app.get("/change-password", response_class=HTMLResponse, response_model=None)
-async def change_password_page(request: Request) -> HTMLResponse:
-    _, session = current_session(request)
+async def change_password_page(request: Request) -> HTMLResponse | RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
     return templates.TemplateResponse(
         request=request,
         name="change_password.html",
-        context={"csrf_token": session.csrf_token, "error": None},
+        context={
+            "csrf_token": session.csrf_token,
+            "error": None,
+            "next": safe_next_path(request.query_params.get("next")),
+        },
     )
 
 
 @app.post("/change-password", response_class=HTMLResponse, response_model=None)
 async def change_password(request: Request) -> HTMLResponse | RedirectResponse:
-    _, session = current_session(request)
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
     form = await request.form()
     require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
     password = str(form.get("password", ""))
     confirmation = str(form.get("confirmation", ""))
+    next_path = safe_next_path(str(form.get("next", "")))
     if len(password) < 12 or password != confirmation:
         return templates.TemplateResponse(
             request=request,
             name="change_password.html",
-            context={"csrf_token": session.csrf_token, "error": "Passwords must match and be at least 12 characters."},
+            context={
+                "csrf_token": session.csrf_token,
+                "error": "Passwords must match and be at least 12 characters.",
+                "next": next_path,
+            },
             status_code=400,
         )
     auth_manager(request).change_password(password)
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse(next_path, status_code=303)
 
 
 async def dashboard_context(request: Request, session: Session) -> dict[str, object]:
@@ -234,7 +301,10 @@ async def dashboard_context(request: Request, session: Session) -> dict[str, obj
 
 @app.get("/", response_class=HTMLResponse, response_model=None)
 async def dashboard(request: Request) -> HTMLResponse | RedirectResponse:
-    _, session = current_session(request)
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
     if auth_manager(request).must_change_password:
         return RedirectResponse("/change-password", status_code=303)
     return templates.TemplateResponse(
@@ -246,7 +316,10 @@ async def dashboard(request: Request) -> HTMLResponse | RedirectResponse:
 
 @app.post("/memory/conflicts/{conflict_id}/resolve")
 async def resolve_conflict(conflict_id: int, request: Request) -> RedirectResponse:
-    _, session = current_session(request)
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
     if auth_manager(request).must_change_password:
         return RedirectResponse("/change-password", status_code=303)
     form = await request.form()
