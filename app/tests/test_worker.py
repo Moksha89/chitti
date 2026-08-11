@@ -79,3 +79,20 @@ def test_output_reader_stops_at_budget_without_buffering_unbounded_output() -> N
     output, exceeded = asyncio.run(exercise())
     assert len(output) == 1024
     assert exceeded
+
+
+def test_failed_unmount_keeps_workspace_image(monkeypatch, tmp_path) -> None:
+    dispatcher = DockerSandboxDispatcher(None)  # type: ignore[arg-type]
+    workspace = tmp_path / "chitti-run-1"
+    image = dispatcher._workspace_image(workspace)
+    image.write_bytes(b"backing image")
+
+    async def fail_unmount(_workspace):
+        raise RuntimeError("workspace mount remains active")
+
+    monkeypatch.setattr(dispatcher, "_unmount_workspace", fail_unmount)
+
+    with pytest.raises(RuntimeError, match="workspace mount remains active"):
+        asyncio.run(dispatcher._cleanup_workspace(workspace))
+
+    assert image.exists()

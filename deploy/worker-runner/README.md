@@ -35,6 +35,17 @@ cleanup path. On startup it also unmounts and removes stale `chitti-run-*.img`
 files left by a crash before claiming new work. This recovery sweep is
 necessary because a leaked quota image would eventually consume the host disk.
 
+The disk-fill proof uses a bind mount with the `--mount` key/value form; the
+bind is read-write by default. With a mounted proof workspace in
+`$workspace`, the worker-side write must fail at the filesystem boundary:
+
+```sh
+docker run --rm --network none --read-only --user 65532:65532 \
+  --mount "type=bind,src=${workspace},dst=/workspace" \
+  chitti-sandbox:latest sh -c \
+  'dd if=/dev/zero of=/workspace/fill bs=1M count=64 status=none'
+```
+
 The frontend-build policy is intentionally conservative for this no-swap host:
 
 - `2g` memory and `1` CPU: enough for the fixture's Next.js/R3F build while
