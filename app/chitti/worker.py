@@ -293,6 +293,7 @@ class DockerSandboxDispatcher:
         spent = 0.0
         spent_tokens = 0
         calls = 0
+        tool_calls_used = 0
         writes = 0
         operation_index = 1
         for task in revision.document.tasks:
@@ -344,8 +345,6 @@ class DockerSandboxDispatcher:
             for iteration in range(1, limits.model_iterations + 1):
                 if time.monotonic() - started > limits.run_timeout_seconds:
                     raise RuntimeError("model run wall-clock budget exceeded")
-                if calls >= limits.model_tool_calls:
-                    raise RuntimeError("model tool-call budget exceeded")
                 try:
                     completion = await self.model_provider.agent_completion(
                         messages,
@@ -415,21 +414,129 @@ class DockerSandboxDispatcher:
                     failures = 0
                     nonproductive_turns = 0
                     continue
-                native_call: ModelToolCall | None = None
                 if completion.tool_calls:
-                    if len(completion.tool_calls) != 1:
-                        detail = "model returned more than one tool call"
-                        await record_nonproductive(detail)
-                        messages.extend(
-                            _tool_rejection_exchange(
-                                completion, f"TOOL FAILURE: {detail}"
+                    messages.append(_assistant_tool_message(completion))
+                    batch_failure: str | None = None
+                    batch_completed = True
+                    for call_index, native_call in enumerate(completion.tool_calls):
+                        tool, arguments = native_call.name, native_call.arguments
+                        if tool not in model_tool_names():
+                            result_text = f"TOOL FAILURE: unknown model tool: {tool}"
+                            batch_failure = result_text
+                            messages.append(_tool_result_message(native_call, result_text))
+                        elif tool_calls_used >= limits.model_tool_calls:
+                            result_text = "TOOL FAILURE: model tool-call budget exceeded"
+                            batch_failure = result_text
+                            messages.append(_tool_result_message(native_call, result_text))
+                        else:
+                            tool_calls_used += 1
+                            if tool == "finish" and _task_done_checks(completed_commands):
+                                await self._event(
+                                    run_id, "task_finished",
+                                    str(arguments.get("summary", ""))[:2000],
+                                    task_id=task.id,
+                                )
+                                messages.append(
+                                    _tool_result_message(native_call, "task finished")
+                                )
+                                done = True
+                                batch_completed = False
+                            elif tool == "finish":
+                                result_text = (
+                                    "TOOL FAILURE: done condition requires "
+                                    "successful build and test commands"
+                                )
+                                batch_failure = result_text
+                                messages.append(_tool_result_message(native_call, result_text))
+                            else:
+                                try:
+                                    result_text, written, operation_index = (
+                                        await self._execute_model_tool(
+                                            run_id, task.id, operation_index, tool,
+                                            arguments, workspace, limits, route,
+                                        )
+                                    )
+                                    writes += written
+                                    if writes > limits.model_write_bytes:
+                                        raise RuntimeError(
+                                            "model write-byte budget exceeded"
+                                        )
+                                    if tool == "run_command":
+                                        completed_commands.add(
+                                            str(arguments.get("name", ""))
+                                        )
+                                        file_writes_without_command = 0
+                                    elif tool == "write_file":
+                                        path = str(arguments.get("path", ""))
+                                        file_writes_without_command += 1
+                                        file_write_counts[path] = (
+                                            file_write_counts.get(path, 0) + 1
+                                        )
+                                        stall = _file_write_stall(
+                                            path, file_write_counts[path],
+                                            file_writes_without_command,
+                                        )
+                                        if stall is not None:
+                                            raise ModelProgressError(
+                                                f"task {task.id} stopped: {stall}"
+                                            )
+                                    messages.append(
+                                        _tool_result_message(
+                                            native_call, result_text[:16000]
+                                        )
+                                    )
+                                except Exception as exc:
+                                    if isinstance(exc, ModelProgressError):
+                                        raise
+                                    result_text = (
+                                        f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
+                                    )
+                                    batch_failure = result_text
+                                    messages.append(
+                                        _tool_result_message(native_call, result_text)
+                                    )
+                        if batch_failure is not None:
+                            messages.extend(
+                                _unexecuted_tool_results(
+                                    completion.tool_calls[call_index + 1:],
+                                    "TOOL FAILURE: not executed because an "
+                                    "earlier tool call in this batch failed",
+                                )
                             )
-                        )
-                        await compact_history()
-                        continue
-                    native_call = completion.tool_calls[0]
-                    tool, arguments = native_call.name, native_call.arguments
+                            batch_completed = False
+                            break
+                        if done:
+                            messages.extend(
+                                _unexecuted_tool_results(
+                                    completion.tool_calls[call_index + 1:],
+                                    "TOOL FAILURE: not executed because the "
+                                    "task was already finished",
+                                )
+                            )
+                            break
+                    if batch_failure is not None:
+                        await record_nonproductive(batch_failure)
+                        if failures >= 2 and route == CODER_ROUTE:
+                            route = REVIEWER_ROUTE
+                            messages = _reviewer_diagnosis_messages(
+                                task.title, task.description,
+                                completion.tool_calls[0].name, batch_failure,
+                            )
+                            await self._event(
+                                run_id, "model_route_switched",
+                                "switched to reviewer after two failures on the same task",
+                                task_id=task.id,
+                            )
+                            continue
+                    elif batch_completed:
+                        failures = 0
+                        nonproductive_turns = 0
+                    await compact_history()
+                    if done:
+                        break
+                    continue
                 else:
+                    native_call = None
                     try:
                         tool, arguments = _parse_tool_call(completion.content)
                     except ValueError as exc:
@@ -450,6 +557,9 @@ class DockerSandboxDispatcher:
                     )
                     await compact_history()
                     continue
+                if tool_calls_used >= limits.model_tool_calls:
+                    raise RuntimeError("model tool-call budget exceeded")
+                tool_calls_used += 1
                 if tool == "finish" and _task_done_checks(completed_commands):
                     await self._event(
                         run_id, "task_finished",
@@ -926,6 +1036,13 @@ class DockerSandboxDispatcher:
                 ["chown", "65532:65532", str(workspace)],
                 check=True,
             )
+            artifacts = workspace / "artifacts"
+            artifacts.mkdir(mode=0o700)
+            await asyncio.to_thread(
+                subprocess.run,
+                ["chown", "65532:65532", str(artifacts)],
+                check=True,
+            )
             source, filesystem, options = await asyncio.to_thread(
                 self._mounted_details, workspace
             )
@@ -1047,6 +1164,13 @@ class DockerSandboxDispatcher:
     @classmethod
     def _verify_worker_mount(cls, workspace: Path) -> None:
         probe = (
+            "from pathlib import Path\n"
+            "artifacts = Path('/workspace/artifacts')\n"
+            "if not artifacts.is_dir():\n"
+            "    raise SystemExit('worker artifacts directory is missing')\n"
+            "write_probe = artifacts / '.write-probe'\n"
+            "write_probe.write_bytes(b'probe')\n"
+            "write_probe.unlink()\n"
             "for line in open('/proc/self/mountinfo', encoding='utf-8'):\n"
             "    fields = line.rstrip().split(' - ', 1)\n"
             "    if len(fields) != 2:\n"
@@ -1646,6 +1770,20 @@ def _assistant_tool_message(completion: ModelCompletion) -> dict[str, object]:
     }
 
 
+def _tool_result_message(call: ModelToolCall, result_text: str) -> dict[str, object]:
+    return {
+        "role": "tool",
+        "tool_call_id": call.id,
+        "content": result_text,
+    }
+
+
+def _unexecuted_tool_results(
+    calls: tuple[ModelToolCall, ...], reason: str
+) -> list[dict[str, object]]:
+    return [_tool_result_message(call, reason) for call in calls]
+
+
 def _tool_exchange(
     completion: ModelCompletion,
     result_text: str,
@@ -1658,11 +1796,7 @@ def _tool_exchange(
         ]
     return [
         _assistant_tool_message(completion),
-        {
-            "role": "tool",
-            "tool_call_id": native_call.id,
-            "content": result_text,
-        },
+        _tool_result_message(native_call, result_text),
     ]
 
 
@@ -1676,11 +1810,7 @@ def _tool_rejection_exchange(
         ]
     exchange: list[dict[str, object]] = [_assistant_tool_message(completion)]
     exchange.extend(
-        {
-            "role": "tool",
-            "tool_call_id": call.id,
-            "content": result_text,
-        }
+        _tool_result_message(call, result_text)
         for call in completion.tool_calls
     )
     return exchange
