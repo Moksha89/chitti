@@ -6,6 +6,8 @@ REMOTE_BRANCH="${REMOTE_BRANCH:-main}"
 REPOSITORY_URL="${REPOSITORY_URL:-https://github.com/Moksha89/chitti.git}"
 RUNNER_ENV="${RUNNER_ENV:-/etc/chitti/worker-runner.env}"
 RUNNER_UNIT="chitti-worker-runner.service"
+RUNNER_ROLE_SQL="${RUNNER_ROLE_SQL:-deploy/worker-runner/runner-role.sql}"
+RUNNER_UNIT_SOURCE="${RUNNER_UNIT_SOURCE:-deploy/worker-runner/chitti-worker-runner.service}"
 fresh_clone=0
 real_checkout=0
 if [[ -e "${INSTALL_DIR}/.git" ]] &&
@@ -130,7 +132,7 @@ else
   chmod 0600 "${runner_env_tmp}"
 
   sed "s/REPLACE_WITH_A_RANDOM_SECRET/${runner_password}/" \
-    deploy/worker-runner/runner-role.sql >"${runner_sql_tmp}"
+    "${RUNNER_ROLE_SQL}" >"${runner_sql_tmp}"
   chmod 0600 "${runner_sql_tmp}"
   docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
     -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <"${runner_sql_tmp}" >/dev/null
@@ -141,7 +143,7 @@ else
 fi
 
 install -o root -g root -m 0644 \
-  deploy/worker-runner/chitti-worker-runner.service \
+  "${RUNNER_UNIT_SOURCE}" \
   "/etc/systemd/system/${RUNNER_UNIT}"
 systemctl daemon-reload
 systemctl enable --now "${RUNNER_UNIT}"
