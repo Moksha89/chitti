@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import shutil
 import subprocess
 import time
@@ -25,6 +26,8 @@ from .provider import ModelCompletion, ModelProvider
 
 if TYPE_CHECKING:
     from .db import Database
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -148,10 +151,8 @@ class DockerSandboxDispatcher:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         workspace = self.workspace_root / f"chitti-run-{run_id}"
         workspace.mkdir(parents=True, exist_ok=True)
-        mounted = False
         try:
             await self._mount_workspace(workspace, limits)
-            mounted = True
             await self._event(run_id, "running", "run started")
             if self.model_provider is not None:
                 await self._dispatch_model_one(revision, run_id, limits, workspace)
@@ -202,10 +203,7 @@ class DockerSandboxDispatcher:
             await self._capture_workspace_artifacts(run_id, workspace, limits)
             await self._event(run_id, "passed", "all fixed operations passed")
         finally:
-            if mounted:
-                await self._unmount_workspace(workspace)
-            shutil.rmtree(workspace, ignore_errors=True)
-            self._workspace_image(workspace).unlink(missing_ok=True)
+            await self._cleanup_workspace(workspace)
 
     async def _dispatch_model_one(
         self, revision: PlanRevision, run_id: int, limits: WorkerLimits, workspace: Path
@@ -692,7 +690,6 @@ class DockerSandboxDispatcher:
 
     async def _mount_workspace(self, workspace: Path, limits: WorkerLimits) -> None:
         image = self._workspace_image(workspace)
-        mounted = False
         await asyncio.to_thread(
             subprocess.run,
             [
@@ -720,34 +717,166 @@ class DockerSandboxDispatcher:
                 ],
                 check=True,
             )
-            mounted = True
             await asyncio.to_thread(
                 subprocess.run,
                 ["chown", "65532:65532", str(workspace)],
                 check=True,
             )
         except Exception:
-            if mounted:
-                await self._unmount_workspace(workspace)
+            await self._cleanup_workspace(workspace)
             raise
 
     async def _unmount_workspace(self, workspace: Path) -> None:
-        await asyncio.to_thread(
-            subprocess.run, ["umount", str(workspace)], check=False
+        image = self._workspace_image(workspace)
+        source = await asyncio.to_thread(self._mounted_source, workspace)
+        if source is not None:
+            await asyncio.to_thread(
+                subprocess.run, ["umount", str(workspace)], check=False
+            )
+        for _ in range(20):
+            if await asyncio.to_thread(self._mounted_source, workspace) is None:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise RuntimeError(f"workspace mount remains active: {workspace}")
+
+        loops = await asyncio.to_thread(self._workspace_loops, image)
+        if source is not None and source.startswith("/dev/loop") and source not in loops:
+            loops = (source, *loops)
+        for loop_device in loops:
+            await asyncio.to_thread(
+                subprocess.run, ["losetup", "--detach", loop_device], check=False
+            )
+        for _ in range(20):
+            remaining = await asyncio.to_thread(self._workspace_loops, image)
+            if not remaining:
+                return
+            await asyncio.sleep(0.1)
+        raise RuntimeError(f"workspace loop device remains active: {image}")
+
+    @staticmethod
+    def _mounted_source(workspace: Path) -> str | None:
+        result = subprocess.run(
+            [
+                "findmnt",
+                "--noheadings",
+                "--output",
+                "SOURCE",
+                "--mountpoint",
+                str(workspace),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
         )
+        source = result.stdout.strip()
+        return source or None
+
+    @staticmethod
+    def _associated_loops(image: Path) -> tuple[str, ...]:
+        result = subprocess.run(
+            ["losetup", "--associated", str(image)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return tuple(
+            line.split(":", 1)[0].strip()
+            for line in result.stdout.splitlines()
+            if line.split(":", 1)[0].strip()
+        )
+
+    @classmethod
+    def _workspace_loops(cls, image: Path) -> tuple[str, ...]:
+        loops = cls._associated_loops(image)
+        backing = cls._backing_loops(image.parent).get(image, ())
+        return tuple(dict.fromkeys((*loops, *backing)))
+
+    @staticmethod
+    def _backing_loops(root: Path) -> dict[Path, tuple[str, ...]]:
+        result = subprocess.run(
+            ["losetup", "--list", "--noheadings", "--output", "NAME,BACK-FILE"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        loops: dict[Path, list[str]] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split(None, 1)
+            if len(fields) != 2:
+                continue
+            device, backing = fields
+            backing_path = Path(backing.removesuffix(" (deleted)"))
+            if backing_path.parent == root and backing_path.name.startswith("chitti-run-"):
+                loops.setdefault(backing_path, []).append(device)
+        return {image: tuple(devices) for image, devices in loops.items()}
+
+    @staticmethod
+    def _mounted_workspaces(root: Path) -> set[Path]:
+        result = subprocess.run(
+            ["findmnt", "--noheadings", "--output", "TARGET,SOURCE"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        workspaces: set[Path] = set()
+        for line in result.stdout.splitlines():
+            fields = line.split(None, 1)
+            if len(fields) != 2:
+                continue
+            target = Path(fields[0])
+            if target.parent == root and target.name.startswith("chitti-run-"):
+                workspaces.add(target)
+        return workspaces
+
+    async def _cleanup_workspace(self, workspace: Path) -> None:
+        await self._unmount_workspace(workspace)
+        shutil.rmtree(workspace, ignore_errors=True)
+        self._workspace_image(workspace).unlink(missing_ok=True)
 
     def _workspace_image(self, workspace: Path) -> Path:
         return workspace.with_name(f"{workspace.name}.img")
 
     async def cleanup_stale_workspaces(self) -> None:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
-        for image in self.workspace_root.glob("chitti-run-*.img"):
-            workspace = image.with_suffix("")
-            run_id = image.stem.removeprefix("chitti-run-")
+        images = set(self.workspace_root.glob("chitti-run-*.img"))
+        images.update(self._backing_loops(self.workspace_root))
+        workspaces = {image.with_suffix("") for image in images}
+        workspaces.update(self._mounted_workspaces(self.workspace_root))
+        failures: list[str] = []
+        for workspace in workspaces:
+            run_id = workspace.name.removeprefix("chitti-run-")
             await self._remove_container(f"chitti-worker-{run_id}")
-            await self._unmount_workspace(workspace)
-            shutil.rmtree(workspace, ignore_errors=True)
-            image.unlink(missing_ok=True)
+            try:
+                await self._cleanup_workspace(workspace)
+            except Exception as exc:
+                detail = f"stale workspace cleanup failed: {str(exc)[:1000]}"
+                failures.append(f"{workspace}: {detail}")
+                await self._record_cleanup_failure(run_id, detail)
+        if failures:
+            raise RuntimeError("; ".join(failures))
+
+    async def _record_cleanup_failure(self, run_id: str, detail: str) -> None:
+        try:
+            numeric_run_id = int(run_id)
+        except (TypeError, ValueError):
+            logger.error("workspace cleanup failure for non-run %s: %s", run_id, detail)
+            return
+        if self.database is None:
+            logger.error("workspace cleanup failure for run %s: %s", run_id, detail)
+            return
+        try:
+            async with self.database.sessions() as session:
+                await session.execute(
+                    text(
+                        "INSERT INTO worker_run_events (run_id, status, detail) "
+                        "VALUES (:run_id, 'failed', :detail)"
+                    ),
+                    {"run_id": numeric_run_id, "detail": detail},
+                )
+                await session.commit()
+        except Exception:
+            logger.exception("could not record workspace cleanup failure for run %s", run_id)
 
     async def _run_container(
         self, run_id: int, command: list[str], limits: WorkerLimits
