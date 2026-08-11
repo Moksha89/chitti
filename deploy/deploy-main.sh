@@ -13,9 +13,9 @@ if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
     echo "Missing application checkout and .env: ${INSTALL_DIR}" >&2
     exit 1
   fi
-  git -C "${INSTALL_DIR}" init --quiet
-  git -C "${INSTALL_DIR}" remote add origin "${REPOSITORY_URL}"
-  git -C "${INSTALL_DIR}" add -A
+  git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" init --quiet
+  git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" remote add origin "${REPOSITORY_URL}"
+  git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" add -A
   fresh_checkout=1
 fi
 
@@ -32,7 +32,8 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
 fi
 
 if [[ "${fresh_checkout}" -eq 0 ]] &&
-  [[ -n "$(git diff --stat)" || -n "$(git diff --cached --stat)" ]]; then
+  [[ -n "$(git -c safe.directory="${INSTALL_DIR}" diff --stat)" ||
+    -n "$(git -c safe.directory="${INSTALL_DIR}" diff --cached --stat)" ]]; then
   echo "Application checkout has local changes; refusing to overwrite them." >&2
   exit 1
 fi
@@ -52,12 +53,12 @@ set -a
 source .env
 set +a
 
-git fetch --quiet origin "${REMOTE_BRANCH}"
-if [[ -n "$(git diff --cached --stat "origin/${REMOTE_BRANCH}" --)" ]]; then
+git -c safe.directory="${INSTALL_DIR}" fetch --quiet origin "${REMOTE_BRANCH}"
+if [[ -n "$(git -c safe.directory="${INSTALL_DIR}" diff --cached --stat "origin/${REMOTE_BRANCH}" --)" ]]; then
   echo "Application checkout has local changes; refusing to overwrite them." >&2
   exit 1
 fi
-git checkout --quiet --detach "origin/${REMOTE_BRANCH}"
+git -c safe.directory="${INSTALL_DIR}" checkout --quiet --detach "origin/${REMOTE_BRANCH}"
 
 docker compose up -d --build
 docker compose ps
