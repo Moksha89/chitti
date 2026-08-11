@@ -1,9 +1,11 @@
+import asyncio
 from datetime import UTC, datetime
+from io import BytesIO
 
 import pytest
 
 from chitti.plans import PlanDocument, PlanRevision
-from chitti.worker import FixedOperation, WorkerLimits, fixed_operations
+from chitti.worker import DockerSandboxDispatcher, FixedOperation, WorkerLimits, fixed_operations
 
 
 def revision() -> PlanRevision:
@@ -60,3 +62,13 @@ def test_fixed_operations_are_deterministic_and_include_preview() -> None:
 @pytest.mark.parametrize("network", ["chitti_net", "host"])
 def test_fixed_operations_never_join_application_network(network: str) -> None:
     assert network not in {operation.network for operation in fixed_operations(revision())}
+
+
+def test_output_reader_stops_at_budget_without_buffering_unbounded_output() -> None:
+    async def exercise() -> tuple[str, bool]:
+        dispatcher = DockerSandboxDispatcher(None)  # type: ignore[arg-type]
+        return dispatcher._read_limited(BytesIO(b"x" * 4096), 1024)
+
+    output, exceeded = asyncio.run(exercise())
+    assert len(output) == 1024
+    assert exceeded

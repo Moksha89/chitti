@@ -100,3 +100,48 @@ async def test_worker_approval_gate_rechecks_exact_content_hash(database) -> Non
         with pytest.raises(ValueError, match="no longer matches"):
             await approved_revision(session, revision_id)
         await session.rollback()
+
+
+async def test_worker_artifact_payload_retention_preserves_audit_record(database) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(session, "sandbox", "Build fixture.", document())
+        await session.execute(
+            text(
+                "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
+                "VALUES (:revision, '{}'::json, 'run-test') RETURNING id"
+            ),
+            {"revision": revision_id},
+        )
+        run_id = int((await session.execute(text("SELECT currval(pg_get_serial_sequence('worker_runs', 'id'))"))).scalar_one())
+        await session.execute(
+            text(
+                "INSERT INTO worker_run_events (run_id, status, detail) "
+                "VALUES (:run, 'cancel_requested', 'owner requested cancellation')"
+            ),
+            {"run": run_id},
+        )
+        artifact_result = await session.execute(
+            text(
+                "INSERT INTO worker_artifacts "
+                "(run_id, kind, path, sha256, byte_size) "
+                "VALUES (:run, 'diff', 'workspace.diff', :sha, 4) RETURNING id"
+            ),
+            {"run": run_id, "sha": "a" * 64},
+        )
+        artifact_id = int(artifact_result.scalar_one())
+        await session.execute(
+            text(
+                "INSERT INTO worker_artifact_payloads (artifact_id, content) "
+                "VALUES (:artifact, 'data')"
+            ),
+            {"artifact": artifact_id},
+        )
+        await session.execute(
+            text("DELETE FROM worker_artifact_payloads WHERE artifact_id = :artifact"),
+            {"artifact": artifact_id},
+        )
+        record = await session.execute(
+            text("SELECT sha256, byte_size FROM worker_artifacts WHERE id = :artifact"),
+            {"artifact": artifact_id},
+        )
+        assert record.one() == ("a" * 64, 4)

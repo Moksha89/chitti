@@ -7,4 +7,3 @@ RUN groupadd --gid 65532 worker && useradd --uid 65532 --gid 65532 --create-home
 COPY screenshot.py /opt/screenshot.py
 USER 65532:65532
 WORKDIR /workspace
-ENTRYPOINT ["/usr/local/bin/python"]

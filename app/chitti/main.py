@@ -32,7 +32,7 @@ from .provider import FakeProvider, LiteLLMProvider
 from .service import ChittiService
 from .settings import Settings, get_settings
 from .telegram import TelegramPoller
-from .worker import DockerSandboxDispatcher, WorkerLimits, WorkerRunManager
+from .worker import WorkerLimits, WorkerRunManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -152,9 +152,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.database = database
     app.state.service = service
     app.state.plan_manager = PlanManager(database, service.provider, service.memory)
-    app.state.worker_manager = WorkerRunManager(
-        database, DockerSandboxDispatcher(database)
-    )
+    app.state.worker_manager = WorkerRunManager(database)
     app.state.project_state = ProjectState(settings.project_root)
     app.state.auth = auth
     await app.state.plan_manager.resume_queued()
@@ -531,14 +529,17 @@ async def worker_artifact(run_id: int, artifact_id: int, request: Request) -> Re
     async with database.sessions() as session:
         result = await session.execute(
             text(
-                "SELECT kind, content FROM worker_artifacts "
-                "WHERE id = :artifact AND run_id = :run"
+                "SELECT a.kind, p.content FROM worker_artifacts a "
+                "LEFT JOIN worker_artifact_payloads p ON p.artifact_id = a.id "
+                "WHERE a.id = :artifact AND a.run_id = :run"
             ),
             {"artifact": artifact_id, "run": run_id},
         )
         artifact = result.mappings().one_or_none()
     if artifact is None:
         raise HTTPException(status_code=404, detail="worker artifact not found")
+    if artifact["content"] is None:
+        raise HTTPException(status_code=410, detail="artifact payload has expired")
     kind = str(artifact["kind"])
     media_type = "image/png" if kind == "screenshot" else "text/plain"
     return Response(content=bytes(artifact["content"]), media_type=media_type)

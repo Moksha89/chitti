@@ -9,12 +9,17 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import IO, TYPE_CHECKING, Protocol
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .plans import PlanApproval, PlanRevision, validate_approval_binding
+from .plans import (
+    PlanApproval,
+    PlanRevision,
+    revision_by_id,
+    validate_approval_binding,
+)
 
 if TYPE_CHECKING:
     from .db import Database
@@ -63,23 +68,32 @@ class WorkerDispatcher(Protocol):
 class DockerSandboxDispatcher:
     """Host-side cage controller; the worker container receives no Docker socket."""
 
-    def __init__(self, database: Database, image: str = "chitti-sandbox:latest") -> None:
+    def __init__(
+        self,
+        database: Database,
+        image: str = "chitti-sandbox:latest",
+        workspace_root: Path = Path("/var/lib/chitti-worker/runs"),
+    ) -> None:
         self.database = database
         self.image = image
+        self.workspace_root = workspace_root
         self._containers: dict[int, str] = {}
+        self._processes: dict[int, subprocess.Popen[bytes]] = {}
         self._cancelled: set[int] = set()
         self._slot = asyncio.Semaphore(1)
 
     async def cancel(self, run_id: int) -> None:
         self._cancelled.add(run_id)
+        process = self._processes.get(run_id)
+        if process and process.returncode is None:
+            process.kill()
+            try:
+                await asyncio.wait_for(asyncio.to_thread(process.wait), timeout=5)
+            except TimeoutError:
+                pass
         container = self._containers.get(run_id)
         if container:
-            await asyncio.to_thread(
-                subprocess.run,
-                ["docker", "rm", "--force", container],
-                capture_output=True,
-                check=False,
-            )
+            await self._remove_container(container)
 
     async def dispatch(
         self, revision: PlanRevision, run_id: int, limits: WorkerLimits
@@ -90,9 +104,14 @@ class DockerSandboxDispatcher:
     async def _dispatch_one(
         self, revision: PlanRevision, run_id: int, limits: WorkerLimits
     ) -> None:
-        workspace = Path(tempfile.mkdtemp(prefix=f"chitti-run-{run_id}-"))
-        workspace.chmod(0o777)
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        workspace = Path(
+            tempfile.mkdtemp(prefix=f"chitti-run-{run_id}-", dir=self.workspace_root)
+        )
+        mounted = False
         try:
+            await self._mount_workspace(workspace, limits)
+            mounted = True
             await self._event(run_id, "running", "run started")
             for index, operation in enumerate(fixed_operations(revision)):
                 if run_id in self._cancelled:
@@ -106,12 +125,8 @@ class DockerSandboxDispatcher:
                 started = datetime.now(UTC)
                 command = self._docker_command(operation, workspace, run_id, limits)
                 try:
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            subprocess.run, command, capture_output=True,
-                            text=True, check=False,
-                        ),
-                        timeout=limits.timeout_seconds,
+                    result, stdout, stderr = await self._run_container(
+                        run_id, command, limits
                     )
                 except TimeoutError:
                     await self.cancel(run_id)
@@ -124,8 +139,6 @@ class DockerSandboxDispatcher:
                 if run_id in self._cancelled:
                     await self._event(run_id, "cancelled", "worker stopped by cancellation")
                     return
-                stdout = result.stdout[: limits.artifact_bytes]
-                stderr = result.stderr[: limits.artifact_bytes]
                 if result.returncode == 137:
                     stderr += "\nworker exceeded memory limit"
                 status = "passed" if result.returncode == 0 else "failed"
@@ -146,14 +159,154 @@ class DockerSandboxDispatcher:
             await self._capture_workspace_artifacts(run_id, workspace, limits)
             await self._event(run_id, "passed", "all fixed operations passed")
         finally:
+            if mounted:
+                await self._unmount_workspace(workspace)
             shutil.rmtree(workspace, ignore_errors=True)
+
+    async def _mount_workspace(self, workspace: Path, limits: WorkerLimits) -> None:
+        await asyncio.to_thread(
+            subprocess.run,
+            [
+                "mount",
+                "-t",
+                "tmpfs",
+                "-o",
+                f"size={limits.artifact_bytes},uid=65532,gid=65532,mode=0770",
+                "tmpfs",
+                str(workspace),
+            ],
+            check=True,
+        )
+
+    async def _unmount_workspace(self, workspace: Path) -> None:
+        await asyncio.to_thread(
+            subprocess.run, ["umount", str(workspace)], check=False
+        )
+
+    async def _run_container(
+        self, run_id: int, command: list[str], limits: WorkerLimits
+    ) -> tuple[subprocess.CompletedProcess[str], str, str]:
+        container = f"chitti-worker-{run_id}"
+        self._containers[run_id] = container
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._processes[run_id] = process
+        try:
+            stdout_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._read_limited, process.stdout, max(1, limits.artifact_bytes // 2)
+                )
+            )
+            stderr_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._read_limited, process.stderr, max(1, limits.artifact_bytes // 2)
+                )
+            )
+            try:
+                output = await asyncio.wait_for(
+                    self._collect_outputs(stdout_task, stderr_task),
+                    timeout=limits.timeout_seconds,
+                )
+            except TimeoutError:
+                await self.cancel(run_id)
+                raise
+            (stdout, stdout_exceeded), (stderr, stderr_exceeded) = output
+            if stdout_exceeded or stderr_exceeded:
+                await self.cancel(run_id)
+                return (
+                    subprocess.CompletedProcess(command, 125),
+                    stdout,
+                    stderr + "\nworker output quota exceeded",
+                )
+            await asyncio.to_thread(process.wait)
+            await self._remove_container(container)
+            return (
+                subprocess.CompletedProcess(command, process.returncode or 0),
+                stdout,
+                stderr,
+            )
+        finally:
+            self._processes.pop(run_id, None)
+            self._containers.pop(run_id, None)
+
+    async def _collect_outputs(
+        self,
+        stdout_task: asyncio.Task[tuple[str, bool]],
+        stderr_task: asyncio.Task[tuple[str, bool]],
+    ) -> tuple[tuple[str, bool], tuple[str, bool]]:
+        pending: set[asyncio.Task[tuple[str, bool]]] = {
+            stdout_task,
+            stderr_task,
+        }
+        results: dict[asyncio.Task[tuple[str, bool]], tuple[str, bool]] = {}
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                result = task.result()
+                results[task] = result
+                if result[1]:
+                    for remaining in pending:
+                        remaining.cancel()
+                    empty = ("", False)
+                    return (
+                        results.get(stdout_task, empty),
+                        results.get(stderr_task, empty),
+                    )
+        return results[stdout_task], results[stderr_task]
+
+    async def _remove_container(self, container: str) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    subprocess.run,
+                    ["docker", "kill", "--signal", "KILL", container],
+                    capture_output=True,
+                    check=False,
+                ),
+                timeout=5,
+            )
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    subprocess.run,
+                    ["docker", "rm", "--force", container],
+                    capture_output=True,
+                    check=False,
+                ),
+                timeout=5,
+            )
+        except TimeoutError:
+            return
+
+    def _read_limited(
+        self, stream: IO[bytes] | None, limit: int
+    ) -> tuple[str, bool]:
+        if stream is None:
+            return "", False
+        chunks: list[bytes] = []
+        total = 0
+        exceeded = False
+        while True:
+            chunk = stream.read(min(65536, limit + 1))
+            if not chunk:
+                break
+            remaining = limit - total
+            if remaining <= 0:
+                exceeded = True
+                break
+            chunks.append(chunk[:remaining])
+            total += len(chunk)
+            if len(chunk) >= remaining:
+                exceeded = True
+                break
+        return b"".join(chunks).decode("utf-8", errors="replace"), exceeded
 
     def _docker_command(
         self, operation: FixedOperation, workspace: Path,
         run_id: int, limits: WorkerLimits,
     ) -> list[str]:
         return [
-            "docker", "run", "--rm", "--name", f"chitti-worker-{run_id}",
+            "docker", "run", "--name", f"chitti-worker-{run_id}",
             "--network", operation.network, "--cpus", str(limits.cpus),
             "--memory", limits.memory, "--pids-limit", str(limits.pids),
             "--ulimit", f"nofile={limits.nofile}:{limits.nofile}",
@@ -220,25 +373,30 @@ class DockerSandboxDispatcher:
                 },
             )
             operation_id = int(result.scalar_one())
-            await session.execute(
-                text(
-                    "INSERT INTO worker_artifacts "
-                    "(run_id, operation_id, kind, path, content, sha256, byte_size) "
-                    "VALUES (:run_id, :operation_id, 'stdout', :path, :content, "
-                    ":sha256, :size), (:run_id, :operation_id, 'stderr', :path, "
-                    ":err_content, :err_sha256, :err_size)"
-                ),
-                {
-                    "run_id": run_id, "operation_id": operation_id,
-                    "path": f"operations/{index}/{operation.name}",
-                    "content": stdout.encode(), "sha256": hashlib.sha256(
-                        stdout.encode()
-                    ).hexdigest(), "size": len(stdout.encode()),
-                    "err_content": stderr.encode(), "err_sha256": hashlib.sha256(
-                        stderr.encode()
-                    ).hexdigest(), "err_size": len(stderr.encode()),
-                },
-            )
+            for kind, content in (("stdout", stdout), ("stderr", stderr)):
+                artifact = await session.execute(
+                    text(
+                        "INSERT INTO worker_artifacts "
+                        "(run_id, operation_id, kind, path, sha256, byte_size) "
+                        "VALUES (:run_id, :operation_id, :kind, :path, :sha256, "
+                        ":size) RETURNING id"
+                    ),
+                    {
+                        "run_id": run_id, "operation_id": operation_id,
+                        "kind": kind,
+                        "path": f"operations/{index}/{operation.name}/{kind}",
+                        "sha256": hashlib.sha256(content.encode()).hexdigest(),
+                        "size": len(content.encode()),
+                    },
+                )
+                artifact_id = int(artifact.scalar_one())
+                await session.execute(
+                    text(
+                        "INSERT INTO worker_artifact_payloads "
+                        "(artifact_id, content) VALUES (:artifact_id, :content)"
+                    ),
+                    {"artifact_id": artifact_id, "content": content.encode()},
+                )
             await session.commit()
 
     async def _capture_workspace_artifacts(
@@ -250,29 +408,37 @@ class DockerSandboxDispatcher:
             content = path.read_bytes()
             kind = "screenshot" if path.suffix == ".png" else "diff"
             async with self.database.sessions() as session:
-                await session.execute(
+                artifact = await session.execute(
                     text(
                         "INSERT INTO worker_artifacts "
-                        "(run_id, kind, path, content, sha256, byte_size) "
-                        "VALUES (:run_id, :kind, :path, :content, :sha256, :byte_size)"
+                        "(run_id, kind, path, sha256, byte_size) "
+                        "VALUES (:run_id, :kind, :path, :sha256, :byte_size) "
+                        "RETURNING id"
                     ),
                     {
                         "run_id": run_id, "kind": kind,
                         "path": str(path.relative_to(workspace)),
-                        "content": content,
                         "sha256": hashlib.sha256(content).hexdigest(),
                         "byte_size": len(content),
                     },
+                )
+                artifact_id = int(artifact.scalar_one())
+                await session.execute(
+                    text(
+                        "INSERT INTO worker_artifact_payloads "
+                        "(artifact_id, content) VALUES (:artifact_id, :content)"
+                    ),
+                    {"artifact_id": artifact_id, "content": content},
                 )
                 await session.commit()
 
 
 class WorkerRunManager:
-    def __init__(self, database: Database, dispatcher: WorkerDispatcher) -> None:
+    def __init__(
+        self, database: Database, dispatcher: WorkerDispatcher | None = None
+    ) -> None:
         self.database = database
         self.dispatcher = dispatcher
-        self._jobs: set[asyncio.Task[None]] = set()
-
     async def enqueue(self, revision_id: int, limits: WorkerLimits | None = None) -> int:
         chosen = limits or WorkerLimits()
         async with self.database.sessions() as session:
@@ -297,25 +463,10 @@ class WorkerRunManager:
                 {"run_id": run_id},
             )
             await session.commit()
-        task = asyncio.create_task(self._run(run_id, revision, chosen))
-        self._jobs.add(task)
-        task.add_done_callback(self._jobs.discard)
         return run_id
 
-    async def _run(
-        self, run_id: int, revision: PlanRevision, limits: WorkerLimits
-    ) -> None:
-        try:
-            await self.dispatcher.dispatch(revision, run_id, limits)
-        except asyncio.CancelledError:
-            await self.dispatcher.cancel(run_id)
-            await self._record(run_id, "cancelled", "run cancelled")
-        except Exception as exc:
-            await self._record(run_id, "failed", str(exc)[:2000])
-
     async def cancel(self, run_id: int) -> None:
-        await self.dispatcher.cancel(run_id)
-        await self._record(run_id, "cancelled", "run cancelled by owner")
+        await self._record(run_id, "cancel_requested", "cancellation requested by owner")
 
     async def _record(self, run_id: int, status: str, detail: str) -> None:
         async with self.database.sessions() as session:
@@ -421,8 +572,6 @@ def _directory_size(path: Path) -> int:
 async def approved_revision(
     session: AsyncSession, revision_id: int
 ) -> PlanRevision:
-    from .plans import revision_by_id
-
     revision = await revision_by_id(session, revision_id)
     if revision is None:
         raise ValueError("plan revision not found")

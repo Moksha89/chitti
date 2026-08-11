@@ -1,0 +1,25 @@
+[Unit]
+Description=Chitti host-side sandbox worker runner
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/ubuntu/chitti/app
+EnvironmentFile=/etc/chitti/worker-runner.env
+Environment=PYTHONPATH=/home/ubuntu/chitti/app
+RuntimeDirectory=chitti-worker
+StateDirectory=chitti-worker
+ExecStart=/usr/bin/python3 -m chitti.runner
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+PrivateTmp=true
+ProtectHome=true
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

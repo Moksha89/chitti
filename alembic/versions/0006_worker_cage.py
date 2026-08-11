@@ -30,7 +30,7 @@ def upgrade() -> None:
         sa.Column("task_id", sa.String(80), nullable=True),
         sa.ForeignKeyConstraint(["run_id"], ["worker_runs.id"]),
         sa.CheckConstraint(
-            "status IN ('queued','running','operation_running','passed','failed','cancelled')",
+            "status IN ('queued','running','operation_running','passed','failed','cancel_requested','cancelled')",
             name="worker_run_event_status_ck",
         ),
     )
