@@ -63,9 +63,9 @@ immutable `worker_runs.limits` JSON:
 - 1,800 seconds overall run wall-clock, separate from each Docker operation's
   900-second timeout;
 - $0.75 loop-side spend cap, with the `coder` and `reviewer` LiteLLM routes
-  capped at $0.75 and $0.25 respectively at the gateway. The loop-side cap
-  means one run can never spend more than $0.75; route caps are an additional
-  gateway guard.
+  capped at $5/day and $1/day respectively at the gateway. The loop-side cap
+  means one run can never spend more than $0.75, so $0.75 is the worst-case
+  cost of one run; daily route caps are an additional bad-day guard.
 
 Only the host runner constructs model prompts and holds the LiteLLM credential.
 The worker receives structured fixed tools, never a model key or arbitrary
