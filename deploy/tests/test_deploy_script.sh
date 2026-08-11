@@ -8,9 +8,25 @@ remote_wrapper="${repo_root}/deploy/deploy-remote.sh"
 [[ "$(tail -n 1 "${script}")" == 'echo "${DEPLOY_COMPLETION_MARKER}"' ]]
 [[ "$(sed -n '3p' "${script}")" == 'exec </dev/null' ]]
 grep -Fq 'DEPLOY_COMPLETION_MARKER="CHITTI_DEPLOY_COMPLETE"' "${script}"
-grep -Fq 'docker run --rm -i --entrypoint python "${runner_image}" -c \' "${script}"
-grep -Fq '< <(printf '\''%s'\'' "${gateway_models}")' "${script}"
-! grep -Fq 'printf '\''%s'\'' "${gateway_models}" |' "${script}"
+grep -Fq 'CHITTI_GATEWAY_MODELS_JSON=${gateway_models}' "${script}"
+grep -Fq 'json.loads(os.environ["CHITTI_GATEWAY_MODELS_JSON"])' "${script}"
+grep -Fq 'docker run --rm \' "${script}"
+! grep -Fq 'docker run --rm -i --entrypoint python "${runner_image}" -c \' "${script}"
+! grep -Fq '< <(printf '\''%s'\'' "${gateway_models}")' "${script}"
+grep -Fq 'response was not valid JSON' "${script}"
+grep -Fq 'gateway request was unreachable or failed' "${script}"
+gateway_input='{"data":[{"id":"chitti-chat"}]}'
+parsed_gateway_input="$(
+  CHITTI_GATEWAY_MODELS_JSON="${gateway_input}" \
+    python3 -c 'import json, os; print(json.loads(os.environ["CHITTI_GATEWAY_MODELS_JSON"])["data"][0]["id"])'
+)"
+[[ "${parsed_gateway_input}" == 'chitti-chat' ]]
+if CHITTI_GATEWAY_MODELS_JSON='not-json' \
+  python3 -c 'import json, os; json.loads(os.environ["CHITTI_GATEWAY_MODELS_JSON"])' \
+  >/dev/null 2>&1; then
+  echo "malformed gateway JSON unexpectedly parsed" >&2
+  exit 1
+fi
 grep -Fq '"${remote_script}" </dev/null' "${remote_wrapper}"
 grep -Fq 'completion marker was missing' "${remote_wrapper}"
 
