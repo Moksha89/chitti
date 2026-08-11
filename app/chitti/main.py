@@ -49,13 +49,19 @@ def build_service(settings: Settings) -> ChittiService:
     return ChittiService(provider, MemoryStore(embedder), profile)
 
 
-def set_session_cookie(response: RedirectResponse | HTMLResponse, token: str) -> None:
+def request_is_https(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    return auth_manager(request).is_trusted_proxy(request) and request.headers.get("X-Forwarded-Proto") == "https"
+
+
+def set_session_cookie(response: RedirectResponse | HTMLResponse, token: str, secure: bool) -> None:
     response.set_cookie(
         SESSION_COOKIE,
         token,
         max_age=8 * 60 * 60,
         httponly=True,
-        secure=True,
+        secure=secure,
         samesite="lax",
     )
 
@@ -92,6 +98,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.chitti_password_hash,
         settings.chitti_auth_state_path,
         settings.chitti_session_ttl_minutes,
+        settings.chitti_trusted_proxy_ip,
     )
     auth.initialize()
     poller = TelegramPoller(settings, service, database.sessions)
@@ -139,7 +146,7 @@ async def login_page(request: Request) -> HTMLResponse | RedirectResponse:
         name="login.html",
         context={"csrf_token": session.csrf_token, "error": None},
     )
-    set_session_cookie(response, token)
+    set_session_cookie(response, token, request_is_https(request))
     return response
 
 
@@ -168,7 +175,7 @@ async def login(request: Request) -> HTMLResponse | RedirectResponse:
     token, session = manager.rotate_authenticated_session(old_token or "", manager.username)
     destination = "/change-password" if manager.must_change_password else "/"
     response = RedirectResponse(destination, status_code=303)
-    set_session_cookie(response, token)
+    set_session_cookie(response, token, request_is_https(request))
     return response
 
 

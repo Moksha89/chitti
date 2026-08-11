@@ -1,5 +1,7 @@
 import re
 import time
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
@@ -66,3 +68,50 @@ def test_session_expiry(tmp_path, monkeypatch) -> None:
     now = time.time()
     monkeypatch.setattr("chitti.auth.time.time", lambda: now + 61 * 60)
     assert auth.get_session(token) is None
+
+
+def test_forwarded_client_addresses_are_proxy_scoped(tmp_path) -> None:
+    auth, _ = make_auth(tmp_path)
+    trusted = SimpleNamespace(
+        client=SimpleNamespace(host="172.31.250.2"),
+        headers={"X-Forwarded-For": "203.0.113.10, 172.31.250.2"},
+    )
+    assert auth.client_key(trusted) == "203.0.113.10"
+    untrusted = SimpleNamespace(
+        client=SimpleNamespace(host="203.0.113.20"),
+        headers={"X-Forwarded-For": "203.0.113.10"},
+    )
+    assert auth.client_key(untrusted) == "203.0.113.20"
+
+
+def test_lockout_backoff_expires_and_quiet_failures_decay(tmp_path, monkeypatch) -> None:
+    auth, password = make_auth(tmp_path)
+    clock = [1000.0]
+    monkeypatch.setattr("chitti.auth.time.time", lambda: clock[0])
+    for _ in range(5):
+        assert not auth.authenticate("akirah", "wrong", "client-a")
+    assert not auth.authenticate("akirah", password, "client-a")
+    clock[0] += 61
+    assert auth.authenticate("akirah", password, "client-a")
+    for _ in range(5):
+        assert not auth.authenticate("akirah", "wrong", "client-a")
+    clock[0] += auth.quiet_decay_seconds + 1
+    assert auth.authenticate("akirah", password, "client-a")
+
+
+def test_wrong_username_still_verifies_a_dummy_hash(tmp_path, monkeypatch) -> None:
+    auth, _ = make_auth(tmp_path)
+    verify = Mock(return_value=False)
+    monkeypatch.setattr(PasswordHasher, "verify", verify)
+    assert not auth.authenticate("other-user", "wrong", "client-a")
+    verify.assert_called_once_with(auth.dummy_password_hash, "wrong")
+
+
+def test_cookie_secure_flag_matches_scheme(tmp_path) -> None:
+    make_auth(tmp_path)
+    http_client = TestClient(app, base_url="http://testserver")
+    http_cookie = http_client.get("/login").headers["set-cookie"]
+    assert " Secure" not in http_cookie
+    https_client = TestClient(app, base_url="https://testserver")
+    https_cookie = https_client.get("/login").headers["set-cookie"]
+    assert " Secure" in https_cookie

@@ -125,6 +125,16 @@ password authentication when no authorized key is present.
 The Chitti, LiteLLM, and PostgreSQL host ports remain loopback-only. Caddy
 publishes only ports 80 and 443 and proxies to the authenticated Chitti app.
 
+The Caddy image is built with the pinned `mholt/caddy-ratelimit` v0.1.0
+module because the stock Caddy image has no rate-limit directive. Login POSTs
+are limited at the proxy to five requests per client address per minute before
+they reach Chitti. Caddy normalizes `X-Forwarded-For`, and Chitti only honors
+that header from its fixed Caddy container address.
+
+Sessions and login lockout buckets are intentionally process-local in Phase 1.
+A Chitti restart invalidates sessions and clears in-memory lockout state; this
+is an operational behavior, not durable authentication state.
+
 ## Later-phase seams
 
 `ModelProvider`, `ProjectState`, and the `WorkerDispatcher` protocol are
