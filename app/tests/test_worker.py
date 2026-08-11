@@ -1,4 +1,5 @@
 import asyncio
+import subprocess
 from datetime import UTC, datetime
 from io import BytesIO
 
@@ -69,6 +70,66 @@ def test_fixed_operations_are_deterministic_and_include_preview() -> None:
 @pytest.mark.parametrize("network", ["chitti_net", "host"])
 def test_fixed_operations_never_join_application_network(network: str) -> None:
     assert network not in {operation.network for operation in fixed_operations(revision())}
+
+
+def test_workspace_mount_refuses_underlying_filesystem() -> None:
+    with pytest.raises(RuntimeError, match="workspace quota mount verification failed"):
+        DockerSandboxDispatcher._assert_quota_mount(
+            "/dev/vda3", "ext4", "rw,nodev,nosuid"
+        )
+
+
+def test_mount_operations_target_host_mount_namespace() -> None:
+    command = DockerSandboxDispatcher._host_command(["umount", "/workspace"])
+    assert command[:3] == [
+        "nsenter",
+        "--mount=/proc/1/ns/mnt",
+        "--",
+    ]
+    assert command[3:] == ["umount", "/workspace"]
+
+
+def test_mount_inspection_uses_host_mount_namespace(monkeypatch, tmp_path) -> None:
+    command = []
+
+    def run(actual, **_kwargs):
+        command.append(actual)
+        return subprocess.CompletedProcess(
+            actual, 0, "/dev/loop0 ext4 rw,nosuid,nodev\n", ""
+        )
+
+    monkeypatch.setattr("chitti.worker.subprocess.run", run)
+    details = DockerSandboxDispatcher._mounted_details(tmp_path)
+
+    assert details == ("/dev/loop0", "ext4", "rw,nosuid,nodev")
+    assert command[0][:3] == ["nsenter", "--mount=/proc/1/ns/mnt", "--"]
+    assert command[0][3] == "findmnt"
+
+
+def test_worker_mount_verification_refuses_unverified_bind(monkeypatch, tmp_path) -> None:
+    def run(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 1, "", "worker mount was not visible")
+
+    monkeypatch.setattr("chitti.worker.subprocess.run", run)
+    with pytest.raises(RuntimeError, match="worker quota mount verification failed"):
+        DockerSandboxDispatcher._verify_worker_mount(tmp_path)
+
+
+def test_unmount_surfaces_status_and_stderr(monkeypatch, tmp_path) -> None:
+    dispatcher = DockerSandboxDispatcher(None)  # type: ignore[arg-type]
+    workspace = tmp_path / "chitti-run-1"
+    commands = []
+    monkeypatch.setattr(dispatcher, "_mounted_source", lambda _workspace: "/dev/loop0")
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 32, "", "target is busy")
+
+    monkeypatch.setattr("chitti.worker.subprocess.run", run)
+    with pytest.raises(RuntimeError, match="target is busy"):
+        asyncio.run(dispatcher._unmount_workspace(workspace))
+    assert commands[0][:3] == ["nsenter", "--mount=/proc/1/ns/mnt", "--"]
+    assert commands[0][3:5] == ["umount", str(workspace)]
 
 
 def test_output_reader_stops_at_budget_without_buffering_unbounded_output() -> None:

@@ -50,9 +50,15 @@ cleanup path. On startup it also unmounts and removes stale `chitti-run-*.img`
 files left by a crash before claiming new work. This recovery sweep is
 necessary because a leaked quota image would eventually consume the host disk.
 
-The disk-fill proof uses a bind mount with the `--mount` key/value form; the
-bind is read-write by default. With a mounted proof workspace in
-`$workspace`, the worker-side write must fail at the filesystem boundary:
+The disk-fill and orphan proofs must use a workspace created by the
+dispatcher. Do not call `mount`, `losetup`, or `mkfs` from the proof shell:
+that would bypass the runner's host-namespace path and prove the wrong thing.
+Enqueue a disposable fixed-operation run through the authenticated
+`POST /plans/{revision_id}/runs` route, wait until its workspace is visible
+from the host with `findmnt`, and set `$workspace` to that dispatcher-created
+path. The runner must verify the host mount and the worker-visible mount
+before it starts the operation. While that workspace is still active, the
+worker-side write must fail at the filesystem boundary:
 
 ```sh
 docker run --rm --network none --read-only --user 65532:65532 \
@@ -60,6 +66,18 @@ docker run --rm --network none --read-only --user 65532:65532 \
   chitti-sandbox:latest sh -c \
   'dd if=/dev/zero of=/workspace/fill bs=1M count=64 status=none'
 ```
+
+Record a non-zero exit status, the host `df` result, and a PostgreSQL health
+check. Let the dispatcher finish and verify that its normal cleanup removes
+the mount, loop device, image, workspace, and worker container.
+
+For orphan recovery, enqueue another disposable fixed-operation run, stop the
+runner after its dispatcher-created mount is visible, and start the runner
+again. Verify that reconciliation removes the stale worker container only
+after the host mount and loop device are gone. A deliberately uncleanable
+candidate must produce a durable failed run event or a loud journal report;
+the proof must never delete its backing image while a mount or loop survives.
+Finish both proofs with a host-wide leak sweep for dispatcher proof run IDs.
 
 The frontend-build policy is intentionally conservative for this no-swap host:
 
