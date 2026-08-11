@@ -3,12 +3,20 @@ set -Eeuo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/chitti}"
 REMOTE_BRANCH="${REMOTE_BRANCH:-main}"
+REPOSITORY_URL="${REPOSITORY_URL:-https://github.com/Moksha89/chitti.git}"
 RUNNER_ENV="${RUNNER_ENV:-/etc/chitti/worker-runner.env}"
 RUNNER_UNIT="chitti-worker-runner.service"
+fresh_checkout=0
 
 if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
-  echo "Missing application checkout: ${INSTALL_DIR}" >&2
-  exit 1
+  if [[ ! -f "${INSTALL_DIR}/.env" ]]; then
+    echo "Missing application checkout and .env: ${INSTALL_DIR}" >&2
+    exit 1
+  fi
+  git -C "${INSTALL_DIR}" init --quiet
+  git -C "${INSTALL_DIR}" remote add origin "${REPOSITORY_URL}"
+  git -C "${INSTALL_DIR}" add -A
+  fresh_checkout=1
 fi
 
 cd "${INSTALL_DIR}"
@@ -23,7 +31,8 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
-if [[ -n "$(git diff --stat)" || -n "$(git diff --cached --stat)" ]]; then
+if [[ "${fresh_checkout}" -eq 0 ]] &&
+  [[ -n "$(git diff --stat)" || -n "$(git diff --cached --stat)" ]]; then
   echo "Application checkout has local changes; refusing to overwrite them." >&2
   exit 1
 fi
@@ -44,6 +53,10 @@ source .env
 set +a
 
 git fetch --quiet origin "${REMOTE_BRANCH}"
+if [[ -n "$(git diff --cached --stat "origin/${REMOTE_BRANCH}" --)" ]]; then
+  echo "Application checkout has local changes; refusing to overwrite them." >&2
+  exit 1
+fi
 git checkout --quiet --detach "origin/${REMOTE_BRANCH}"
 
 docker compose up -d --build
