@@ -40,7 +40,8 @@ model_list:
 
 litellm_settings:
   drop_params: true
-  request_timeout: 120
+  request_timeout: 600
+  num_retries: 0
   json_logs: true
   set_verbose: false
   cache: true

@@ -13,6 +13,8 @@ REVIEWER_ROUTE = "reviewer"
 REQUIRED_GATEWAY_ROUTES = frozenset({CODER_ROUTE, REVIEWER_ROUTE})
 CODER_MAX_OUTPUT_TOKENS = 32768
 REVIEWER_MAX_OUTPUT_TOKENS = 4096
+MODEL_GATEWAY_TIMEOUT_SECONDS = 600
+MODEL_CLIENT_TIMEOUT_SECONDS = 660
 
 
 class GatewayValidationError(RuntimeError):
@@ -25,6 +27,10 @@ class GatewayMisconfigurationError(GatewayValidationError):
 
 class GatewayTransientError(GatewayValidationError):
     """The gateway could not be checked due to a temporary failure."""
+
+
+class ModelTransportError(RuntimeError):
+    """The model gateway could not complete a request over the network."""
 
 
 @dataclass(frozen=True)
@@ -210,47 +216,58 @@ class LiteLLMProvider:
             request["tools"] = tools
         if tool_choice is not None:
             request["tool_choice"] = tool_choice
-        async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(
-                self.url,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json=request,
-            )
-            response.raise_for_status()
-            body = response.json()
-            choice = body["choices"][0]
-            message = choice.get("message") or {}
-            if not isinstance(message, dict):
-                message = {}
-            content = message.get("content")
-            native_tool_calls = _extract_tool_calls(message)
-            usage = body.get("usage") or {}
-            prompt_tokens = int(usage.get("prompt_tokens", 0))
-            completion_tokens = int(usage.get("completion_tokens", 0))
-            total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens))
-            completion_details = usage.get("completion_tokens_details") or {}
-            reasoning_tokens = (
-                int(completion_details.get("reasoning_tokens", 0))
-                if isinstance(completion_details, dict)
-                else 0
-            )
-            cost = body.get("cost", response.headers.get("x-litellm-response-cost", 0.0))
-            return ModelCompletion(
-                content=content if isinstance(content, str) else "",
-                model=str(body.get("model", role)),
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
-                cost_usd=float(cost or 0.0),
-                reasoning_tokens=reasoning_tokens,
-                finish_reason=(
-                    str(choice["finish_reason"])
-                    if choice.get("finish_reason") is not None
-                    else None
-                ),
-                message_fields=_diagnostic_message_fields(message),
-                tool_calls=native_tool_calls,
-            )
+        try:
+            async with httpx.AsyncClient(timeout=MODEL_CLIENT_TIMEOUT_SECONDS) as client:
+                response = await client.post(
+                    self.url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=request,
+                )
+        except httpx.TimeoutException as exc:
+            raise ModelTransportError(
+                f"gateway request timed out after {MODEL_GATEWAY_TIMEOUT_SECONDS} seconds"
+            ) from exc
+        except httpx.NetworkError as exc:
+            raise ModelTransportError("gateway network request failed") from exc
+        except httpx.HTTPError:
+            raise
+        except Exception as exc:
+            raise ModelTransportError("gateway transport request failed") from exc
+        response.raise_for_status()
+        body = response.json()
+        choice = body["choices"][0]
+        message = choice.get("message") or {}
+        if not isinstance(message, dict):
+            message = {}
+        content = message.get("content")
+        native_tool_calls = _extract_tool_calls(message)
+        usage = body.get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens", 0))
+        completion_tokens = int(usage.get("completion_tokens", 0))
+        total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens))
+        completion_details = usage.get("completion_tokens_details") or {}
+        reasoning_tokens = (
+            int(completion_details.get("reasoning_tokens", 0))
+            if isinstance(completion_details, dict)
+            else 0
+        )
+        cost = body.get("cost", response.headers.get("x-litellm-response-cost", 0.0))
+        return ModelCompletion(
+            content=content if isinstance(content, str) else "",
+            model=str(body.get("model", role)),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            cost_usd=float(cost or 0.0),
+            reasoning_tokens=reasoning_tokens,
+            finish_reason=(
+                str(choice["finish_reason"])
+                if choice.get("finish_reason") is not None
+                else None
+            ),
+            message_fields=_diagnostic_message_fields(message),
+            tool_calls=native_tool_calls,
+        )
 
     async def chat(self, system: str, messages: list[dict[str, object]], role: str) -> str:
         return await self._completion([{"role": "system", "content": system}, *messages], role)

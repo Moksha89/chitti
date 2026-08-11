@@ -13,6 +13,7 @@ from chitti.worker import (
     _file_write_stall,
     _install_failure_detail,
     _is_lockfile_mismatch,
+    _model_call_failure_detail,
     _model_response_failure,
     _model_system_prompt,
     _parse_tool_call,
@@ -71,6 +72,18 @@ def test_starter_context_summarizes_direct_dependencies(tmp_path) -> None:
 def test_model_limits_round_trip() -> None:
     limits = WorkerLimits(model_iterations=3, model_tool_calls=7, model_write_bytes=1234)
     assert WorkerLimits.from_json(limits.as_json()) == limits
+    assert WorkerLimits().run_timeout_seconds == 7200
+
+
+def test_model_call_failure_detail_distinguishes_transport_and_response_errors() -> None:
+    from chitti.provider import ModelTransportError
+
+    assert "transport failure" in _model_call_failure_detail(
+        "coder", ModelTransportError("gateway request timed out")
+    )
+    assert "response processing failed" in _model_call_failure_detail(
+        "coder", ValueError("invalid model response")
+    )
 
 
 def test_inspection_does_not_clear_stall_but_write_progress_does() -> None:

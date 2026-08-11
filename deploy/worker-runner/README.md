@@ -132,8 +132,8 @@ immutable `worker_runs.limits` JSON:
 - 40 model iterations per task and 120 total tool calls;
 - 300,000 total model tokens;
 - 2 MiB total model-authored writes;
-- 1,800 seconds overall run wall-clock, separate from each Docker operation's
-  900-second timeout;
+- 7,200 seconds overall run wall-clock, separate from each Docker operation's
+  900-second timeout and the 600-second model gateway request timeout;
 - $0.75 loop-side spend cap, with the `coder` and `reviewer` LiteLLM routes
   capped at $5/day and $1/day respectively at the gateway. The loop-side cap
   means one run can never spend more than $0.75, so $0.75 is the worst-case

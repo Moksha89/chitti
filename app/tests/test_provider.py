@@ -1,16 +1,20 @@
 import asyncio
+from pathlib import Path
 
 import httpx
 import pytest
 
 from chitti.provider import (
     CODER_MAX_OUTPUT_TOKENS,
+    MODEL_CLIENT_TIMEOUT_SECONDS,
+    MODEL_GATEWAY_TIMEOUT_SECONDS,
     REVIEWER_MAX_OUTPUT_TOKENS,
     FakeProvider,
     GatewayMisconfigurationError,
     GatewayTransientError,
     LiteLLMProvider,
     ModelToolCall,
+    ModelTransportError,
     _diagnostic_message_fields,
 )
 
@@ -150,6 +154,62 @@ def test_agent_completion_records_native_tool_calls_and_request_schema(monkeypat
     assert calls[0][1]["json"]["tools"][0]["function"]["name"] == "list_files"
     assert calls[0][1]["json"]["tool_choice"] == "required"
     assert "thinking" not in calls[0][1]["json"]
+
+
+def test_agent_completion_timeout_is_bounded_above_gateway_timeout(monkeypatch) -> None:
+    response = httpx.Response(
+        200,
+        request=httpx.Request("POST", "http://127.0.0.1:4000/v1/chat/completions"),
+        json={
+            "choices": [{"finish_reason": "stop", "message": {"content": "done"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
+    )
+    client_timeouts = []
+
+    class Client(_Client):
+        async def __aenter__(self):
+            return self
+
+        async def post(self, *_args, **_kwargs):
+            return response
+
+    def client_factory(**kwargs):
+        client_timeouts.append(kwargs["timeout"])
+        return Client()
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", client_factory)
+    asyncio.run(
+        LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+            [{"role": "user", "content": "work"}], "coder"
+        )
+    )
+
+    assert MODEL_GATEWAY_TIMEOUT_SECONDS == 600
+    assert MODEL_CLIENT_TIMEOUT_SECONDS == 660
+    assert client_timeouts == [MODEL_CLIENT_TIMEOUT_SECONDS]
+
+
+def test_agent_completion_distinguishes_transport_timeout(monkeypatch) -> None:
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            raise httpx.ReadTimeout("upstream stalled")
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+
+    with pytest.raises(ModelTransportError, match="gateway request timed out"):
+        asyncio.run(
+            LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+                [{"role": "user", "content": "work"}], "coder"
+            )
+        )
+
+
+def test_gateway_config_has_bounded_single_attempt_timeout() -> None:
+    config = Path(__file__).parents[2] / "litellm" / "config.yaml"
+    text = config.read_text()
+    assert "request_timeout: 600" in text
+    assert "num_retries: 0" in text
 
 
 def test_reviewer_request_uses_headroom_below_provider_ceiling(monkeypatch) -> None:
