@@ -38,12 +38,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 NONPRODUCTIVE_TURN_LIMIT = 3
+MAX_TURNS_WITHOUT_WORKSPACE_CHANGE = 8
 MAX_FILE_REWRITES_WITHOUT_COMMAND = 4
 MAX_FILE_WRITES_WITHOUT_COMMAND = 24
 
 
 class ModelProgressError(RuntimeError):
     """The model loop stopped because it was not making useful progress."""
+
+
+def _progress_counters(
+    failures: int,
+    nonproductive_turns: int,
+    *,
+    workspace_changed: bool,
+    failure: bool = False,
+) -> tuple[int, int]:
+    if workspace_changed:
+        return 0, 0
+    return failures + int(failure), nonproductive_turns + 1
 
 
 def _model_response_failure(completion: ModelCompletion) -> str | None:
@@ -362,14 +375,37 @@ class DockerSandboxDispatcher:
 
             async def record_nonproductive(detail: str, task_id: str = task_id) -> None:
                 nonlocal failures, nonproductive_turns
-                failures += 1
-                nonproductive_turns += 1
+                failures, nonproductive_turns = _progress_counters(
+                    failures, nonproductive_turns, workspace_changed=False, failure=True
+                )
                 await self._event(run_id, "model_tool_failed", detail, task_id=task_id)
-                if nonproductive_turns >= NONPRODUCTIVE_TURN_LIMIT:
+                if failures >= NONPRODUCTIVE_TURN_LIMIT:
+                    raise RuntimeError(
+                        f"task {task_id} stopped after {failures} "
+                        f"consecutive model failures: {detail}"
+                    )
+                if nonproductive_turns >= MAX_TURNS_WITHOUT_WORKSPACE_CHANGE:
                     raise RuntimeError(
                         f"task {task_id} stopped after {nonproductive_turns} "
-                        f"nonproductive model turns: {detail}"
+                        f"model turns without workspace changes: {detail}"
                     )
+
+            async def record_inspection_turn(task_id: str = task_id) -> None:
+                nonlocal failures, nonproductive_turns
+                failures, nonproductive_turns = _progress_counters(
+                    failures, nonproductive_turns, workspace_changed=False
+                )
+                if nonproductive_turns >= MAX_TURNS_WITHOUT_WORKSPACE_CHANGE:
+                    raise RuntimeError(
+                        f"task {task_id} stopped after {nonproductive_turns} "
+                        "model turns without workspace changes"
+                    )
+
+            def reset_progress_counters() -> None:
+                nonlocal failures, nonproductive_turns
+                failures, nonproductive_turns = _progress_counters(
+                    failures, nonproductive_turns, workspace_changed=True
+                )
 
             for iteration in range(1, limits.model_iterations + 1):
                 if time.monotonic() - started > limits.run_timeout_seconds:
@@ -440,13 +476,13 @@ class DockerSandboxDispatcher:
                         },
                     ]
                     route = CODER_ROUTE
-                    failures = 0
-                    nonproductive_turns = 0
+                    await record_inspection_turn()
                     continue
                 if completion.tool_calls:
                     messages.append(_assistant_tool_message(completion))
                     batch_failure: str | None = None
                     batch_completed = True
+                    batch_workspace_changed = False
                     for call_index, native_call in enumerate(completion.tool_calls):
                         tool, arguments = native_call.name, native_call.arguments
                         if tool not in model_tool_names():
@@ -509,6 +545,12 @@ class DockerSandboxDispatcher:
                                             raise ModelProgressError(
                                                 f"task {task.id} stopped: {stall}"
                                             )
+                                    if tool in {
+                                        "write_file",
+                                        "run_command",
+                                        "capture_screenshot",
+                                    }:
+                                        batch_workspace_changed = True
                                     messages.append(
                                         _tool_result_message(
                                             native_call, result_text[:16000]
@@ -544,6 +586,8 @@ class DockerSandboxDispatcher:
                             )
                             break
                     if batch_failure is not None:
+                        if batch_workspace_changed:
+                            reset_progress_counters()
                         await record_nonproductive(batch_failure)
                         if failures >= 2 and route == CODER_ROUTE:
                             route = REVIEWER_ROUTE
@@ -558,8 +602,10 @@ class DockerSandboxDispatcher:
                             )
                             continue
                     elif batch_completed:
-                        failures = 0
-                        nonproductive_turns = 0
+                        if batch_workspace_changed:
+                            reset_progress_counters()
+                        else:
+                            await record_inspection_turn()
                     await compact_history()
                     if done:
                         break
@@ -624,8 +670,10 @@ class DockerSandboxDispatcher:
                             raise ModelProgressError(
                                 f"task {task.id} stopped: {stall}"
                             )
-                    failures = 0
-                    nonproductive_turns = 0
+                    if tool in {"write_file", "run_command", "capture_screenshot"}:
+                        reset_progress_counters()
+                    else:
+                        await record_inspection_turn()
                 except Exception as exc:
                     if isinstance(exc, ModelProgressError):
                         raise

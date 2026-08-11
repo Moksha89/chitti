@@ -27,6 +27,7 @@ from .provider import (
     LiteLLMProvider,
     ModelProvider,
 )
+from .runtime_identity import write_loaded_code_identity
 from .settings import Settings, get_settings
 from .worker import (
     DockerSandboxDispatcher,
@@ -392,6 +393,12 @@ async def execute_run(
 
 
 async def run_forever() -> None:
+    identity = write_loaded_code_identity()
+    logger.info(
+        "runner loaded code identity digest=%s pid=%s",
+        identity["digest"],
+        identity["pid"],
+    )
     database = Database(get_settings())
     settings = get_settings()
     provider = (

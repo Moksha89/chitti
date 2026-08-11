@@ -16,6 +16,7 @@ from chitti.worker import (
     _model_response_failure,
     _model_system_prompt,
     _parse_tool_call,
+    _progress_counters,
     _reviewer_diagnosis_messages,
     _starter_context,
     _task_done_checks,
@@ -70,6 +71,32 @@ def test_starter_context_summarizes_direct_dependencies(tmp_path) -> None:
 def test_model_limits_round_trip() -> None:
     limits = WorkerLimits(model_iterations=3, model_tool_calls=7, model_write_bytes=1234)
     assert WorkerLimits.from_json(limits.as_json()) == limits
+
+
+def test_inspection_does_not_clear_stall_but_write_progress_does() -> None:
+    failures, turns = _progress_counters(
+        1, 2, workspace_changed=False
+    )
+    assert (failures, turns) == (1, 3)
+    assert _progress_counters(
+        failures, turns, workspace_changed=True
+    ) == (0, 0)
+
+
+def test_reviewer_return_does_not_reset_progress_counters() -> None:
+    assert _progress_counters(
+        2, 3, workspace_changed=False
+    ) == (2, 4)
+
+
+def test_repeated_failures_survive_inspection_until_failure_limit() -> None:
+    failures, turns = _progress_counters(
+        1, 1, workspace_changed=False, failure=False
+    )
+    assert (failures, turns) == (1, 2)
+    assert _progress_counters(
+        failures, turns, workspace_changed=False, failure=True
+    ) == (2, 3)
 
 
 def test_model_token_budget_round_trip() -> None:
