@@ -432,7 +432,14 @@ async def _run_event_stream(
     manager: WorkerRunManager,
     run_id: int,
     cursor: int,
+    initial_status: str | None = None,
 ) -> AsyncIterator[str]:
+    if await request.is_disconnected():
+        return
+    if initial_status is None:
+        initial_status = await manager.latest_status(run_id)
+    if initial_status is None or initial_status in TERMINAL_RUN_STATUSES:
+        return
     last_heartbeat = time.monotonic()
     while True:
         if await request.is_disconnected():
@@ -593,14 +600,15 @@ async def workspace_index(request: Request) -> RedirectResponse:
 async def workspace_run_events(run_id: int, request: Request) -> StreamingResponse:
     current_session(request)
     manager: WorkerRunManager = request.app.state.worker_manager
-    if await manager.detail(run_id) is None:
+    current_status = await manager.latest_status(run_id)
+    if current_status is None:
         raise HTTPException(status_code=404, detail="worker run not found")
     try:
         cursor = max(0, int(request.headers.get("Last-Event-ID", "0")))
     except ValueError:
         cursor = 0
     return StreamingResponse(
-        _run_event_stream(request, manager, run_id, cursor),
+        _run_event_stream(request, manager, run_id, cursor, current_status),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

@@ -220,6 +220,9 @@ def test_run_event_stream_replays_after_last_event_id() -> None:
             return False
 
     class Manager:
+        async def latest_status(self, _run_id):
+            return "running"
+
         async def events_after(self, _run_id, event_id):
             return [
                 {"id": 1, "status": "queued", "detail": "queued"},
@@ -241,6 +244,9 @@ def test_run_event_stream_stops_cleanly_when_client_disconnects() -> None:
             return True
 
     class Manager:
+        async def latest_status(self, _run_id):
+            raise AssertionError("disconnected clients must not query state")
+
         async def events_after(self, _run_id, _event_id):
             raise AssertionError("disconnected clients must not query state")
 
@@ -256,6 +262,9 @@ def test_run_event_stream_closes_after_terminal_event() -> None:
             return False
 
     class Manager:
+        async def latest_status(self, _run_id):
+            return "running"
+
         async def events_after(self, _run_id, _event_id):
             return [{"id": 8, "status": "failed", "detail": "finished"}]
 
@@ -263,6 +272,24 @@ def test_run_event_stream_closes_after_terminal_event() -> None:
     terminal = asyncio.run(stream.__anext__())
 
     assert '"terminal":true' in terminal
+    with pytest.raises(StopAsyncIteration):
+        asyncio.run(stream.__anext__())
+
+
+def test_finished_run_stream_closes_before_polling() -> None:
+    class Request:
+        async def is_disconnected(self):
+            return False
+
+    class Manager:
+        async def latest_status(self, _run_id):
+            return "passed"
+
+        async def events_after(self, _run_id, _event_id):
+            raise AssertionError("finished runs must not poll events")
+
+    stream = _run_event_stream(Request(), Manager(), 7, 999)
+
     with pytest.raises(StopAsyncIteration):
         asyncio.run(stream.__anext__())
 
