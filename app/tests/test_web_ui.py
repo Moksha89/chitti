@@ -13,6 +13,7 @@ def _finished_run(promotion=None):
         "run": {"id": 7},
         "events": [{"status": "passed", "detail": "complete"}],
         "token_totals": 0,
+        "reasoning_token_totals": 0,
         "cost_total_usd": 0.0,
         "promotion": promotion,
         "promotion_event": None,
@@ -75,6 +76,15 @@ def test_finished_run_without_export_manifest_is_not_promotable() -> None:
 
     assert "This run is not promotable: static export evidence was not produced." in rendered
     assert "Approve result" not in rendered
+
+
+def test_finished_run_displays_reasoning_token_usage() -> None:
+    run = _finished_run()
+    run["token_totals"] = 1234
+    run["reasoning_token_totals"] = 456
+    rendered = _render_plan_run(run)
+
+    assert "Model calls: 1234 tokens (456 reasoning)" in rendered
 
 
 def test_plan_approval_reason_form_round_trips_to_plan_display() -> None:
