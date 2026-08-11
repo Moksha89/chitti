@@ -121,6 +121,15 @@ if [[ "${role_exists}" == "1" ]]; then
     echo "Runner role exists but ${RUNNER_ENV} is missing; refusing to rotate credentials." >&2
     exit 1
   fi
+  runner_sql_tmp="$(mktemp /etc/chitti/runner-role.XXXXXX)"
+  trap 'rm -f "${runner_sql_tmp:-}"' EXIT
+  sed "/^CREATE ROLE chitti_runner LOGIN PASSWORD /d" \
+    "${RUNNER_ROLE_SQL}" >"${runner_sql_tmp}"
+  chmod 0600 "${runner_sql_tmp}"
+  docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
+    -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <"${runner_sql_tmp}" >/dev/null
+  rm -f "${runner_sql_tmp}"
+  trap - EXIT
 else
   runner_password="$(openssl rand -hex 32)"
   runner_env_tmp="$(mktemp /etc/chitti/worker-runner.env.XXXXXX)"
@@ -241,7 +250,7 @@ END
 $$;
 SQL
 
-runner_image="$(docker compose images -q chitti | head -n1)"
+runner_image="chitti-chitti:latest"
 [[ -n "${runner_image}" ]]
 docker run --rm --network host --env-file "${RUNNER_ENV}" \
   --entrypoint python "${runner_image}" -c '
