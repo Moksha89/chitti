@@ -78,4 +78,8 @@ jobs:
           docker compose config --quiet || status=$?
           echo "::endgroup::"
 
+          echo "::group::Frontend fixture tests"
+          (cd sandbox/fixture && node --test) || status=$?
+          echo "::endgroup::"
+
           exit "$status"
