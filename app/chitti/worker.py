@@ -398,7 +398,6 @@ class DockerSandboxDispatcher:
                 await compact_history()
             if not done:
                 raise RuntimeError(f"task {task.id} exceeded model iteration budget")
-        await self._review_run(run_id, revision, limits, spent, spent_tokens, calls)
         diff = FixedOperation(
             "runner",
             "git-diff",
@@ -426,6 +425,9 @@ class DockerSandboxDispatcher:
             diff_result.returncode, datetime.now(UTC),
         )
         await self._capture_workspace_artifacts(run_id, workspace, limits)
+        await self._review_run(
+            run_id, revision, limits, spent, spent_tokens, calls, workspace
+        )
         await self._event(run_id, "passed", "model tasks and reviewer passed")
 
     async def _execute_model_tool(
@@ -466,8 +468,9 @@ class DockerSandboxDispatcher:
                 stdout, stderr, result.returncode, datetime.now(UTC),
             )
             if result.returncode:
+                await self._capture_workspace_artifacts(run_id, workspace, limits)
                 raise RuntimeError(stderr[-1000:] or "screenshot failed")
-            return "screenshots captured in artifacts/", 0, operation_index
+            return stdout[-4000:] or "screenshots captured in artifacts/", 0, operation_index
         if tool == "run_command":
             name = str(arguments.get("name", ""))
             if arguments.get("args", []) not in ([], None):
@@ -508,15 +511,23 @@ class DockerSandboxDispatcher:
 
     async def _review_run(
         self, run_id: int, revision: PlanRevision, limits: WorkerLimits,
-        spent: float, spent_tokens: int, calls: int,
+        spent: float, spent_tokens: int, calls: int, workspace: Path,
     ) -> None:
         assert self.model_provider is not None
+        evidence = await self._review_evidence(run_id, workspace)
         review_messages = [
             {"role": "system", "content": _reviewer_system_prompt()},
             {
                 "role": "user",
-                "content": f"Review completed run for {revision.document.title}. "
-                "Build, tests, diff, and screenshots are recorded artifacts.",
+                "content": (
+                    f"Review completed run for {revision.document.title}.\n"
+                    "Review only the evidence below. Return a structured verdict "
+                    "with verdict (pass or fail), findings (specific observations), "
+                    "evidence_limitations, and summary. Do not claim to inspect "
+                    "pixels or image contents; image dimensions and browser errors "
+                    "are the available screenshot facts.\n\n"
+                    f"{evidence}"
+                ),
             },
         ]
         try:
@@ -545,7 +556,64 @@ class DockerSandboxDispatcher:
             kind="reviewer_report",
             prompt=json.dumps(review_messages, separators=(",", ":")),
         )
-        await self._event(run_id, "review_complete", completion.content[:4000])
+        try:
+            verdict = json.loads(completion.content)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"reviewer returned invalid JSON: {exc}") from exc
+        if (
+            not isinstance(verdict, dict)
+            or verdict.get("verdict") not in {"pass", "fail"}
+            or not isinstance(verdict.get("findings"), list)
+            or not isinstance(verdict.get("evidence_limitations"), list)
+            or not isinstance(verdict.get("summary"), str)
+        ):
+            raise RuntimeError("reviewer returned an incomplete structured verdict")
+        await self._event(run_id, "review_complete", json.dumps(verdict)[:4000])
+
+    async def _review_evidence(self, run_id: int, workspace: Path) -> str:
+        async with self.database.sessions() as session:
+            operations = await session.execute(
+                text(
+                    "SELECT name, status, stdout, stderr, exit_code "
+                    "FROM worker_operations WHERE run_id = :run_id "
+                    "ORDER BY operation_index"
+                ),
+                {"run_id": run_id},
+            )
+            rows = [
+                {
+                    **dict(row._mapping),
+                    "stdout": str(row._mapping["stdout"])[-4000:],
+                    "stderr": str(row._mapping["stderr"])[-4000:],
+                }
+                for row in operations
+                if row._mapping["name"] in {
+                    "npm-install",
+                    "next-build",
+                    "run-tests",
+                    "capture-screenshot",
+                    "git-diff",
+                }
+            ][-20:]
+        facts: list[dict[str, object]] = []
+        for name in ("phone.png", "desktop.png", "browser-errors.json", "workspace.diff"):
+            path = workspace / "artifacts" / name
+            if not path.is_file():
+                continue
+            item: dict[str, object] = {"path": f"artifacts/{name}"}
+            if name.endswith(".png"):
+                raw = path.read_bytes()
+                if raw[:8] == b"\x89PNG\r\n\x1a\n" and len(raw) >= 24:
+                    item["dimensions"] = {
+                        "width": int.from_bytes(raw[16:20], "big"),
+                        "height": int.from_bytes(raw[20:24], "big"),
+                    }
+            else:
+                item["bytes"] = path.stat().st_size
+                if name == "browser-errors.json":
+                    item["content"] = path.read_text(encoding="utf-8")[:8000]
+            facts.append(item)
+        return json.dumps({"operations": rows, "artifacts": facts}, default=str)
 
     async def _record_model_call(
         self, run_id: int, task_id: str, iteration: int, route: str,
@@ -908,13 +976,18 @@ class DockerSandboxDispatcher:
             return
         for path in artifact_root.iterdir():
             if not path.is_file() or (
-                path.suffix != ".png" and path.name != "workspace.diff"
+                path.suffix != ".png"
+                and path.name not in {"workspace.diff", "browser-errors.json"}
             ):
                 continue
             if path.stat().st_size > limits.artifact_bytes:
                 continue
             content = path.read_bytes()
-            kind = "screenshot" if path.suffix == ".png" else "diff"
+            kind = (
+                "screenshot" if path.suffix == ".png"
+                else "browser_evidence" if path.name == "browser-errors.json"
+                else "diff"
+            )
             async with self.database.sessions() as session:
                 artifact = await session.execute(
                     text(
@@ -1129,6 +1202,10 @@ def _model_system_prompt() -> str:
         "credentials, arbitrary argv, shell passthrough, or network tool exists. "
         "Write useful code early, then iterate using build and test feedback; do not "
         "read the entire workspace before making a first change."
+        " Browser capture runs with no network: do not use remote assets, Drei "
+        "Environment presets, remote fonts, external URLs, or runtime fetches. "
+        "Use local geometry, lights, CSS, and ASCII text so the page renders "
+        "offline inside the cage."
     )
 
 
@@ -1146,9 +1223,14 @@ def _starter_context(workspace: Path) -> str:
 
 def _reviewer_system_prompt() -> str:
     return (
-        "You are the reviewer route. Return one strict JSON object using only the "
-        '{"tool":"finish","arguments":{"summary":"..."}} tool. '
-        "Do not write files or propose shell commands."
+        "You are the reviewer route. Return one strict JSON object with exactly "
+        'the fields {"verdict":"pass|fail","findings":[],"evidence_limitations":[],'
+        '"summary":"..."}. Findings must be specific observations grounded in the '
+        "provided operation output and artifact facts. A browser error, page "
+        "exception, failed request, failed build/test, or missing artifact requires "
+        "verdict fail. Do not claim to inspect screenshot pixels: the prompt only "
+        "contains screenshot dimensions and browser evidence facts. Do not write "
+        "files or propose shell commands."
     )
 
 
