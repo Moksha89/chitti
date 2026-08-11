@@ -71,8 +71,26 @@ async def test_rephrased_key_conflicts_and_forget_hides_without_deleting(store) 
             session,
             [ExtractedMemory("preferred_frontend_framework", "Next.js", "replacement", None, "user_stated")],
         )
-        assert conflicts and conflicts[0].key == "preferred_stack.frontend_framework"
+        assert conflicts and conflicts[0].key == "frontend_framework"
         await memory.forget_decision(session, first)
         assert await memory.decisions(session) == []
         result = await session.execute(text("SELECT id FROM decisions WHERE id = :id"), {"id": first})
         assert result.scalar_one() == first
+
+
+async def test_conflicting_extractions_in_one_batch_use_real_decision_ids(store) -> None:
+    engine, memory = store
+    async with engine.begin() as session:
+        conflicts = await memory.record_memories(
+            session,
+            [
+                ExtractedMemory("deployment_target", "VPS", "first", None, "user_stated"),
+                ExtractedMemory("deployment_target", "managed cloud", "second", None, "user_stated"),
+            ],
+        )
+        assert len(conflicts) == 1
+        assert conflicts[0].decision_id > 0
+        result = await session.execute(
+            text("SELECT COUNT(*) FROM decisions WHERE decision_key = 'deployment_target'")
+        )
+        assert result.scalar_one() == 1

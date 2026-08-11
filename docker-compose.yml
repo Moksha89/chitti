@@ -27,6 +27,7 @@ services:
       GLM_CODING_API_KEY: ${GLM_CODING_API_KEY}
       GLM_API_BASE: ${GLM_API_BASE:-https://api.z.ai/api/paas/v4}
       GLM_MODEL: ${GLM_MODEL:-glm-5.2}
+      GLM_LITELLM_MODEL: openai/${GLM_MODEL:-glm-5.2}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}

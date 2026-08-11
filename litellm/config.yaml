@@ -1,22 +1,22 @@
 model_list:
   - model_name: chitti-chat
     litellm_params:
-      model: openai/${GLM_MODEL}
-      api_base: ${GLM_API_BASE}
+      model: os.environ/GLM_LITELLM_MODEL
+      api_base: os.environ/GLM_API_BASE
       api_key: os.environ/GLM_CODING_API_KEY
       max_budget: 25
       budget_duration: 1d
   - model_name: planner
     litellm_params:
-      model: openai/${GLM_MODEL}
-      api_base: ${GLM_API_BASE}
+      model: os.environ/GLM_LITELLM_MODEL
+      api_base: os.environ/GLM_API_BASE
       api_key: os.environ/GLM_CODING_API_KEY
       max_budget: 25
       budget_duration: 1d
   - model_name: coder
     litellm_params:
-      model: openai/${GLM_MODEL}
-      api_base: ${GLM_API_BASE}
+      model: os.environ/GLM_LITELLM_MODEL
+      api_base: os.environ/GLM_API_BASE
       api_key: os.environ/GLM_CODING_API_KEY
       max_budget: 25
       budget_duration: 1d

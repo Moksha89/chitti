@@ -14,8 +14,16 @@ def test_memory_item_is_explicitly_structured() -> None:
 
 
 def test_normalize_key_collapses_namespace_drift() -> None:
-    assert normalize_key("preferred_stack.frontend_framework") == "preferred_frontend_framework"
-    assert normalize_key("preferred_frontend_framework") == "preferred_frontend_framework"
+    expected = "frontend_framework"
+    for key in (
+        "preferred_stack.frontend_framework",
+        "preferred_frontend_framework",
+        "preferences.frontend_framework",
+        "stack.frontend_framework",
+        "frontend_framework",
+    ):
+        assert normalize_key(key) == expected
+    assert normalize_key("project.frontend_framework") == "project_frontend_framework"
 
 
 class SubjectEmbedder:

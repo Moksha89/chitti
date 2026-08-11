@@ -55,7 +55,7 @@ reported by provider usage metadata when available; do not assume every request
 will hit.
 
 Belief slots use canonicalized keys plus cosine similarity over the normalized
-key-and-value subject. The candidate threshold is `0.82`; exact canonical-key
+key-and-value subject. The candidate threshold is `0.62`; exact canonical-key
 matches are always candidates, while unrelated subjects below the threshold
 remain separate. Forgetting a belief appends a marker in `decision_forgets`
 instead of deleting or mutating the original decision. `DISPLAY_TIMEZONE`
