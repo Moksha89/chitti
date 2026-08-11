@@ -248,7 +248,10 @@ import os
 import asyncpg
 
 async def main():
-    conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+    database_url = os.environ["DATABASE_URL"].replace(
+        "postgresql+asyncpg://", "postgresql://", 1
+    )
+    conn = await asyncpg.connect(database_url)
     current_user = await conn.fetchval("SELECT current_user")
     if current_user != "chitti_runner":
         raise SystemExit("runner role identity check failed")
