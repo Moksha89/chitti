@@ -18,6 +18,11 @@ if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
   git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" add -A
   fresh_checkout=1
 fi
+if ! git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" remote get-url origin >/dev/null 2>&1; then
+  git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" remote add origin "${REPOSITORY_URL}"
+  git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" add -A
+  fresh_checkout=1
+fi
 
 cd "${INSTALL_DIR}"
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
