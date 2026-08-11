@@ -53,6 +53,7 @@ def test_fixed_operations_are_deterministic_and_include_preview() -> None:
         "write-fixture",
         "install-node-dependencies",
         "next-build",
+        "static-export",
         "browser-preview",
         "run-tests",
         "git-diff",

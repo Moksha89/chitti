@@ -1,4 +1,7 @@
+import json
 import logging
+import mimetypes
+import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -10,7 +13,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field
@@ -27,6 +30,7 @@ from .plans import (
     reject_revision,
     revision_by_id,
 )
+from .previews import safe_preview_file
 from .project_state import ProjectState
 from .provider import FakeProvider, LiteLLMProvider
 from .service import ChittiService
@@ -470,6 +474,46 @@ async def plan_page(revision_id: int, request: Request) -> HTMLResponse | Redire
             await request.app.state.worker_manager.detail(int(row.id))
             for row in runs_result
         ]
+        for run in runs:
+            if run is None:
+                continue
+            promotion_result = await db_session.execute(
+                text(
+                    "SELECT m.id AS manifest_id, m.digest, m.total_bytes, "
+                    "a.id AS approval_id, a.decision, p.preview_id, p.expires_at "
+                    "FROM export_manifests m "
+                    "LEFT JOIN promotion_approvals a ON a.manifest_id = m.id "
+                    "LEFT JOIN previews p ON p.manifest_id = m.id "
+                    "WHERE m.run_id = :run_id"
+                ),
+                {"run_id": int(run["run"]["id"])},
+            )
+            run["promotion"] = promotion_result.mappings().one_or_none()
+            promotion_event_result = await db_session.execute(
+                text(
+                    "SELECT status, detail FROM worker_run_events "
+                    "WHERE run_id = :run_id AND status IN "
+                    "('preview_failed', 'preview_blocked') "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"run_id": int(run["run"]["id"])},
+            )
+            run["promotion_event"] = promotion_event_result.mappings().one_or_none()
+            reviewer_result = await db_session.execute(
+                text(
+                    "SELECT p.content FROM worker_artifacts a "
+                    "JOIN worker_artifact_payloads p ON p.artifact_id = a.id "
+                    "WHERE a.run_id = :run_id AND a.kind = 'reviewer_report' "
+                    "ORDER BY a.id DESC LIMIT 1"
+                ),
+                {"run_id": int(run["run"]["id"])},
+            )
+            reviewer_payload = reviewer_result.scalar_one_or_none()
+            if reviewer_payload is not None:
+                try:
+                    run["reviewer_verdict"] = json.loads(reviewer_payload)
+                except (TypeError, json.JSONDecodeError):
+                    run["reviewer_verdict"] = {"verdict": "invalid"}
     return templates.TemplateResponse(
         request=request,
         name="plan.html",
@@ -481,6 +525,67 @@ async def plan_page(revision_id: int, request: Request) -> HTMLResponse | Redire
             "runs": [run for run in runs if run is not None],
         },
     )
+
+
+@app.post("/runs/{run_id}/approve-result")
+async def approve_result(run_id: int, request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    database: Database = request.app.state.database
+    async with database.sessions() as db_session:
+        manifest_result = await db_session.execute(
+            text(
+                "SELECT r.revision_id, r.id AS run_id, e.revision_content_hash, "
+                "e.id AS manifest_id, e.reviewer_artifact_id, e.diff_artifact_id, "
+                "e.digest, e.revision_content_hash AS manifest_revision_hash, "
+                "ra.sha256 AS reviewer_sha256, da.sha256 AS diff_sha256 "
+                "FROM export_manifests e "
+                "JOIN worker_runs r ON r.id = e.run_id "
+                "JOIN worker_artifacts ra ON ra.id = e.reviewer_artifact_id "
+                "JOIN worker_artifacts da ON da.id = e.diff_artifact_id "
+                "WHERE e.run_id = :run_id"
+            ),
+            {"run_id": run_id},
+        )
+        manifest = manifest_result.mappings().one_or_none()
+        if manifest is None:
+            raise HTTPException(
+                status_code=400,
+                detail="this run is not promotable; static export evidence is missing",
+            )
+        try:
+            await db_session.execute(
+                text(
+                    "INSERT INTO promotion_approvals "
+                    "(run_id, revision_id, revision_content_hash, manifest_id, "
+                    "reviewer_artifact_id, reviewer_sha256, diff_artifact_id, "
+                    "diff_sha256, manifest_digest, decision, reason) VALUES "
+                    "(:run_id, :revision_id, :revision_hash, :manifest_id, "
+                    ":reviewer_id, :reviewer_sha256, :diff_id, :diff_sha256, "
+                    ":digest, 'approved', :reason)"
+                ),
+                {
+                    "run_id": run_id,
+                    "revision_id": manifest["revision_id"],
+                    "revision_hash": manifest["revision_content_hash"],
+                    "manifest_id": manifest["manifest_id"],
+                    "reviewer_id": manifest["reviewer_artifact_id"],
+                    "reviewer_sha256": manifest["reviewer_sha256"],
+                    "diff_id": manifest["diff_artifact_id"],
+                    "diff_sha256": manifest["diff_sha256"],
+                    "digest": manifest["digest"],
+                    "reason": str(form.get("reason", "")).strip() or None,
+                },
+            )
+            await db_session.commit()
+        except Exception as exc:
+            await db_session.rollback()
+            raise HTTPException(status_code=409, detail="result approval already exists") from exc
+    return RedirectResponse(request.headers.get("referer", "/"), status_code=303)
 
 
 @app.post("/plans/{revision_id}/runs")
@@ -543,6 +648,39 @@ async def worker_artifact(run_id: int, artifact_id: int, request: Request) -> Re
     kind = str(artifact["kind"])
     media_type = "image/png" if kind == "screenshot" else "text/plain"
     return Response(content=bytes(artifact["content"]), media_type=media_type)
+
+
+@app.get("/previews/{preview_id}/{path:path}")
+async def preview_file(preview_id: str, path: str, request: Request) -> StreamingResponse:
+    current_session(request)
+    database: Database = request.app.state.database
+    async with database.sessions() as session:
+        result = await session.execute(
+            text(
+                "SELECT 1 FROM previews "
+                "WHERE preview_id = :preview_id AND expires_at > now()"
+            ),
+            {"preview_id": preview_id},
+        )
+        if result.scalar_one_or_none() is None:
+            raise HTTPException(status_code=404, detail="preview not found")
+    candidates = [path]
+    if not path or path.endswith("/"):
+        candidates.insert(0, f"{path}index.html")
+    file_descriptor = None
+    filename = ""
+    for candidate in candidates:
+        try:
+            file_descriptor, filename = safe_preview_file(
+                Path(request.app.state.settings.preview_root), preview_id, candidate
+            )
+            break
+        except (OSError, ValueError):
+            continue
+    if file_descriptor is None:
+        raise HTTPException(status_code=404, detail="preview file not found")
+    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return StreamingResponse(os.fdopen(file_descriptor, "rb"), media_type=media_type)
 
 
 @app.post("/plans/{revision_id}/reject")

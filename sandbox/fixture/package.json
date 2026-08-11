@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "build": "next build",
+    "export": "test -f out/index.html",
     "start": "next start",
     "test": "node --test"
   },

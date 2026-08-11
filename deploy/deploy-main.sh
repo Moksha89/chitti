@@ -96,6 +96,9 @@ set +a
 git -c safe.directory="${INSTALL_DIR}" fetch --quiet origin "${REMOTE_BRANCH}"
 git -c safe.directory="${INSTALL_DIR}" checkout --quiet --detach "origin/${REMOTE_BRANCH}"
 
+install -d -o root -g root -m 0750 \
+  /var/lib/chitti-previews /var/lib/chitti-preview-staging
+
 docker compose up -d --build
 docker compose ps
 
@@ -151,7 +154,7 @@ else
   runner_sql_tmp="$(mktemp /etc/chitti/runner-role.sql.XXXXXX)"
   trap 'rm -f "${runner_env_tmp:-}" "${runner_sql_tmp:-}"' EXIT
 
-  printf 'DATABASE_URL=postgresql+asyncpg://chitti_runner:%s@127.0.0.1:5432/%s\n' \
+  printf 'DATABASE_URL=postgresql+asyncpg://chitti_runner:%s@127.0.0.1:5432/%s\nPREVIEW_ROOT=/var/lib/chitti-previews\nPREVIEW_STAGING_ROOT=/var/lib/chitti-preview-staging\n' \
     "${runner_password}" "${POSTGRES_DB}" >"${runner_env_tmp}"
   chmod 0600 "${runner_env_tmp}"
 
@@ -218,9 +221,9 @@ DO $$
 BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM alembic_version
-    WHERE version_num = '0010_model_context_compaction'
+    WHERE version_num = '0011_preview_promotion'
   ) THEN
-    RAISE EXCEPTION 'database is not at migration 0010_model_context_compaction';
+    RAISE EXCEPTION 'database is not at migration 0011_preview_promotion';
   END IF;
 END
 $$;
@@ -231,7 +234,8 @@ BEGIN
   FOREACH required_table IN ARRAY ARRAY[
     'decisions', 'decision_forgets', 'plan_revisions', 'plan_approvals',
     'worker_runs', 'worker_run_events', 'worker_operations',
-    'worker_artifacts', 'worker_model_calls'
+    'worker_artifacts', 'worker_model_calls', 'export_manifests',
+    'promotion_approvals', 'previews'
   ] LOOP
     IF to_regclass('public.' || required_table) IS NULL THEN
       RAISE EXCEPTION 'missing required table %', required_table;
@@ -252,7 +256,10 @@ BEGIN
     'reject_worker_event_mutation_trigger',
     'reject_worker_operation_mutation_trigger',
     'reject_worker_artifact_mutation_trigger',
-    'reject_worker_model_call_mutation_trigger'
+    'reject_worker_model_call_mutation_trigger',
+    'reject_export_manifest_mutation_trigger',
+    'reject_promotion_approval_mutation_trigger',
+    'reject_preview_mutation_trigger'
   ] LOOP
     IF NOT EXISTS (
       SELECT 1 FROM pg_trigger
@@ -289,17 +296,20 @@ async def main():
         "worker_runs", "worker_run_events", "worker_operations",
         "worker_artifacts", "worker_retention_policy",
         "worker_artifact_payloads", "worker_model_calls",
+        "export_manifests", "promotion_approvals", "previews",
     ]
     inserts = [
         "plan_task_events", "worker_run_events", "worker_operations",
         "worker_artifacts", "worker_artifact_payloads", "worker_model_calls",
+        "export_manifests", "previews",
     ]
     updates = ["worker_runs"]  # SELECT ... FOR UPDATE OF worker_runs in runner.py
     deletes = ["worker_artifact_payloads"]
     sequences = [
         "plan_task_events_id_seq", "worker_run_events_id_seq",
         "worker_operations_id_seq", "worker_artifacts_id_seq",
-        "worker_model_calls_id_seq",
+        "worker_model_calls_id_seq", "export_manifests_id_seq",
+        "previews_id_seq",
     ]
 
     async def require_table_privilege(table, privilege):

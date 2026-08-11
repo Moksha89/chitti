@@ -22,6 +22,7 @@ from .plans import (
     revision_by_id,
     validate_approval_binding,
 )
+from .previews import copy_export, remove_preview
 from .provider import ModelCompletion, ModelProvider
 
 if TYPE_CHECKING:
@@ -115,11 +116,17 @@ class DockerSandboxDispatcher:
         database: Database,
         image: str = "chitti-sandbox:latest",
         workspace_root: Path = Path("/var/lib/chitti-worker/runs"),
+        preview_root: Path = Path("/var/lib/chitti-previews"),
+        preview_staging_root: Path = Path("/var/lib/chitti-preview-staging"),
+        preview_ttl_hours: int = 72,
         model_provider: ModelProvider | None = None,
     ) -> None:
         self.database = database
         self.image = image
         self.workspace_root = workspace_root
+        self.preview_root = preview_root
+        self.preview_staging_root = preview_staging_root
+        self.preview_ttl_hours = preview_ttl_hours
         self.model_provider = model_provider
         self._containers: dict[int, str] = {}
         self._processes: dict[int, subprocess.Popen[bytes]] = {}
@@ -426,7 +433,69 @@ class DockerSandboxDispatcher:
         await self._review_run(
             run_id, revision, limits, spent, spent_tokens, calls, workspace
         )
+        await self._create_export_manifest(run_id, revision, workspace)
         await self._event(run_id, "passed", "model tasks and reviewer passed")
+
+    async def _create_export_manifest(
+        self, run_id: int, revision: PlanRevision, workspace: Path
+    ) -> None:
+        export_root = workspace / "out"
+        if not export_root.is_dir():
+            raise RuntimeError(
+                "run is not promotable: static export output is missing"
+            )
+        staging = self.preview_staging_root / str(run_id)
+        try:
+            manifest = await asyncio.to_thread(copy_export, export_root, staging)
+            async with self.database.sessions() as session:
+                artifacts = await session.execute(
+                    text(
+                        "SELECT id, kind, sha256 FROM worker_artifacts "
+                        "WHERE run_id = :run_id AND kind IN ('diff', 'reviewer_report') "
+                        "ORDER BY id"
+                    ),
+                    {"run_id": run_id},
+                )
+                rows = list(artifacts.mappings())
+                reviewer = next(
+                    (row for row in reversed(rows) if row["kind"] == "reviewer_report"),
+                    None,
+                )
+                diff = next(
+                    (row for row in reversed(rows) if row["kind"] == "diff"), None
+                )
+                if reviewer is None or diff is None:
+                    raise RuntimeError(
+                        "run is not promotable: reviewer or diff evidence is missing"
+                    )
+                await session.execute(
+                    text(
+                        "INSERT INTO export_manifests "
+                        "(run_id, revision_id, revision_content_hash, "
+                        "reviewer_artifact_id, diff_artifact_id, manifest, digest, "
+                        "total_bytes, file_count, max_depth, staging_path) VALUES "
+                        "(:run_id, :revision_id, :revision_hash, :reviewer, :diff, "
+                        "CAST(:manifest AS json), :digest, :total_bytes, :file_count, "
+                        ":max_depth, :staging_path)"
+                    ),
+                    {
+                        "run_id": run_id,
+                        "revision_id": revision.id,
+                        "revision_hash": revision.content_hash,
+                        "reviewer": int(reviewer["id"]),
+                        "diff": int(diff["id"]),
+                        "manifest": json.dumps(manifest.as_json()),
+                        "digest": manifest.digest,
+                        "total_bytes": manifest.total_bytes,
+                        "file_count": len(manifest.entries),
+                        "max_depth": manifest.max_depth,
+                        "staging_path": str(staging),
+                    },
+                )
+                await session.commit()
+        except Exception:
+            await asyncio.to_thread(remove_preview, staging)
+            raise
 
     async def _execute_model_tool(
         self, run_id: int, task_id: str, operation_index: int, tool: str,
@@ -479,6 +548,11 @@ class DockerSandboxDispatcher:
                 "test": (
                     "run-tests",
                     ("sh", "-c", "CHITTI_MODEL_LOOP=1 npm test"),
+                    "none",
+                ),
+                "export": (
+                    "static-export",
+                    ("sh", "-c", "test -f out/index.html"),
                     "none",
                 ),
             }
@@ -856,6 +930,34 @@ class DockerSandboxDispatcher:
         if failures:
             raise RuntimeError("; ".join(failures))
 
+        self.preview_root.mkdir(parents=True, exist_ok=True)
+        self.preview_staging_root.mkdir(parents=True, exist_ok=True)
+        async with self.database.sessions() as session:
+            manifests = await session.execute(
+                text("SELECT staging_path, created_at FROM export_manifests")
+            )
+            cutoff = datetime.now(UTC).timestamp() - self.preview_ttl_hours * 3600
+            known_staging = {
+                Path(str(row.staging_path))
+                for row in manifests
+                if row.created_at.timestamp() >= cutoff
+            }
+            previews = await session.execute(
+                text("SELECT preview_id, expires_at FROM previews")
+            )
+            now = datetime.now(UTC)
+            known_previews = {
+                str(row.preview_id)
+                for row in previews
+                if row.expires_at > now
+            }
+        for child in self.preview_staging_root.iterdir():
+            if child not in known_staging:
+                await asyncio.to_thread(remove_preview, child)
+        for child in self.preview_root.iterdir():
+            if child.name not in known_previews:
+                await asyncio.to_thread(remove_preview, child)
+
     async def _record_cleanup_failure(self, run_id: str, detail: str) -> None:
         try:
             numeric_run_id = int(run_id)
@@ -877,6 +979,17 @@ class DockerSandboxDispatcher:
                 await session.commit()
         except Exception:
             logger.exception("could not record workspace cleanup failure for run %s", run_id)
+
+    async def cleanup_expired_previews(self) -> None:
+        if not self.preview_root.exists():
+            return
+        async with self.database.sessions() as session:
+            result = await session.execute(
+                text("SELECT preview_id FROM previews WHERE expires_at <= now()")
+            )
+            expired = [str(row.preview_id) for row in result]
+        for identifier in expired:
+            await asyncio.to_thread(remove_preview, self.preview_root / identifier)
 
     async def _run_container(
         self, run_id: int, command: list[str], limits: WorkerLimits
@@ -1269,7 +1382,7 @@ def _parse_tool_call(content: str) -> tuple[str, dict[str, object]]:
 
 
 def _task_done_checks(completed_commands: set[str]) -> bool:
-    return {"build", "test"} <= completed_commands
+    return {"build", "test", "export"} <= completed_commands
 
 
 def _bounded_artifact(value: str, maximum: int = 16000) -> tuple[bytes, int, bool]:
@@ -1321,7 +1434,7 @@ def _model_system_prompt() -> str:
         '{"tool":"list_files","arguments":{"path":"."}}\n'
         '{"tool":"read_file","arguments":{"path":"app/page.js","max_bytes":65536}}\n'
         '{"tool":"write_file","arguments":{"path":"app/page.js","content":"..."}}\n'
-        '{"tool":"run_command","arguments":{"name":"install|build|test","args":[]}}\n'
+        '{"tool":"run_command","arguments":{"name":"install|build|test|export","args":[]}}\n'
         '{"tool":"capture_screenshot","arguments":{"route":"/","width":390}}\n'
         '{"tool":"finish","arguments":{"summary":"done"}}\n'
         "All paths are relative to the disposable workspace. No .env, secrets, "
@@ -1335,7 +1448,9 @@ def _model_system_prompt() -> str:
         "offline inside the cage. Replace the starter's fixture copy and "
         "placeholder content with original task-specific copy; do not claim "
         "inherited fixture text as authored work. Run npm install before build "
-        "or test so dependency failures are avoided."
+        "or test so dependency failures are avoided. Run export after build and "
+        "confirm that out/index.html exists; a project that cannot produce a "
+        "complete static export is not promotable."
     )
 
 
@@ -1395,6 +1510,9 @@ def fixed_operations(revision: PlanRevision) -> tuple[FixedOperation, ...]:
         ),
         FixedOperation(first.id, "next-build", (
             "sh", "-c", "npm run build",
+        )),
+        FixedOperation(first.id, "static-export", (
+            "sh", "-c", "test -f out/index.html",
         )),
         FixedOperation(first.id, "browser-preview", (
             "python3", "/opt/next_screenshot.py",

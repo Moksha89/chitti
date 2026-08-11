@@ -36,6 +36,13 @@ quota, then bind-mounted into disposable containers. This keeps large
 `node_modules` trees on disk instead of consuming host RAM on this no-swap box.
 The worker container itself remains non-root and receives no Docker socket.
 
+Published previews are stored under `/var/lib/chitti-previews`, which is the
+only preview directory bind-mounted read-only into the application container.
+Unapproved export staging is stored separately under
+`/var/lib/chitti-preview-staging`; only the host runner can read and write that
+path. The application serves a preview only when its identifier is present in
+the database's unexpired `previews` table.
+
 `StateDirectory=chitti-worker` provides `/var/lib/chitti-worker`; the runner
 uses `/var/lib/chitti-worker/runs`. It must be visible to the host Docker
 daemon; do not place it under a private container volume or a
