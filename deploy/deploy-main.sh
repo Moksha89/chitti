@@ -5,7 +5,6 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/chitti}"
 REMOTE_BRANCH="${REMOTE_BRANCH:-main}"
 RUNNER_ENV="${RUNNER_ENV:-/etc/chitti/worker-runner.env}"
 RUNNER_UNIT="chitti-worker-runner.service"
-COMPOSE_PROJECT="${COMPOSE_PROJECT:-chitti}"
 
 if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
   echo "Missing application checkout: ${INSTALL_DIR}" >&2
@@ -111,19 +110,48 @@ if docker inspect "${app_container}" \
 fi
 docker exec "${app_container}" test ! -S /var/run/docker.sock
 
-docker run --rm --network none chitti-sandbox:latest python3 -c '
+worker_targets=""
+for service_port in postgres:5432 redis:6379 litellm:4000 caddy:80; do
+  service="${service_port%%:*}"
+  port="${service_port##*:}"
+  container="$(docker compose ps -q "${service}")"
+  [[ -n "${container}" ]]
+  address="$(
+    docker inspect "${container}" --format \
+      '{{range .NetworkSettings.Networks}}{{if .IPAddress}}{{.IPAddress}}{{end}}{{end}}'
+  )"
+  [[ -n "${address}" ]]
+  worker_targets+="${service}|${address}|${port};"
+done
+docker run --rm --network bridge -e "WORKER_TARGETS=${worker_targets}" \
+  chitti-sandbox:latest python3 -c '
+import os
 import socket
-targets = [("postgres", 5432), ("redis", 6379), ("litellm", 4000), ("caddy", 80)]
-for host, port in targets:
-    try:
-        socket.create_connection((host, port), timeout=0.5)
-    except OSError:
+
+for target in os.environ["WORKER_TARGETS"].split(";"):
+    if not target:
         continue
-    raise SystemExit(f"worker reached {host}:{port}")
+    name, address, port = target.split("|")
+    for host in (name, address):
+        try:
+            socket.create_connection((host, int(port)), timeout=0.5)
+        except OSError:
+            continue
+        raise SystemExit(f"worker reached {name}:{port} via {host}")
 '
 
 docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
   -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<'SQL' >/dev/null
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM alembic_version
+    WHERE version_num = '0010_model_context_compaction'
+  ) THEN
+    RAISE EXCEPTION 'database is not at migration 0010_model_context_compaction';
+  END IF;
+END
+$$;
 DO $$
 DECLARE
   required_table text;
@@ -140,19 +168,27 @@ BEGIN
 END
 $$;
 DO $$
+DECLARE
+  required_trigger text;
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_trigger
-    WHERE tgname = 'decisions_append_only'
-  ) THEN
-    RAISE EXCEPTION 'missing decisions append-only trigger';
-  END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_trigger
-    WHERE tgname = 'plan_revisions_immutable'
-  ) THEN
-    RAISE EXCEPTION 'missing plan revision immutability trigger';
-  END IF;
+  FOREACH required_trigger IN ARRAY ARRAY[
+    'decisions_append_only',
+    'plan_revisions_immutable',
+    'plan_task_events_immutable',
+    'plan_approvals_immutable',
+    'reject_worker_run_mutation_trigger',
+    'reject_worker_event_mutation_trigger',
+    'reject_worker_operation_mutation_trigger',
+    'reject_worker_artifact_mutation_trigger',
+    'reject_worker_model_call_mutation_trigger'
+  ] LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_trigger
+      WHERE tgname = required_trigger
+    ) THEN
+      RAISE EXCEPTION 'missing required append-only trigger %', required_trigger;
+    END IF;
+  END LOOP;
 END
 $$;
 SQL
@@ -174,7 +210,7 @@ async def main():
                has_sequence_privilege(current_user, $$worker_runs_id_seq$$, $$USAGE$$)
     """)
     await conn.close()
-    if row[0] != "chitti_runner" or row[1] or not row[2] or not row[3]:
+    if row[0] != "chitti_runner" or row[1] or row[2] or row[3]:
         raise SystemExit("runner role privilege boundary failed")
 
 asyncio.run(main())
