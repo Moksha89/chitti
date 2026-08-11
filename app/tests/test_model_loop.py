@@ -6,6 +6,7 @@ from chitti.worker import (
     DockerSandboxDispatcher,
     WorkerLimits,
     _bounded_artifact,
+    _compact_model_messages,
     _confined_path,
     _parse_tool_call,
     _task_done_checks,
@@ -36,6 +37,26 @@ def test_bounded_artifact_preserves_original_size_and_truncation() -> None:
     assert len(payload) == 16000
     assert original_size == 18000
     assert truncated
+
+
+def test_model_history_compaction_keeps_prefix_recent_and_feedback() -> None:
+    messages = [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "task contract"},
+        *[
+            {"role": "assistant", "content": f"old {index}"}
+            for index in range(10)
+        ],
+        {"role": "user", "content": "next-build passed"},
+        {"role": "assistant", "content": "recent"},
+    ]
+    compacted, changed, removed = _compact_model_messages(messages, recent_turns=2)
+    assert changed
+    assert removed > 0
+    assert compacted[0] == messages[0]
+    assert compacted[1] == messages[1]
+    assert any("next-build passed" in item["content"] for item in compacted)
+    assert any("COMPACTION:" in item["content"] for item in compacted)
 
 
 def test_model_tool_parser_rejects_malformed_and_unknown_shape() -> None:

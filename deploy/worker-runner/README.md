@@ -58,16 +58,20 @@ Model coding runs add a second, runner-enforced budget document to the
 immutable `worker_runs.limits` JSON:
 
 - 40 model iterations per task and 120 total tool calls;
-- 30,000 total model tokens;
+- 300,000 total model tokens;
 - 2 MiB total model-authored writes;
 - 1,800 seconds overall run wall-clock, separate from each Docker operation's
   900-second timeout;
-- $1.50 loop-side spend cap, with the `coder` and `reviewer` LiteLLM routes
-  capped at $1.50 and $0.50 respectively at the gateway.
+- $0.75 loop-side spend cap, with the `coder` and `reviewer` LiteLLM routes
+  capped at $0.75 and $0.25 respectively at the gateway. The loop-side cap
+  means one run can never spend more than $0.75; route caps are an additional
+  gateway guard.
 
 Only the host runner constructs model prompts and holds the LiteLLM credential.
 The worker receives structured fixed tools, never a model key or arbitrary
 argv. Model prompts and responses are bounded append-only artifacts, with
 token/cost metadata in `worker_model_calls`; reviewer output is stored as a
-separate artifact. Approval remains evidence review only: this slice does not
-publish, merge, or deploy sandbox output.
+separate artifact. Older exploratory turns are compacted while the stable
+prompt prefix, task contract, recent turns, and build/test feedback remain;
+each compaction is recorded as a run event. Approval remains evidence review
+only: this slice does not publish, merge, or deploy sandbox output.

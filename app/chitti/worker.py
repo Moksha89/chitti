@@ -40,9 +40,9 @@ class WorkerLimits:
     shm_size: str = "256m"
     model_iterations: int = 40
     model_tool_calls: int = 120
-    model_tokens: int = 30000
+    model_tokens: int = 300000
     model_write_bytes: int = 2 * 1024 * 1024
-    model_spend_usd: float = 1.50
+    model_spend_usd: float = 0.75
     run_timeout_seconds: int = 1800
 
     def as_json(self) -> dict[str, object]:
@@ -81,9 +81,9 @@ class WorkerLimits:
             shm_size=str(values["shm_size"]),
             model_iterations=int(cast(int, values.get("model_iterations", 40))),
             model_tool_calls=int(cast(int, values.get("model_tool_calls", 120))),
-            model_tokens=int(cast(int, values.get("model_tokens", 30000))),
+            model_tokens=int(cast(int, values.get("model_tokens", 300000))),
             model_write_bytes=int(cast(int, values.get("model_write_bytes", 2 * 1024 * 1024))),
-            model_spend_usd=float(cast(float, values.get("model_spend_usd", 1.50))),
+            model_spend_usd=float(cast(float, values.get("model_spend_usd", 0.75))),
             run_timeout_seconds=int(cast(int, values.get("run_timeout_seconds", 1800))),
         )
 
@@ -271,6 +271,20 @@ class DockerSandboxDispatcher:
                 },
             ]
             done = False
+            task_id = task.id
+
+            async def compact_history(task_id: str = task_id) -> None:
+                nonlocal messages
+                compacted, changed, removed_chars = _compact_model_messages(messages)
+                if changed:
+                    messages = compacted
+                    await self._event(
+                        run_id,
+                        "model_context_compacted",
+                        f"compacted model history: removed {removed_chars} characters",
+                        task_id=task_id,
+                    )
+
             for iteration in range(1, limits.model_iterations + 1):
                 if time.monotonic() - started > limits.run_timeout_seconds:
                     raise RuntimeError("model run wall-clock budget exceeded")
@@ -332,6 +346,7 @@ class DockerSandboxDispatcher:
                     messages.append(
                         {"role": "user", "content": f"TOOL FAILURE: {str(exc)[:1000]}"}
                     )
+                    await compact_history()
                     continue
                 if tool == "finish" and _task_done_checks(completed_commands):
                     await self._event(
@@ -350,6 +365,7 @@ class DockerSandboxDispatcher:
                             {"role": "user", "content": result_text},
                         ]
                     )
+                    await compact_history()
                     continue
                 try:
                     result_text, written, operation_index = await self._execute_model_tool(
@@ -379,6 +395,7 @@ class DockerSandboxDispatcher:
                         {"role": "user", "content": result_text[:16000]},
                     ]
                 )
+                await compact_history()
             if not done:
                 raise RuntimeError(f"task {task.id} exceeded model iteration budget")
         await self._review_run(run_id, revision, limits, spent, spent_tokens, calls)
@@ -391,6 +408,9 @@ class DockerSandboxDispatcher:
                 "':(exclude)node_modules' ':(exclude)node_modules/**' "
                 "':(exclude).next' ':(exclude).next/**' "
                 "':(exclude).npm-cache' ':(exclude).npm-cache/**' "
+                "':(exclude).home' ':(exclude).home/**' "
+                "':(exclude).cache' ':(exclude).cache/**' "
+                "':(exclude).npm' ':(exclude).npm/**' "
                 "':(exclude)artifacts' ':(exclude)artifacts/**' && "
                 "git -c safe.directory=/workspace diff --cached --no-ext-diff "
                 "> artifacts/workspace.diff",
@@ -1058,6 +1078,43 @@ def _bounded_artifact(value: str, maximum: int = 16000) -> tuple[bytes, int, boo
     return raw[:maximum], len(raw), len(raw) > maximum
 
 
+def _compact_model_messages(
+    messages: list[dict[str, str]], recent_turns: int = 8, max_preserved: int = 4
+) -> tuple[list[dict[str, str]], bool, int]:
+    if len(messages) <= recent_turns + 3:
+        return messages, False, 0
+    prefix = messages[:2]
+    older = messages[2:-recent_turns]
+    recent = messages[-recent_turns:]
+    important = [
+        {"role": item["role"], "content": item["content"][:3000]}
+        for item in older
+        if any(
+            marker in item["content"].lower()
+            for marker in (
+                "tool failure",
+                "next-build",
+                "run-tests",
+                "npm-install",
+                "screenshot",
+                "worker output",
+            )
+        )
+    ][-max_preserved:]
+    removed_chars = sum(len(item["content"]) for item in older) - sum(
+        len(item["content"]) for item in important
+    )
+    summary = {
+        "role": "user",
+        "content": (
+            "COMPACTION: older exploratory turns and superseded file contents were "
+            f"removed ({removed_chars} characters). The current workspace is authoritative; "
+            "retain the task contract, recent turns, and preserved build/test feedback."
+        ),
+    }
+    return prefix + [summary, *important, *recent], True, removed_chars
+
+
 def _model_system_prompt() -> str:
     return (
         "Stable worker rules and tool schemas come first. Emit exactly one strict JSON "
@@ -1141,6 +1198,11 @@ def fixed_operations(revision: PlanRevision) -> tuple[FixedOperation, ...]:
                 "':(exclude).next' ':(exclude).next/**' "
                 "':(exclude)**/.next/**' ':(exclude).npm-cache' "
                 "':(exclude).npm-cache/**' ':(exclude)**/.npm-cache/**' "
+                "':(exclude).home' ':(exclude).home/**' "
+                "':(exclude)**/.home/**' ':(exclude).cache' "
+                "':(exclude).cache/**' ':(exclude)**/.cache/**' "
+                "':(exclude).npm' ':(exclude).npm/**' "
+                "':(exclude)**/.npm/**' "
                 "':(exclude)artifacts' ':(exclude)artifacts/**' && "
             "git -c safe.directory=/workspace diff --cached --no-ext-diff "
             "> artifacts/workspace.diff",
