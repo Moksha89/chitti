@@ -136,26 +136,50 @@ if [[ "$(docker inspect -f '{{.State.Health.Status}}' "${litellm_container}")" !
   exit 1
 fi
 docker exec "${litellm_container}" test -s /app/litellm/config.yaml
-gateway_models="$(
+if ! gateway_models="$(
   curl --fail --silent --show-error --max-time 15 \
     -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
     "http://127.0.0.1:${LITELLM_PORT:-4000}/v1/models"
-)"
-missing_gateway_routes="$(
-  docker run --rm -i --entrypoint python "${runner_image}" -c \
+)"; then
+  echo "gateway loaded-route assertion failed: gateway request was unreachable or failed" >&2
+  exit 1
+fi
+gateway_assertion_error="$(mktemp)"
+if missing_gateway_routes="$(
+  docker run --rm \
+    --env "CHITTI_GATEWAY_MODELS_JSON=${gateway_models}" \
+    --entrypoint python "${runner_image}" -c \
     'import json
+import os
 import sys
 from chitti.provider import REQUIRED_GATEWAY_ROUTES
 
-payload = json.load(sys.stdin)
+try:
+    payload = json.loads(os.environ["CHITTI_GATEWAY_MODELS_JSON"])
+except (KeyError, json.JSONDecodeError, TypeError) as exc:
+    print(f"invalid gateway JSON response: {exc}", file=sys.stderr)
+    raise SystemExit(2)
 model_ids = {
     str(item["id"])
     for item in payload.get("data", [])
     if isinstance(item, dict) and "id" in item
 }
-print("\n".join(sorted(REQUIRED_GATEWAY_ROUTES - model_ids)))'
-  < <(printf '%s' "${gateway_models}")
-)"
+print("\n".join(sorted(REQUIRED_GATEWAY_ROUTES - model_ids)))' \
+    2>"${gateway_assertion_error}"
+)"; then
+  :
+else
+  gateway_assertion_status="$?"
+  if [[ "${gateway_assertion_status}" -eq 2 ]]; then
+    echo "gateway loaded-route assertion failed: response was not valid JSON" >&2
+  else
+    echo "gateway loaded-route assertion failed: route checker could not execute" >&2
+  fi
+  cat "${gateway_assertion_error}" >&2
+  rm -f "${gateway_assertion_error}"
+  exit 1
+fi
+rm -f "${gateway_assertion_error}"
 if [[ -n "${missing_gateway_routes}" ]]; then
   echo "gateway loaded-route assertion failed; missing: ${missing_gateway_routes}" >&2
   exit 1
