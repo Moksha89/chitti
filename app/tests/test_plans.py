@@ -1,6 +1,15 @@
+from datetime import UTC, datetime
+
 import pytest
 
-from chitti.plans import PlanDocument, PlanTask, plan_hash, validate_approval_binding
+from chitti.plans import (
+    PlanApproval,
+    PlanDocument,
+    PlanRevision,
+    PlanTask,
+    plan_hash,
+    validate_approval_binding,
+)
 
 
 def task(task_id: str, dependencies: list[str] | None = None) -> PlanTask:
@@ -26,9 +35,12 @@ def test_plan_validator_rejects_dependency_cycle() -> None:
 def test_approval_binding_is_to_exact_revision_content() -> None:
     document = PlanDocument(title="Plan", summary="Summary", tasks=[task("a")])
     digest = plan_hash(document)
-    approval = type("Approval", (), {"revision_id": 1, "content_hash": digest})()
-    revision = type("Revision", (), {"id": 1, "document": document, "content_hash": digest})()
+    created_at = datetime.now(UTC)
+    approval = PlanApproval(1, 1, "approved", None, digest, created_at)
+    revision = PlanRevision(1, "demo", "Build the demo.", 1, document, digest, created_at, None)
     assert validate_approval_binding(revision, approval)
     changed = document.model_copy(update={"summary": "Changed"})
-    changed_revision = type("Revision", (), {"id": 1, "document": changed, "content_hash": digest})()
+    changed_revision = PlanRevision(
+        1, "demo", "Build the demo.", 1, changed, digest, created_at, None
+    )
     assert not validate_approval_binding(changed_revision, approval)

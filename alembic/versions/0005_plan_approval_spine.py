@@ -15,6 +15,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("project", sa.String(255), nullable=False),
+        sa.Column("brief", sa.Text(), nullable=False),
         sa.Column("revision", sa.Integer(), nullable=False),
         sa.Column("content", sa.JSON(), nullable=False),
         sa.Column("content_hash", sa.String(64), nullable=False),
@@ -29,6 +30,7 @@ def upgrade() -> None:
         sa.Column("project", sa.String(255), nullable=False),
         sa.Column("brief", sa.Text(), nullable=False),
         sa.Column("parent_revision_id", sa.Integer(), nullable=True),
+        sa.Column("rejection", sa.Text(), nullable=True),
         sa.Column("status", sa.String(16), nullable=False, server_default="queued"),
         sa.Column("error", sa.Text(), nullable=True),
         sa.Column("revision_id", sa.Integer(), nullable=True),
@@ -57,6 +59,9 @@ def upgrade() -> None:
         sa.Column("content_hash", sa.String(64), nullable=False),
         sa.ForeignKeyConstraint(["revision_id"], ["plan_revisions.id"]),
         sa.CheckConstraint("decision IN ('approved', 'rejected')", name="plan_approval_decision_ck"),
+    )
+    op.create_unique_constraint(
+        "plan_approvals_revision_uq", "plan_approvals", ["revision_id"]
     )
     op.execute(
         """CREATE OR REPLACE FUNCTION reject_plan_revision_mutation() RETURNS trigger AS $$

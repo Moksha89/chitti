@@ -4,14 +4,19 @@ import asyncio
 import hashlib
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+if TYPE_CHECKING:
+    from .db import Database
+    from .memory import MemoryStore
+    from .provider import ModelProvider
 
 
 class PlanTask(BaseModel):
@@ -84,6 +89,7 @@ def plan_hash(document: PlanDocument) -> str:
 class PlanRevision:
     id: int
     project: str
+    brief: str
     revision: int
     document: PlanDocument
     content_hash: str
@@ -101,13 +107,16 @@ class PlanApproval:
     created_at: datetime
 
 
-def _document_from_row(value: Any) -> PlanDocument:
-    return PlanDocument.model_validate(value if isinstance(value, dict) else json.loads(value))
+def _document_from_row(value: object) -> PlanDocument:
+    if isinstance(value, dict):
+        return PlanDocument.model_validate(value)
+    return PlanDocument.model_validate(json.loads(str(value)))
 
 
 async def create_revision(
     session: AsyncSession,
     project: str,
+    brief: str,
     document: PlanDocument,
     parent_revision_id: int | None = None,
 ) -> int:
@@ -124,12 +133,13 @@ async def create_revision(
     result = await session.execute(
         text(
             "INSERT INTO plan_revisions "
-            "(project, revision, content, content_hash, parent_revision_id) "
-            "VALUES (:project, :revision, CAST(:content AS jsonb), :content_hash, "
+            "(project, brief, revision, content, content_hash, parent_revision_id) "
+            "VALUES (:project, :brief, :revision, CAST(:content AS jsonb), :content_hash, "
             ":parent_revision_id) RETURNING id"
         ),
         {
             "project": project,
+            "brief": brief,
             "revision": revision,
             "content": json.dumps(content),
             "content_hash": digest,
@@ -154,22 +164,33 @@ async def create_revision(
 
 
 class PlanManager:
-    def __init__(self, database: Any, provider: Any, memory: Any) -> None:
+    def __init__(
+        self, database: Database, provider: ModelProvider, memory: MemoryStore
+    ) -> None:
         self.database = database
         self.provider = provider
         self.memory = memory
         self._jobs: set[asyncio.Task[None]] = set()
 
     async def enqueue(
-        self, project: str, brief: str, parent_revision_id: int | None = None
+        self,
+        project: str,
+        brief: str,
+        parent_revision_id: int | None = None,
+        rejection: str | None = None,
     ) -> int:
         async with self.database.sessions() as session:
             result = await session.execute(
                 text(
-                    "INSERT INTO plan_jobs (project, brief, parent_revision_id) "
-                    "VALUES (:project, :brief, :parent) RETURNING id"
+                    "INSERT INTO plan_jobs (project, brief, parent_revision_id, rejection) "
+                    "VALUES (:project, :brief, :parent, :rejection) RETURNING id"
                 ),
-                {"project": project, "brief": brief, "parent": parent_revision_id},
+                {
+                    "project": project,
+                    "brief": brief,
+                    "parent": parent_revision_id,
+                    "rejection": rejection,
+                },
             )
             job_id = int(result.scalar_one())
             await session.commit()
@@ -194,7 +215,8 @@ class PlanManager:
             job = (
                 await session.execute(
                     text(
-                        "SELECT project, brief, parent_revision_id FROM plan_jobs WHERE id = :id"
+                        "SELECT project, brief, parent_revision_id, rejection "
+                        "FROM plan_jobs WHERE id = :id"
                     ),
                     {"id": job_id},
                 )
@@ -209,7 +231,12 @@ class PlanManager:
         try:
             async with self.database.sessions() as session:
                 beliefs = await self.memory.active_beliefs(session)
-            raw = await self.provider.plan(str(job["brief"]), str(job["project"]), beliefs)
+            raw = await self.provider.plan(
+                str(job["brief"]),
+                str(job["project"]),
+                beliefs,
+                str(job["rejection"]) if job["rejection"] else None,
+            )
             match = re.search(r"\{[\s\S]*\}", raw)
             if not match:
                 raise ValueError("planner returned no JSON object")
@@ -218,6 +245,7 @@ class PlanManager:
                 revision_id = await create_revision(
                     session,
                     str(job["project"]),
+                    str(job["brief"]),
                     document,
                     int(job["parent_revision_id"]) if job["parent_revision_id"] else None,
                 )
@@ -234,7 +262,7 @@ class PlanManager:
                 )
                 await session.commit()
 
-    async def job(self, job_id: int) -> dict[str, Any] | None:
+    async def job(self, job_id: int) -> dict[str, object] | None:
         async with self.database.sessions() as session:
             result = await session.execute(
                 text(
@@ -247,7 +275,7 @@ class PlanManager:
             return dict(row) if row else None
 
 
-async def latest_revisions(session: AsyncSession) -> list[dict[str, Any]]:
+async def latest_revisions(session: AsyncSession) -> list[dict[str, object]]:
     result = await session.execute(
         text(
             "SELECT DISTINCT ON (project) id, project, revision, content, content_hash, "
@@ -278,7 +306,7 @@ async def latest_revisions(session: AsyncSession) -> list[dict[str, Any]]:
 async def revision_by_id(session: AsyncSession, revision_id: int) -> PlanRevision | None:
     result = await session.execute(
         text(
-            "SELECT id, project, revision, content, content_hash, created_at, parent_revision_id "
+            "SELECT id, project, brief, revision, content, content_hash, created_at, parent_revision_id "
             "FROM plan_revisions WHERE id = :id"
         ),
         {"id": revision_id},
@@ -289,6 +317,7 @@ async def revision_by_id(session: AsyncSession, revision_id: int) -> PlanRevisio
     return PlanRevision(
         id=int(row["id"]),
         project=str(row["project"]),
+        brief=str(row["brief"]),
         revision=int(row["revision"]),
         document=_document_from_row(row["content"]),
         content_hash=str(row["content_hash"]),
@@ -377,7 +406,7 @@ def validate_approval_binding(revision: PlanRevision, approval: PlanApproval) ->
     )
 
 
-def task_status_projection(events: Iterable[dict[str, Any]]) -> dict[str, str]:
+def task_status_projection(events: Iterable[Mapping[str, object]]) -> dict[str, str]:
     projection: dict[str, str] = {}
     for event in events:
         projection[str(event["task_id"])] = str(event["status"])

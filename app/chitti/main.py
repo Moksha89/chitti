@@ -39,6 +39,7 @@ CSRF_FIELD = "csrf_token"
 class ChatRequest(BaseModel):
     message: str
     project: str | None = None
+    plan_requested: bool = False
     history: list[dict[str, str]] = Field(default_factory=list)
 
 
@@ -348,16 +349,13 @@ def humanize_belief_key(value: str) -> str:
     return re.sub(r"[_\.]+", " ", value).strip().capitalize()
 
 
-def project_from_brief(message: str, project: str | None) -> str | None:
-    if project:
-        return project.strip() or None
-    if not re.search(r"\b(build|create|make|develop|design)\b", message, re.IGNORECASE):
+def project_from_brief(
+    project: str | None, plan_requested: bool = False
+) -> str | None:
+    if not plan_requested or not project or not project.strip():
         return None
-    match = re.search(r"\bfor\s+([A-Za-z0-9][A-Za-z0-9 _-]{1,80}?)(?:[.!?]|$)", message, re.IGNORECASE)
-    if not match:
-        return "untitled-project"
-    value = re.sub(r"[^a-zA-Z0-9]+", "-", match.group(1).strip()).strip("-").lower()
-    return value or "untitled-project"
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", project.strip()).strip("-").lower()
+    return value or None
 
 
 
@@ -447,8 +445,9 @@ async def reject_plan(revision_id: int, request: Request) -> RedirectResponse:
     manager: PlanManager = request.app.state.plan_manager
     await manager.enqueue(
         revision.project,
-        f"{revision.document.summary}\nOwner rejection feedback: {reason}",
+        revision.brief,
         revision_id,
+        reason,
     )
     return RedirectResponse("/", status_code=303)
 
@@ -492,6 +491,11 @@ async def chat(payload: ChatRequest, request: Request) -> dict[str, object]:
     require_csrf(request, session)
     database: Database = request.app.state.database
     service: ChittiService = request.app.state.service
+    plan_project = project_from_brief(payload.project, payload.plan_requested)
+    if payload.plan_requested and plan_project is None:
+        raise HTTPException(
+            status_code=400, detail="a named project is required for planning"
+        )
     try:
         async with database.sessions() as db_session:
             result = await service.turn(db_session, payload.message, payload.project, payload.history)
@@ -500,11 +504,13 @@ async def chat(payload: ChatRequest, request: Request) -> dict[str, object]:
         raise HTTPException(status_code=503, detail="model provider unavailable") from exc
     plan_job_id = None
     reply = result.reply
-    plan_project = project_from_brief(payload.message, payload.project)
     if plan_project:
         manager: PlanManager = request.app.state.plan_manager
         plan_job_id = await manager.enqueue(plan_project, payload.message)
-        reply += "\n\nI queued a project plan for owner approval. Nothing will execute."
+        reply += (
+            "\n\nI created a plan draft for "
+            f"{plan_project}. It is waiting for your approval; nothing will execute."
+        )
     return {
         "reply": reply,
         "reply_html": render_markdown(reply),

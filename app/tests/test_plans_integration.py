@@ -55,11 +55,14 @@ def document(summary: str = "Build the site.") -> PlanDocument:
 
 async def test_rejection_and_approval_are_append_only_and_hash_bound(database) -> None:
     async with database.begin() as session:
-        first_id = await create_revision(session, "vsports", document())
+        first_id = await create_revision(session, "vsports", "Build the site.", document())
         rejection = await reject_revision(session, first_id, "Add a mobile acceptance criterion.")
+        with pytest.raises(ValueError, match="already has an approval decision"):
+            await approve_revision(session, first_id)
         second_id = await create_revision(
             session,
             "vsports",
+            "Build the site with mobile acceptance criteria.",
             document("Build the site with mobile acceptance criteria."),
             first_id,
         )

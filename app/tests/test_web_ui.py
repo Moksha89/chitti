@@ -20,6 +20,7 @@ def test_belief_presentation_keeps_keys_consistent_and_values_readable() -> None
 
 
 def test_project_brief_is_detected_without_starting_execution() -> None:
-    assert project_from_brief("Build an animated 3D landing page for VSports", None) == "vsports"
-    assert project_from_brief("Tell me what you remember", None) is None
-    assert project_from_brief("Build the page", "my-project") == "my-project"
+    assert project_from_brief("VSports", True) == "vsports"
+    assert project_from_brief("VSports", False) is None
+    assert project_from_brief(None, True) is None
+    assert project_from_brief("!!!", True) is None
