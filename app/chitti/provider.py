@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 CODER_ROUTE = "coder"
 REVIEWER_ROUTE = "reviewer"
 REQUIRED_GATEWAY_ROUTES = frozenset({CODER_ROUTE, REVIEWER_ROUTE})
-CODER_MAX_OUTPUT_TOKENS = 8192
+CODER_MAX_OUTPUT_TOKENS = 32768
 
 
 class GatewayValidationError(RuntimeError):
@@ -43,6 +43,7 @@ class ModelCompletion:
     completion_tokens: int
     total_tokens: int
     cost_usd: float
+    reasoning_tokens: int = 0
     finish_reason: str | None = None
     message_fields: tuple[str, ...] = ()
     tool_calls: tuple["ModelToolCall", ...] = ()
@@ -222,6 +223,12 @@ class LiteLLMProvider:
             prompt_tokens = int(usage.get("prompt_tokens", 0))
             completion_tokens = int(usage.get("completion_tokens", 0))
             total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens))
+            completion_details = usage.get("completion_tokens_details") or {}
+            reasoning_tokens = (
+                int(completion_details.get("reasoning_tokens", 0))
+                if isinstance(completion_details, dict)
+                else 0
+            )
             cost = body.get("cost", response.headers.get("x-litellm-response-cost", 0.0))
             return ModelCompletion(
                 content=content if isinstance(content, str) else "",
@@ -230,6 +237,7 @@ class LiteLLMProvider:
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
                 cost_usd=float(cost or 0.0),
+                reasoning_tokens=reasoning_tokens,
                 finish_reason=(
                     str(choice["finish_reason"])
                     if choice.get("finish_reason") is not None

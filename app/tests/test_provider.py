@@ -110,6 +110,7 @@ def test_agent_completion_records_native_tool_calls_and_request_schema(monkeypat
                 "prompt_tokens": 12,
                 "completion_tokens": CODER_MAX_OUTPUT_TOKENS,
                 "total_tokens": 8204,
+                "completion_tokens_details": {"reasoning_tokens": 123},
             },
         },
     )
@@ -138,10 +139,15 @@ def test_agent_completion_records_native_tool_calls_and_request_schema(monkeypat
     assert completion.tool_calls == (
         ModelToolCall(id="call-1", name="list_files", arguments={"path": "."}),
     )
+    assert completion.reasoning_tokens == 123
     assert calls[0][1]["json"]["max_tokens"] == CODER_MAX_OUTPUT_TOKENS
     assert calls[0][1]["json"]["tools"][0]["function"]["name"] == "list_files"
     assert calls[0][1]["json"]["tool_choice"] == "required"
     assert "thinking" not in calls[0][1]["json"]
+
+
+def test_coder_output_ceiling_leaves_reasoning_and_write_headroom() -> None:
+    assert CODER_MAX_OUTPUT_TOKENS == 32768
 
 
 def test_diagnostic_fields_ignore_structural_and_empty_message_values() -> None:

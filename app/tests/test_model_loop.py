@@ -199,9 +199,9 @@ def test_truncated_model_response_is_reported_distinctly() -> None:
         cost_usd=0.01,
         finish_reason="length",
     )
-    assert _model_response_failure(completion) == (
-        "model response truncated at the output limit"
-    )
+    detail = _model_response_failure(completion)
+    assert detail is not None
+    assert "be brief" in detail
     assert not completion.message_fields
 
 
@@ -218,9 +218,10 @@ def test_truncated_native_tool_call_is_rejected_not_executed() -> None:
             ModelToolCall(id="partial", name="write_file", arguments={}),
         ),
     )
-    assert _model_response_failure(completion) == (
-        "model response truncated at the output limit"
-    )
+    detail = _model_response_failure(completion)
+    assert detail is not None
+    assert "be brief" in detail
+    assert "split large file writes" in detail
 
 
 def test_empty_content_with_reasoning_but_no_tool_call_is_nonproductive() -> None:

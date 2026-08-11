@@ -48,7 +48,10 @@ class ModelProgressError(RuntimeError):
 
 def _model_response_failure(completion: ModelCompletion) -> str | None:
     if completion.finish_reason == "length":
-        detail = "model response truncated at the output limit"
+        detail = (
+            "model response was truncated before a complete tool call; "
+            "be brief and split large file writes across multiple tool calls"
+        )
     elif not completion.content.strip() and not completion.tool_calls:
         detail = "model response had no visible content"
     else:
@@ -930,10 +933,12 @@ class DockerSandboxDispatcher:
                 text(
                     "INSERT INTO worker_model_calls "
                     "(run_id, task_id, iteration, route, model, prompt_tokens, "
-                    "completion_tokens, total_tokens, cost_usd, finish_reason, "
+                    "completion_tokens, total_tokens, reasoning_tokens, cost_usd, "
+                    "finish_reason, "
                     "message_fields) VALUES "
                     "(:run_id, :task_id, :iteration, :route, :model, :prompt_tokens, "
-                    ":completion_tokens, :total_tokens, :cost_usd, :finish_reason, "
+                    ":completion_tokens, :total_tokens, :reasoning_tokens, :cost_usd, "
+                    ":finish_reason, "
                     "CAST(:message_fields AS jsonb)) RETURNING id"
                 ),
                 {
@@ -942,6 +947,7 @@ class DockerSandboxDispatcher:
                     "prompt_tokens": completion.prompt_tokens,
                     "completion_tokens": completion.completion_tokens,
                     "total_tokens": completion.total_tokens,
+                    "reasoning_tokens": completion.reasoning_tokens,
                     "cost_usd": completion.cost_usd,
                     "finish_reason": completion.finish_reason,
                     "message_fields": json.dumps(completion.message_fields),
@@ -1708,7 +1714,7 @@ class WorkerRunManager:
             model_calls = await session.execute(
                 text(
                     "SELECT id, task_id, iteration, route, model, prompt_tokens, "
-                    "completion_tokens, total_tokens, cost_usd, created_at "
+                    "completion_tokens, total_tokens, reasoning_tokens, cost_usd, created_at "
                     "FROM worker_model_calls WHERE run_id = :run_id ORDER BY id"
                 ),
                 {"run_id": run_id},
@@ -1721,6 +1727,9 @@ class WorkerRunManager:
                 "artifacts": [dict(row._mapping) for row in artifacts],
                 "model_calls": model_call_rows,
                 "token_totals": sum(int(row["total_tokens"]) for row in model_call_rows),
+                "reasoning_token_totals": sum(
+                    int(row["reasoning_tokens"]) for row in model_call_rows
+                ),
                 "cost_total_usd": sum(float(row["cost_usd"]) for row in model_call_rows),
             }
 
