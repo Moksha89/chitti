@@ -17,7 +17,6 @@ from .previews import (
     manifest_from_json,
     preview_id,
     remove_preview,
-    validate_result_binding,
 )
 from .provider import FakeProvider, LiteLLMProvider
 from .settings import Settings, get_settings
@@ -122,18 +121,12 @@ async def trim_payloads(database: Database) -> None:
 async def publish_approved_previews(database: Database, settings: Settings) -> None:
     preview_root = Path(str(settings.preview_root))
     preview_root.mkdir(parents=True, exist_ok=True)
-    staging_root = preview_root / "staging"
-    staging_root.mkdir(parents=True, exist_ok=True)
+    await _evict_expired_preview_directories(database, preview_root)
     async with database.sessions() as session:
         rows = await session.execute(
             text(
-                "SELECT a.id AS approval_id, a.run_id, a.manifest_id, "
-                "a.revision_content_hash, a.reviewer_artifact_id, a.reviewer_sha256, "
-                "a.diff_artifact_id, a.diff_sha256, a.manifest_digest, "
-                "m.revision_content_hash AS manifest_revision_content_hash, "
-                "m.manifest, m.digest, m.staging_path, m.total_bytes, m.file_count "
-                "FROM promotion_approvals a JOIN export_manifests m "
-                "ON m.id = a.manifest_id "
+                "SELECT a.id AS approval_id, a.run_id "
+                "FROM promotion_approvals a "
                 "LEFT JOIN previews p ON p.run_id = a.run_id "
                 "WHERE a.decision = 'approved' AND p.run_id IS NULL"
             )
@@ -148,83 +141,151 @@ async def publish_approved_previews(database: Database, settings: Settings) -> N
         totals = existing.mappings().one()
         total_bytes = int(totals["total"])
         preview_count = int(totals["count"])
-        for row in approvals:
-            if preview_count >= int(settings.preview_max_count):
-                continue
-            manifest = manifest_from_json(row["manifest"], str(row["digest"]))
-            if not validate_result_binding(
-                revision_hash=str(row["revision_content_hash"]),
-                manifest_revision_hash=str(row["manifest_revision_content_hash"]),
-                approval_manifest_digest=str(row["manifest_digest"]),
-                manifest_digest=manifest.digest,
-                approval_reviewer_sha256=str(row["reviewer_sha256"]),
-                reviewer_sha256=str(row["reviewer_sha256"]),
-                approval_diff_sha256=str(row["diff_sha256"]),
-                diff_sha256=str(row["diff_sha256"]),
-            ) or (
-                manifest.total_bytes != int(row["total_bytes"])
-                or len(manifest.entries) != int(row["file_count"])
-            ):
-                raise RuntimeError("preview approval binding failed")
-            if total_bytes + manifest.total_bytes > int(settings.preview_max_bytes):
-                continue
-            reviewer = await session.execute(
-                text(
-                    "SELECT sha256 FROM worker_artifacts "
-                    "WHERE id = :id AND run_id = :run_id"
-                ),
-                {"id": row["reviewer_artifact_id"], "run_id": row["run_id"]},
+    for row in approvals:
+        try:
+            size = await _publish_one_preview(
+                database, settings, preview_root, cast(Mapping[str, object], row)
             )
-            diff = await session.execute(
-                text(
-                    "SELECT sha256 FROM worker_artifacts "
-                    "WHERE id = :id AND run_id = :run_id"
-                ),
-                {"id": row["diff_artifact_id"], "run_id": row["run_id"]},
+        except PreviewBlockedError as exc:
+            await _record_preview_event(
+                database, int(cast(int, row["run_id"])), "preview_blocked", str(exc)
             )
-            if (
-                reviewer.scalar_one_or_none() != row["reviewer_sha256"]
-                or diff.scalar_one_or_none() != row["diff_sha256"]
-            ):
-                raise RuntimeError("preview evidence substitution detected")
-            staging = Path(str(row["staging_path"]))
-            if not staging.is_dir():
-                raise RuntimeError("approved preview staging output is missing")
-            current = await asyncio.to_thread(build_manifest, staging)
-            if current.digest != manifest.digest:
-                raise RuntimeError("preview export changed after approval")
-            identifier = preview_id()
-            destination = preview_root / identifier
-            try:
-                await asyncio.to_thread(copy_export, staging, destination)
-                expires_at = datetime.now(UTC) + timedelta(
-                    hours=int(settings.preview_ttl_hours)
-                )
-                await session.execute(
-                    text(
-                        "INSERT INTO previews "
-                        "(preview_id, expires_at, run_id, manifest_id, approval_id, "
-                        "total_bytes, file_count) VALUES "
-                        "(:preview_id, :expires_at, :run_id, :manifest_id, "
-                        ":approval_id, :total_bytes, :file_count)"
-                    ),
-                    {
-                        "preview_id": identifier,
-                        "expires_at": expires_at,
-                        "run_id": row["run_id"],
-                        "manifest_id": row["manifest_id"],
-                        "approval_id": row["approval_id"],
-                        "total_bytes": manifest.total_bytes,
-                        "file_count": len(manifest.entries),
-                    },
-                )
-                await session.commit()
-                await asyncio.to_thread(remove_preview, staging)
-                total_bytes += manifest.total_bytes
-                preview_count += 1
-            except Exception:
-                await asyncio.to_thread(remove_preview, destination)
-                raise
+        except Exception as exc:
+            await _record_preview_event(
+                database,
+                int(cast(int, row["run_id"])),
+                "preview_failed",
+                str(exc)[:2000],
+            )
+        else:
+            total_bytes += size
+            preview_count += 1
+
+
+class PreviewBlockedError(RuntimeError):
+    pass
+
+
+async def _record_preview_event(
+    database: Database, run_id: int, status: str, detail: str
+) -> None:
+    try:
+        await record_event(database, run_id, status, detail[:2000])
+    except Exception:
+        logger.exception("could not record preview event for run %s", run_id)
+
+
+async def _evict_expired_preview_directories(database: Database, preview_root: Path) -> None:
+    async with database.sessions() as session:
+        result = await session.execute(
+            text("SELECT preview_id FROM previews WHERE expires_at <= now()")
+        )
+        expired = [str(row.preview_id) for row in result]
+    for identifier in expired:
+        await asyncio.to_thread(remove_preview, preview_root / identifier)
+
+
+async def _publish_one_preview(
+    database: Database,
+    settings: Settings,
+    preview_root: Path,
+    approval: Mapping[str, object],
+) -> int:
+    async with database.sessions() as session:
+        result = await session.execute(
+            text(
+                "SELECT a.id AS approval_id, a.run_id, a.manifest_id, "
+                "a.revision_content_hash, a.reviewer_artifact_id, a.reviewer_sha256, "
+                "a.diff_artifact_id, a.diff_sha256, a.manifest_digest, "
+                "m.revision_content_hash AS manifest_revision_content_hash, "
+                "m.manifest, m.digest, m.staging_path, m.total_bytes, m.file_count "
+                "FROM promotion_approvals a JOIN export_manifests m "
+                "ON m.id = a.manifest_id WHERE a.id = :approval_id"
+            ),
+            {"approval_id": int(cast(int, approval["approval_id"]))},
+        )
+        row = result.mappings().one()
+        existing = await session.execute(
+            text(
+                "SELECT COALESCE(SUM(total_bytes), 0) AS total, COUNT(*) AS count "
+                "FROM previews WHERE expires_at > now()"
+            )
+        )
+        totals = existing.mappings().one()
+        total_bytes = int(totals["total"])
+        preview_count = int(totals["count"])
+        manifest = manifest_from_json(row["manifest"], str(row["digest"]))
+        if (
+            str(row["revision_content_hash"])
+            != str(row["manifest_revision_content_hash"])
+            or str(row["manifest_digest"]) != manifest.digest
+            or manifest.total_bytes != int(row["total_bytes"])
+            or len(manifest.entries) != int(row["file_count"])
+        ):
+            raise RuntimeError("preview approval binding failed")
+        if preview_count >= int(settings.preview_max_count):
+            raise PreviewBlockedError("preview count quota exhausted")
+        if total_bytes + manifest.total_bytes > int(settings.preview_max_bytes):
+            raise PreviewBlockedError("preview size quota exhausted")
+        reviewer = await session.execute(
+            text(
+                "SELECT sha256 FROM worker_artifacts "
+                "WHERE id = :id AND run_id = :run_id"
+            ),
+            {"id": row["reviewer_artifact_id"], "run_id": row["run_id"]},
+        )
+        diff = await session.execute(
+            text(
+                "SELECT sha256 FROM worker_artifacts "
+                "WHERE id = :id AND run_id = :run_id"
+            ),
+            {"id": row["diff_artifact_id"], "run_id": row["run_id"]},
+        )
+        if (
+            reviewer.scalar_one_or_none() != row["reviewer_sha256"]
+            or diff.scalar_one_or_none() != row["diff_sha256"]
+        ):
+            raise RuntimeError("preview evidence substitution detected")
+        staging = Path(str(row["staging_path"]))
+        if not staging.is_dir():
+            raise RuntimeError("approved preview staging output is missing")
+        current = await asyncio.to_thread(build_manifest, staging)
+        if current.digest != manifest.digest:
+            raise RuntimeError("preview export changed after approval")
+        identifier = preview_id()
+        destination = preview_root / identifier
+        try:
+            landed = await asyncio.to_thread(copy_export, staging, destination)
+            if landed != manifest:
+                raise RuntimeError("preview export changed while publishing")
+            expires_at = datetime.now(UTC) + timedelta(
+                hours=int(settings.preview_ttl_hours)
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO previews "
+                    "(preview_id, expires_at, run_id, manifest_id, approval_id, "
+                    "total_bytes, file_count) VALUES "
+                    "(:preview_id, :expires_at, :run_id, :manifest_id, "
+                    ":approval_id, :total_bytes, :file_count)"
+                ),
+                {
+                    "preview_id": identifier,
+                    "expires_at": expires_at,
+                    "run_id": row["run_id"],
+                    "manifest_id": row["manifest_id"],
+                    "approval_id": row["approval_id"],
+                    "total_bytes": landed.total_bytes,
+                    "file_count": len(landed.entries),
+                },
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            await asyncio.to_thread(remove_preview, destination)
+            raise
+    await asyncio.to_thread(remove_preview, staging)
+    return manifest.total_bytes
 
 
 async def execute_run(
