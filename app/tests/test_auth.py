@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from chitti.auth import AuthManager
 from chitti.main import app
+from chitti.web_security import safe_next_path
 
 
 def make_auth(tmp_path):
@@ -14,6 +15,12 @@ def make_auth(tmp_path):
     auth.initialize()
     app.state.auth = auth
     return auth, password
+
+
+def test_safe_next_path_rejects_protocol_relative_backslashes() -> None:
+    assert safe_next_path("/workspace") == "/workspace"
+    assert safe_next_path("/\\evil.com") == "/"
+    assert safe_next_path("//evil.com") == "/"
 
 
 def test_login_forces_first_password_change_and_rejects_csrf(tmp_path) -> None:
