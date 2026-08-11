@@ -14,7 +14,7 @@ test("landing page contains an authored interactive scene", () => {
     assert.doesNotMatch(page, /Ideas with a little more dimension\./);
     assert.doesNotMatch(
       page,
-      /A deterministic Next\.js landing page fixture with a live React Three Fiber scene, ready for a safe build\./,
+      /A deterministic Next\.js landing page fixture with a live React Three\s+Fiber scene,\s+ready for a safe build\./,
     );
     assert.doesNotMatch(page, /CHITTI \/ MOTION LAB/);
   }
