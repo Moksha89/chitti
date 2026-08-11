@@ -489,7 +489,7 @@ class DockerSandboxDispatcher:
                         "run_id": run_id,
                         "revision_id": revision.id,
                         "revision_hash": revision.content_hash,
-                        REVIEWER_ROUTE: int(reviewer["id"]),
+                        "reviewer": int(reviewer["id"]),
                         "diff": int(diff["id"]),
                         "manifest": json.dumps(manifest.as_json()),
                         "digest": manifest.digest,

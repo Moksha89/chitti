@@ -118,11 +118,9 @@ runner_image="chitti-chitti:latest"
 docker compose up -d --build --force-recreate litellm
 docker compose ps
 
-required_gateway_routes="$(
-  docker run --rm --entrypoint python "${runner_image}" -c \
-    'from chitti.provider import REQUIRED_GATEWAY_ROUTES
-print("\n".join(sorted(REQUIRED_GATEWAY_ROUTES)))'
-)"
+litellm_container="$(docker compose ps -q litellm)"
+[[ -n "${litellm_container}" ]]
+docker exec "${litellm_container}" test -s /app/litellm/config.yaml
 gateway_models="$(
   curl --fail --silent --show-error --max-time 15 \
     -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
@@ -147,10 +145,18 @@ if [[ -n "${missing_gateway_routes}" ]]; then
   echo "gateway loaded-route assertion failed; missing: ${missing_gateway_routes}" >&2
   exit 1
 fi
-while IFS= read -r route; do
-  [[ -n "${route}" ]]
-done <<<"${required_gateway_routes}"
 echo "Gateway loaded-route assertions passed."
+
+caddy_container="$(docker compose ps -q caddy)"
+[[ -n "${caddy_container}" ]]
+caddy_loaded_config="$(
+  docker exec "${caddy_container}" \
+    wget -qO- http://127.0.0.1:2019/config/
+)"
+printf '%s' "${caddy_loaded_config}" | grep -q '"apps"'
+curl --fail --silent --show-error --max-time 15 \
+  "https://${DOMAIN:-localhost}/login" >/dev/null
+echo "Caddy loaded configuration and served the login page."
 
 if [[ ! -x "${RUNNER_PYTHON}" ]]; then
   if ! python3 -m venv "${RUNNER_VENV_DIR}"; then
