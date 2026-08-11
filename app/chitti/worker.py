@@ -834,10 +834,12 @@ class DockerSandboxDispatcher:
                 )
             raise RuntimeError(f"workspace mount remains active: {workspace}{detail}")
         if unmount_result is not None and unmount_result.returncode != 0:
-            raise RuntimeError(
-                f"workspace unmount failed: {workspace} "
-                f"(exit={unmount_result.returncode}, "
-                f"stderr={unmount_result.stderr.strip()!r})"
+            logger.warning(
+                "workspace unmount reported exit=%s stderr=%r, "
+                "but the mount is gone: %s",
+                unmount_result.returncode,
+                unmount_result.stderr.strip(),
+                workspace,
             )
 
         loops = await asyncio.to_thread(self._workspace_loops, image)
@@ -860,10 +862,6 @@ class DockerSandboxDispatcher:
         for _ in range(20):
             remaining = await asyncio.to_thread(self._workspace_loops, image)
             if not remaining:
-                if detach_failures:
-                    raise RuntimeError(
-                        f"workspace loop detach failed: {'; '.join(detach_failures)}"
-                    )
                 return
             await asyncio.sleep(0.1)
         detail = f"; detach errors={'; '.join(detach_failures)}" if detach_failures else ""

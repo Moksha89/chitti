@@ -133,6 +133,45 @@ def test_unmount_surfaces_status_and_stderr(monkeypatch, tmp_path) -> None:
     assert commands[0][3:5] == ["umount", str(workspace)]
 
 
+def test_already_detached_loop_is_cleanup_success(monkeypatch, tmp_path) -> None:
+    dispatcher = DockerSandboxDispatcher(None)  # type: ignore[arg-type]
+    workspace = tmp_path / "chitti-run-1"
+    mounted = iter(["/dev/loop0", None])
+    loops = iter([("/dev/loop0",), ()])
+    monkeypatch.setattr(dispatcher, "_mounted_source", lambda _workspace: next(mounted))
+    monkeypatch.setattr(dispatcher, "_workspace_loops", lambda _image: next(loops))
+
+    def run(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 1, "", "No such device or address")
+
+    monkeypatch.setattr("chitti.worker.subprocess.run", run)
+    asyncio.run(dispatcher._unmount_workspace(workspace))
+
+
+def test_surviving_loop_keeps_cleanup_failed_with_diagnostics(
+    monkeypatch, tmp_path
+) -> None:
+    dispatcher = DockerSandboxDispatcher(None)  # type: ignore[arg-type]
+    workspace = tmp_path / "chitti-run-1"
+    mounted = iter(["/dev/loop0", None])
+    monkeypatch.setattr(dispatcher, "_mounted_source", lambda _workspace: next(mounted))
+    monkeypatch.setattr(
+        dispatcher, "_workspace_loops", lambda _image: ("/dev/loop0",)
+    )
+
+    async def no_sleep(_seconds) -> None:
+        return None
+
+    monkeypatch.setattr("chitti.worker.asyncio.sleep", no_sleep)
+
+    def run(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 1, "", "device is busy")
+
+    monkeypatch.setattr("chitti.worker.subprocess.run", run)
+    with pytest.raises(RuntimeError, match="device is busy"):
+        asyncio.run(dispatcher._unmount_workspace(workspace))
+
+
 def test_output_reader_stops_at_budget_without_buffering_unbounded_output() -> None:
     async def exercise() -> tuple[str, bool]:
         dispatcher = DockerSandboxDispatcher(None)  # type: ignore[arg-type]
