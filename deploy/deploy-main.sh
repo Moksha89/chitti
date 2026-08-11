@@ -6,45 +6,76 @@ REMOTE_BRANCH="${REMOTE_BRANCH:-main}"
 REPOSITORY_URL="${REPOSITORY_URL:-https://github.com/Moksha89/chitti.git}"
 RUNNER_ENV="${RUNNER_ENV:-/etc/chitti/worker-runner.env}"
 RUNNER_UNIT="chitti-worker-runner.service"
-fresh_checkout=0
-
-if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
-  if [[ ! -f "${INSTALL_DIR}/.env" ]]; then
-    echo "Missing application checkout and .env: ${INSTALL_DIR}" >&2
-    exit 1
-  fi
-  git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" init --quiet
-  git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" remote add origin "${REPOSITORY_URL}"
-  git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" add -A
-  fresh_checkout=1
-fi
-if ! git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" remote get-url origin >/dev/null 2>&1; then
-  git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" remote add origin "${REPOSITORY_URL}"
-  git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" add -A
-  fresh_checkout=1
+fresh_clone=0
+real_checkout=0
+if [[ -e "${INSTALL_DIR}/.git" ]] &&
+  git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" rev-parse --verify HEAD >/dev/null 2>&1; then
+  real_checkout=1
 fi
 
-cd "${INSTALL_DIR}"
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
-  printf '%s\n' \
-    "Would update ${INSTALL_DIR} to origin/${REMOTE_BRANCH}" \
-    "Would apply migrations through the normal chitti startup path" \
-    "Would build chitti-sandbox:latest" \
-    "Would install and enable ${RUNNER_UNIT}" \
-    "Would create or verify the runner-only database role" \
-    "Would verify schema, privileges, and container network boundaries"
+  if [[ "${real_checkout}" -eq 1 ]]; then
+    printf '%s\n' \
+      "Would update ${INSTALL_DIR} to origin/${REMOTE_BRANCH}" \
+      "Would apply migrations through the normal chitti startup path" \
+      "Would build chitti-sandbox:latest" \
+      "Would install and enable ${RUNNER_UNIT}" \
+      "Would create or verify the runner-only database role" \
+      "Would verify schema, privileges, and container network boundaries"
+  else
+    printf '%s\n' \
+      "Would clone origin/${REMOTE_BRANCH} into ${INSTALL_DIR}" \
+      "Would retain the existing tree as a dated rollback directory" \
+      "Would carry forward .env and projects content without printing .env" \
+      "Would apply migrations through the normal chitti startup path" \
+      "Would build chitti-sandbox:latest" \
+      "Would install and enable ${RUNNER_UNIT}" \
+      "Would create or verify the runner-only database role" \
+      "Would verify schema, privileges, and container network boundaries"
+  fi
   exit 0
-fi
-
-if [[ "${fresh_checkout}" -eq 0 ]] &&
-  [[ -n "$(git -c safe.directory="${INSTALL_DIR}" diff --stat)" ||
-    -n "$(git -c safe.directory="${INSTALL_DIR}" diff --cached --stat)" ]]; then
-  echo "Application checkout has local changes; refusing to overwrite them." >&2
-  exit 1
 fi
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this deployment as root." >&2
+  exit 1
+fi
+
+if [[ "${real_checkout}" -eq 0 ]]; then
+  if [[ ! -f "${INSTALL_DIR}/.env" ]]; then
+    echo "Missing application artifact or .env: ${INSTALL_DIR}" >&2
+    exit 1
+  fi
+  rollback_dir="${INSTALL_DIR%/*}/$(basename "${INSTALL_DIR}")-rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+  if [[ -e "${rollback_dir}" ]]; then
+    echo "Rollback directory already exists: ${rollback_dir}" >&2
+    exit 1
+  fi
+  clone_dir="${INSTALL_DIR%/*}/$(basename "${INSTALL_DIR}")-new-$(date -u +%Y%m%dT%H%M%SZ)"
+  if [[ -e "${clone_dir}" ]]; then
+    echo "Clone staging directory already exists: ${clone_dir}" >&2
+    exit 1
+  fi
+  git clone --quiet --branch "${REMOTE_BRANCH}" "${REPOSITORY_URL}" "${clone_dir}"
+  mv "${INSTALL_DIR}" "${rollback_dir}"
+  mv "${clone_dir}" "${INSTALL_DIR}"
+  install -o root -g root -m 0600 "${rollback_dir}/.env" "${INSTALL_DIR}/.env"
+  install -d -o root -g root -m 0755 "${INSTALL_DIR}/projects"
+  if [[ -d "${rollback_dir}/projects" ]]; then
+    cp -a "${rollback_dir}/projects/." "${INSTALL_DIR}/projects/"
+  fi
+  rm -rf "${rollback_dir}/.git"
+  rm -f \
+    "${rollback_dir}/deploy/worker-runner/runner-role.sql" \
+    "${rollback_dir}/deploy/worker-runner/chitti-worker-runner.service"
+  fresh_clone=1
+fi
+
+cd "${INSTALL_DIR}"
+if [[ "${fresh_clone}" -eq 0 ]] &&
+  [[ -n "$(git -c safe.directory="${INSTALL_DIR}" diff --stat)" ||
+    -n "$(git -c safe.directory="${INSTALL_DIR}" diff --cached --stat)" ]]; then
+  echo "Application checkout has local changes; refusing to overwrite them." >&2
   exit 1
 fi
 
@@ -59,10 +90,6 @@ source .env
 set +a
 
 git -c safe.directory="${INSTALL_DIR}" fetch --quiet origin "${REMOTE_BRANCH}"
-if [[ -n "$(git -c safe.directory="${INSTALL_DIR}" diff --cached --stat "origin/${REMOTE_BRANCH}" --)" ]]; then
-  echo "Application checkout has local changes; refusing to overwrite them." >&2
-  exit 1
-fi
 git -c safe.directory="${INSTALL_DIR}" checkout --quiet --detach "origin/${REMOTE_BRANCH}"
 
 docker compose up -d --build
