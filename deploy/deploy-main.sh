@@ -296,20 +296,19 @@ print(heads[0])
 '
 )"
 
+live_migration="$(
+  docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -At \
+    -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+    -c "SELECT version_num FROM alembic_version"
+)"
+if [[ "${live_migration}" != "${expected_migration}" ]]; then
+  echo \
+    "database migration mismatch: live ${live_migration:-<empty>}, " \
+    "expected ${expected_migration}" >&2
+  exit 1
+fi
 docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
-  -v "expected_migration=${expected_migration}" \
   -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<'SQL' >/dev/null
-DO $$
-DECLARE
-  expected text := :'expected_migration';
-  actual text;
-BEGIN
-  SELECT version_num INTO actual FROM alembic_version;
-  IF actual IS DISTINCT FROM expected THEN
-    RAISE EXCEPTION 'database migration mismatch: live %, expected %', actual, expected;
-  END IF;
-END
-$$;
 DO $$
 DECLARE
   required_table text;
@@ -395,6 +394,15 @@ async def main():
             raise SystemExit(f"runner lacks {privilege} on {table}")
 
     async def require_sequence_privilege(table):
+        has_id = await conn.fetchval(
+            "SELECT EXISTS ("
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = $$public$$ AND table_name = $1 "
+            "AND column_name = $$id$$"
+            ")", table
+        )
+        if not has_id:
+            return
         sequence = await conn.fetchval(
             "SELECT pg_get_serial_sequence($1, $$id$$)", table
         )
