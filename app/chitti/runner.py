@@ -28,6 +28,16 @@ from .worker import (
 
 logger = logging.getLogger("chitti.worker_runner")
 POLL_SECONDS = 2
+PREVIEW_APPROVAL_BINDING_FAILURE = "preview approval binding failed"
+PREVIEW_EVIDENCE_SUBSTITUTION = "preview evidence substitution detected"
+PREVIEW_STAGING_MISSING = "approved preview staging output is missing"
+TERMINAL_PREVIEW_FAILURES = frozenset(
+    {
+        PREVIEW_APPROVAL_BINDING_FAILURE,
+        PREVIEW_EVIDENCE_SUBSTITUTION,
+        PREVIEW_STAGING_MISSING,
+    }
+)
 
 
 async def next_queued_run(database: Database) -> Mapping[str, object] | None:
@@ -165,11 +175,7 @@ class PreviewBlockedError(RuntimeError):
 def _promotion_failure_is_terminal(status: object, detail: object) -> bool:
     if status != "preview_failed":
         return False
-    return str(detail) in {
-        "preview approval binding failed",
-        "preview evidence substitution detected",
-        "approved preview staging output is missing",
-    }
+    return str(detail) in TERMINAL_PREVIEW_FAILURES
 
 
 async def _record_preview_event(
@@ -253,7 +259,7 @@ async def _publish_one_preview(
             or manifest.total_bytes != int(row["total_bytes"])
             or len(manifest.entries) != int(row["file_count"])
         ):
-            raise RuntimeError("preview approval binding failed")
+            raise RuntimeError(PREVIEW_APPROVAL_BINDING_FAILURE)
         if preview_count >= int(settings.preview_max_count):
             raise PreviewBlockedError("preview count quota exhausted")
         if total_bytes + manifest.total_bytes > int(settings.preview_max_bytes):
@@ -276,10 +282,10 @@ async def _publish_one_preview(
             reviewer.scalar_one_or_none() != row["reviewer_sha256"]
             or diff.scalar_one_or_none() != row["diff_sha256"]
         ):
-            raise RuntimeError("preview evidence substitution detected")
+            raise RuntimeError(PREVIEW_EVIDENCE_SUBSTITUTION)
         staging = Path(str(row["staging_path"]))
         if not staging.is_dir():
-            raise RuntimeError("approved preview staging output is missing")
+            raise RuntimeError(PREVIEW_STAGING_MISSING)
         current = await asyncio.to_thread(build_manifest, staging)
         if current.digest != manifest.digest:
             raise RuntimeError("preview export changed after approval")

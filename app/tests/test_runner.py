@@ -62,10 +62,10 @@ class _EventSession:
             latest = self.database.events[-1] if self.database.events else None
             return _Result(one=latest)
         self.database.events.append(
-            (
-                parameters["status"],
-                parameters["detail"],
-            )
+            {
+                "status": parameters["status"],
+                "detail": parameters["detail"],
+            }
         )
         return _Result()
 
@@ -160,5 +160,8 @@ def test_preview_failure_event_is_not_duplicated() -> None:
     )
 
     assert database.events == [
-        ("preview_failed", "approved preview staging output is missing")
+        {
+            "status": "preview_failed",
+            "detail": "approved preview staging output is missing",
+        }
     ]
