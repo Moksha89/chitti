@@ -7,6 +7,8 @@ the runner-only database URL:
 
 ```text
 DATABASE_URL=postgresql+asyncpg://chitti_runner:<secret>@127.0.0.1:5432/chitti
+LITELLM_BASE_URL=http://127.0.0.1:4000
+LITELLM_MASTER_KEY=<from the application environment>
 ```
 
 ## Repeatable deployment
@@ -119,6 +121,12 @@ immutable `worker_runs.limits` JSON:
   cost of one run; daily route caps are an additional bad-day guard.
 
 Only the host runner constructs model prompts and holds the LiteLLM credential.
+The runner uses the existing gateway credential because the deployed LiteLLM
+configuration budgets the `coder` and `reviewer` routes, plus global and
+provider limits; it does not configure separate virtual-key budgets. The
+deployment refreshes the root-only runner copy whenever the application
+credential changes. The runner must use the host-loopback URL above, not the
+compose-only `litellm` hostname.
 The worker receives structured fixed tools, never a model key or arbitrary
 argv. Model prompts and responses are bounded append-only artifacts, with
 token/cost metadata in `worker_model_calls`; reviewer output is stored as a
@@ -126,3 +134,8 @@ separate artifact. Older exploratory turns are compacted while the stable
 prompt prefix, task contract, recent turns, and build/test feedback remain;
 each compaction is recorded as a run event. Approval remains evidence review
 only: this slice does not publish, merge, or deploy sandbox output.
+
+Plan approval records preserve the optional reason text and display it in the
+plan view. That reason is the only attribution available; the schema does not
+record a separate approver identity, so a blank reason is not evidence of an
+owner click.

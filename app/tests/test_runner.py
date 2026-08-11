@@ -6,6 +6,7 @@ import pytest
 
 from chitti import runner
 from chitti.previews import build_manifest, copy_export
+from chitti.provider import GatewayMisconfigurationError, GatewayTransientError
 
 
 class _Result:
@@ -24,6 +25,76 @@ class _Result:
 
     def __iter__(self):
         return iter(self._rows or [])
+
+
+def test_run_refuses_gateway_misconfiguration_before_workspace(monkeypatch) -> None:
+    dispatched = False
+    events: list[str] = []
+
+    class Provider:
+        async def validate_gateway(self) -> None:
+            raise GatewayMisconfigurationError("gateway routes unavailable: reviewer")
+
+    class Dispatcher:
+        async def dispatch(self, *_args) -> None:
+            nonlocal dispatched
+            dispatched = True
+
+    async def record_event(_database, _run_id, status, detail) -> None:
+        events.append(f"{status}: {detail}")
+
+    async def trim_payloads(_database) -> None:
+        return
+
+    monkeypatch.setattr("chitti.runner.record_event", record_event)
+    monkeypatch.setattr("chitti.runner.trim_payloads", trim_payloads)
+    asyncio.run(
+        runner.execute_run(
+            None,  # type: ignore[arg-type]
+            Dispatcher(),  # type: ignore[arg-type]
+            {"id": 1, "revision_id": 1, "limits": runner.WorkerLimits().as_json()},
+            Provider(),  # type: ignore[arg-type]
+        )
+    )
+
+    assert dispatched is False
+    assert events == ["failed: gateway misconfiguration: gateway routes unavailable: reviewer"]
+
+
+def test_run_distinguishes_transient_gateway_failure_before_workspace(monkeypatch) -> None:
+    dispatched = False
+    events: list[str] = []
+
+    class Provider:
+        async def validate_gateway(self) -> None:
+            raise GatewayTransientError("gateway did not respond during preflight")
+
+    class Dispatcher:
+        async def dispatch(self, *_args) -> None:
+            nonlocal dispatched
+            dispatched = True
+
+    async def record_event(_database, _run_id, status, detail) -> None:
+        events.append(f"{status}: {detail}")
+
+    async def trim_payloads(_database) -> None:
+        return
+
+    monkeypatch.setattr("chitti.runner.record_event", record_event)
+    monkeypatch.setattr("chitti.runner.trim_payloads", trim_payloads)
+    asyncio.run(
+        runner.execute_run(
+            None,  # type: ignore[arg-type]
+            Dispatcher(),  # type: ignore[arg-type]
+            {"id": 1, "revision_id": 1, "limits": runner.WorkerLimits().as_json()},
+            Provider(),  # type: ignore[arg-type]
+        )
+    )
+
+    assert dispatched is False
+    assert events == [
+        "failed: gateway temporarily unavailable: gateway did not respond during preflight"
+    ]
 
 
 class _Session:
