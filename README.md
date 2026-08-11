@@ -6,18 +6,20 @@ The provider and project-state interfaces leave seams for those later phases.
 
 ## Model and embedding decisions
 
-LiteLLM is the only model gateway. The Z.AI GLM Coding Plan documentation
-specifies the OpenAI-compatible base URL
-`https://api.z.ai/api/coding/paas/v4` and model `glm-5.2`:
+LiteLLM is the only model gateway. Chitti uses the regular, metered Z.AI API
+by default, with `https://api.z.ai/api/paas/v4` and model `glm-5.2`:
 
-- [Z.AI GLM Coding Plan quick start](https://docs.z.ai/devpack/quick-start)
+- [Z.AI API endpoint reference](https://docs.z.ai/api-reference/introduction)
+- [Z.AI model pricing](https://docs.z.ai/guides/overview/pricing)
 - [Z.AI GLM-5.2 model selection](https://docs.z.ai/devpack/latest-model)
 - [Z.AI chat completion reference](https://docs.z.ai/api-reference/llm/chat-completion)
 
-The Anthropic-compatible endpoint is `https://api.z.ai/api/anthropic`, but
-Chitti uses LiteLLM's OpenAI-compatible gateway, so the coding endpoint is
-configured. Z.AI says Coding Plan access is restricted to officially supported
-tools/products; verify the intended account entitlement before production use.
+`GLM_API_BASE` and `GLM_MODEL` remain configurable through the server-side
+`.env`. `GLM_CODING_API_KEY` is retained as the existing secret variable name
+for compatibility, but the key must have regular Z.AI platform API entitlement;
+do not point it at the Coding Plan endpoint. The `chitti-chat`, `planner`, and
+`coder` aliases share the same GLM deployment and retain their per-role and
+global daily budget caps in `litellm/config.yaml`.
 
 DeepSeek is configured with `https://api.deepseek.com` and the documented
 OpenAI-compatible model name `deepseek-v4-flash` as the bulk fallback. The role
@@ -42,6 +44,15 @@ LiteLLM is pinned to `ghcr.io/berriai/litellm:v1.80.0-stable.1`. The config
 uses the current `model_list`, `litellm_settings`, `router_settings`, and
 `general_settings` schema. Request logs go to stdout; a daily provider budget
 and per-deployment budget are configured in `litellm/config.yaml`.
+
+LiteLLM also uses Redis for **exact response caching only**. Redis is an
+internal Compose service with a required password and no published host port;
+semantic caching is intentionally disabled because near-match replay is unsafe
+for agentic work. Chitti constructs the stable system instructions and profile
+first, followed by variable semantic recall and the user/history messages, so
+provider-side prefix caching has a stable candidate. Provider cache hits are
+reported by provider usage metadata when available; do not assume every request
+will hit.
 
 ## Run locally
 

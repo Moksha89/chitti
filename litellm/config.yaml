@@ -1,22 +1,22 @@
 model_list:
   - model_name: chitti-chat
     litellm_params:
-      model: openai/glm-5.2
-      api_base: https://api.z.ai/api/coding/paas/v4
+      model: openai/${GLM_MODEL}
+      api_base: ${GLM_API_BASE}
       api_key: os.environ/GLM_CODING_API_KEY
       max_budget: 25
       budget_duration: 1d
   - model_name: planner
     litellm_params:
-      model: openai/glm-5.2
-      api_base: https://api.z.ai/api/coding/paas/v4
+      model: openai/${GLM_MODEL}
+      api_base: ${GLM_API_BASE}
       api_key: os.environ/GLM_CODING_API_KEY
       max_budget: 25
       budget_duration: 1d
   - model_name: coder
     litellm_params:
-      model: openai/glm-5.2
-      api_base: https://api.z.ai/api/coding/paas/v4
+      model: openai/${GLM_MODEL}
+      api_base: ${GLM_API_BASE}
       api_key: os.environ/GLM_CODING_API_KEY
       max_budget: 25
       budget_duration: 1d
@@ -33,6 +33,13 @@ litellm_settings:
   request_timeout: 120
   json_logs: true
   set_verbose: false
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+    password: os.environ/REDIS_PASSWORD
+    namespace: chitti-exact
   success_callback: ["prometheus"]
   failure_callback: ["prometheus"]
   max_budget: 35
