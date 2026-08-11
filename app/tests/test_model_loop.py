@@ -2,12 +2,15 @@ from pathlib import Path
 
 import pytest
 
+from chitti.provider import ModelCompletion
 from chitti.worker import (
     DockerSandboxDispatcher,
     WorkerLimits,
     _bounded_artifact,
     _compact_model_messages,
     _confined_path,
+    _file_write_stall,
+    _model_response_failure,
     _parse_tool_call,
     _task_done_checks,
 )
@@ -66,6 +69,57 @@ def test_model_tool_parser_rejects_malformed_and_unknown_shape() -> None:
         _parse_tool_call('{"arguments": {}}')
     with pytest.raises(ValueError, match="arguments"):
         _parse_tool_call('{"tool": "write_file", "arguments": []}')
+
+
+def test_truncated_model_response_is_reported_distinctly() -> None:
+    completion = ModelCompletion(
+        content="",
+        model="coder",
+        prompt_tokens=10,
+        completion_tokens=8192,
+        total_tokens=8202,
+        cost_usd=0.01,
+        finish_reason="length",
+    )
+    assert _model_response_failure(completion) == (
+        "model response truncated at the output limit"
+    )
+    assert not completion.message_fields
+
+
+def test_empty_content_with_alternate_fields_is_reported() -> None:
+    completion = ModelCompletion(
+        content="",
+        model="coder",
+        prompt_tokens=10,
+        completion_tokens=20,
+        total_tokens=30,
+        cost_usd=0.01,
+        message_fields=("reasoning_content",),
+    )
+    assert _model_response_failure(completion) == (
+        "model response had no visible content; "
+        "alternate message fields present: reasoning_content"
+    )
+
+
+def test_circular_file_rewrites_are_stopped() -> None:
+    assert _file_write_stall("app/page.js", 4, 4) == (
+        "app/page.js was rewritten 4 times without running a command"
+    )
+    assert _file_write_stall("app/page.js", 2, 24) == (
+        "stopped after 24 file writes without running a command"
+    )
+    assert _file_write_stall("app/page.js", 3, 15) is None
+
+
+def test_many_file_scaffold_writes_can_reach_a_command() -> None:
+    for index in range(20):
+        assert _file_write_stall(f"app/file-{index}.js", 1, index + 1) is None
+    assert _file_write_stall("app/file-20.js", 1, 21) is None
+    assert _file_write_stall("app/file-23.js", 1, 24) == (
+        "stopped after 24 file writes without running a command"
+    )
 
 
 def test_model_paths_reject_traversal_and_symlink_escape(tmp_path: Path) -> None:
