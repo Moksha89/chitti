@@ -1,5 +1,6 @@
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
@@ -14,6 +15,7 @@ from chitti.provider import ExtractedMemory
 pytestmark = pytest.mark.skipif(
     not os.getenv("RUN_DB_TESTS"), reason="set RUN_DB_TESTS=1 to run PostgreSQL integration tests"
 )
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
@@ -23,7 +25,7 @@ async def store():
         env = {**os.environ, "DATABASE_URL": url}
         subprocess.run(
             ["python", "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
-            cwd="..",
+            cwd=REPO_ROOT,
             env=env,
             check=True,
         )
