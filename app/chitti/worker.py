@@ -59,6 +59,10 @@ class RunBudgetExceeded(RuntimeError):
         super().__init__(f"{budget} budget exceeded")
 
 
+class RunCancelled(RuntimeError):
+    """The owner cancelled a run while it was executing."""
+
+
 class ModelProgressError(RuntimeError):
     """The model loop stopped because it was not making useful progress."""
 
@@ -380,6 +384,13 @@ class DockerSandboxDispatcher:
         if container:
             await self._remove_container(container)
 
+    def _raise_if_cancelled(self, run_id: int) -> None:
+        if self._is_cancelled(run_id):
+            raise RunCancelled
+
+    def _is_cancelled(self, run_id: int) -> bool:
+        return run_id in self._cancelled
+
     async def dispatch(
         self, revision: PlanRevision, run_id: int, limits: WorkerLimits
     ) -> None:
@@ -395,11 +406,14 @@ class DockerSandboxDispatcher:
         try:
             await self._mount_workspace(workspace, limits)
             await self._event(run_id, "running", "run started")
+            if self._is_cancelled(run_id):
+                await self._event(run_id, "cancelled", "cancelled before operation")
+                return
             if self.model_provider is not None:
                 await self._dispatch_model_one(revision, run_id, limits, workspace)
                 return
             for index, operation in enumerate(fixed_operations(revision)):
-                if run_id in self._cancelled:
+                if self._is_cancelled(run_id):
                     await self._event(run_id, "cancelled", "cancelled before operation")
                     return
                 await self._event(
@@ -421,7 +435,7 @@ class DockerSandboxDispatcher:
                     )
                     await self._event(run_id, "failed", "worker exceeded wall-clock timeout")
                     return
-                if run_id in self._cancelled:
+                if self._is_cancelled(run_id):
                     await self._event(run_id, "cancelled", "worker stopped by cancellation")
                     return
                 if result.returncode == 137:
@@ -476,6 +490,7 @@ class DockerSandboxDispatcher:
             run_id, fixture, 1, "passed", fixture_out, fixture_err,
             fixture_result.returncode, datetime.now(UTC),
         )
+        self._raise_if_cancelled(run_id)
         starter_context = _starter_context(workspace)
         async with self.database.sessions() as session:
             result = await session.execute(
@@ -599,6 +614,7 @@ class DockerSandboxDispatcher:
                         )
 
             for iteration in range(1, limits.model_iterations + 1):
+                self._raise_if_cancelled(run_id)
                 if time.monotonic() - started > limits.run_timeout_seconds:
                     raise RunBudgetExceeded("model run wall-clock")
                 _replace_model_progress_status(
@@ -618,6 +634,8 @@ class DockerSandboxDispatcher:
                         tool_choice="required" if route == CODER_ROUTE else None,
                     )
                 except Exception as exc:
+                    if self._is_cancelled(run_id):
+                        raise RunCancelled from exc
                     detail = _model_call_failure_detail(route, exc)
                     failure = ModelCompletion(
                         content=detail[:1000],
@@ -645,6 +663,7 @@ class DockerSandboxDispatcher:
                     run_id, task.id, iteration, route, completion,
                     prompt=json.dumps(messages, separators=(",", ":")),
                 )
+                self._raise_if_cancelled(run_id)
                 if spent_tokens > limits.model_tokens:
                     raise RunBudgetExceeded("model token")
                 if spent > limits.model_spend_usd:
@@ -687,6 +706,7 @@ class DockerSandboxDispatcher:
                     batch_workspace_changed = False
                     batch_refusal_progress = True
                     for call_index, native_call in enumerate(completion.tool_calls):
+                        self._raise_if_cancelled(run_id)
                         tool, arguments = native_call.name, native_call.arguments
                         if tool not in model_tool_names():
                             result_text = f"TOOL FAILURE: unknown model tool: {tool}"
@@ -732,6 +752,7 @@ class DockerSandboxDispatcher:
                                             arguments, workspace, limits, route,
                                         )
                                     )
+                                    self._raise_if_cancelled(run_id)
                                     writes += written
                                     if writes > limits.model_write_bytes:
                                         raise RunBudgetExceeded("model write-byte")
@@ -785,6 +806,8 @@ class DockerSandboxDispatcher:
                                         )
                                     )
                                 except Exception as exc:
+                                    if self._is_cancelled(run_id):
+                                        raise RunCancelled from exc
                                     if isinstance(exc, ModelProgressError | RunBudgetExceeded):
                                         await self._task_event(
                                             run_id, task.id, "failed", str(exc)[:1000]
@@ -904,6 +927,7 @@ class DockerSandboxDispatcher:
                         run_id, task.id, operation_index, tool, arguments,
                         workspace, limits, route,
                     )
+                    self._raise_if_cancelled(run_id)
                     writes += written
                     if writes > limits.model_write_bytes:
                         raise RunBudgetExceeded("model write-byte")
@@ -948,6 +972,8 @@ class DockerSandboxDispatcher:
                     else:
                         await record_inspection_turn()
                 except Exception as exc:
+                    if self._is_cancelled(run_id):
+                        raise RunCancelled from exc
                     if isinstance(exc, ModelProgressError | RunBudgetExceeded):
                         await self._task_event(
                             run_id, task.id, "failed", str(exc)[:1000]

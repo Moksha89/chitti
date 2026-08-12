@@ -32,6 +32,7 @@ from .settings import Settings, get_settings
 from .worker import (
     DockerSandboxDispatcher,
     RunBudgetExceeded,
+    RunCancelled,
     WorkerLimits,
     approved_revision,
 )
@@ -47,6 +48,9 @@ TERMINAL_PREVIEW_FAILURES = frozenset(
         PREVIEW_EVIDENCE_SUBSTITUTION,
         PREVIEW_STAGING_MISSING,
     }
+)
+OUTCOME_TERMINAL_RUN_STATUSES = frozenset(
+    {"passed", "preview_failed", "preview_blocked"}
 )
 
 
@@ -88,6 +92,40 @@ async def next_queued_run(database: Database) -> Mapping[str, object] | None:
         return cast(Mapping[str, object], row)
 
 
+async def reconcile_cancelled_run(database: Database) -> int | None:
+    async with database.sessions() as session:
+        result = await session.execute(
+            text(
+                "SELECT r.id "
+                "FROM worker_runs r "
+                "JOIN LATERAL ("
+                "  SELECT status FROM worker_run_events "
+                "  WHERE run_id = r.id ORDER BY id DESC LIMIT 1"
+                ") latest ON latest.status = 'cancel_requested' "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM worker_run_events claimed "
+                "  WHERE claimed.run_id = r.id "
+                "    AND claimed.status = 'running'"
+                ") "
+                "ORDER BY r.id "
+                "LIMIT 1 FOR UPDATE OF r SKIP LOCKED"
+            )
+        )
+        row = result.mappings().one_or_none()
+        if row is None:
+            return None
+        run_id = int(row["id"])
+        await session.execute(
+            text(
+                "INSERT INTO worker_run_events (run_id, status, detail) "
+                "VALUES (:run_id, 'cancelled', 'cancelled before it started')"
+            ),
+            {"run_id": run_id},
+        )
+        await session.commit()
+        return run_id
+
+
 async def cancellation_requested(database: Database, run_id: int) -> bool:
     async with database.sessions() as session:
         result = await session.execute(
@@ -112,6 +150,29 @@ async def record_event(database: Database, run_id: int, status: str, detail: str
             {"run_id": run_id, "status": status, "detail": detail},
         )
         await session.commit()
+
+
+async def latest_status(database: Database, run_id: int) -> str | None:
+    async with database.sessions() as session:
+        result = await session.execute(
+            text(
+                "SELECT status FROM worker_run_events "
+                "WHERE run_id = :run_id ORDER BY id DESC LIMIT 1"
+            ),
+            {"run_id": run_id},
+        )
+        status = result.scalar_one_or_none()
+        return str(status) if status is not None else None
+
+
+async def record_cancelled_if_requested(database: Database, run_id: int) -> bool:
+    if not await cancellation_requested(database, run_id):
+        return False
+    status = await latest_status(database, run_id)
+    if status in OUTCOME_TERMINAL_RUN_STATUSES or status == "cancelled":
+        return True
+    await record_event(database, run_id, "cancelled", "cancelled by owner")
+    return True
 
 
 async def trim_payloads(database: Database) -> None:
@@ -368,6 +429,8 @@ async def execute_run(
     except GatewayTransientError as exc:
         await record_event(database, run_id, "failed", f"gateway temporarily unavailable: {exc}")
         return
+    if await record_cancelled_if_requested(database, run_id):
+        return
     async with database.sessions() as session:
         revision = await approved_revision(session, revision_id)
 
@@ -383,19 +446,28 @@ async def execute_run(
                     await task
                 except asyncio.CancelledError:
                     pass
-                await record_event(database, run_id, "failed", "model run wall-clock budget exceeded")
+                if not await record_cancelled_if_requested(database, run_id):
+                    await record_event(
+                        database, run_id, "failed",
+                        "model run wall-clock budget exceeded",
+                    )
                 return
             if await cancellation_requested(database, run_id):
                 await dispatcher.cancel(run_id)
         await task
+        await record_cancelled_if_requested(database, run_id)
+    except RunCancelled:
+        await record_event(database, run_id, "cancelled", "cancelled by owner")
     except asyncio.CancelledError:
         await dispatcher.cancel(run_id)
         await record_event(database, run_id, "cancelled", "runner interrupted")
         raise
     except RunBudgetExceeded as exc:
-        await record_event(database, run_id, "failed", str(exc))
+        if not await record_cancelled_if_requested(database, run_id):
+            await record_event(database, run_id, "failed", str(exc))
     except Exception as exc:
-        await record_event(database, run_id, "failed", str(exc)[:2000])
+        if not await record_cancelled_if_requested(database, run_id):
+            await record_event(database, run_id, "failed", str(exc)[:2000])
     finally:
         await trim_payloads(database)
 
@@ -430,6 +502,7 @@ async def run_forever() -> None:
         while True:
             await dispatcher.cleanup_expired_previews()
             await publish_approved_previews(database, settings)
+            await reconcile_cancelled_run(database)
             row = await next_queued_run(database)
             if row is None:
                 await asyncio.sleep(POLL_SECONDS)

@@ -9,7 +9,12 @@ from pathlib import Path
 import pytest
 
 from chitti.plans import PlanDocument, PlanRevision
-from chitti.worker import DockerSandboxDispatcher, FixedOperation, WorkerLimits, fixed_operations
+from chitti.worker import (
+    DockerSandboxDispatcher,
+    FixedOperation,
+    WorkerLimits,
+    fixed_operations,
+)
 
 
 def revision() -> PlanRevision:
@@ -307,6 +312,31 @@ def test_failed_unmount_keeps_workspace_image(monkeypatch, tmp_path) -> None:
         asyncio.run(dispatcher._cleanup_workspace(workspace))
 
     assert image.exists()
+
+
+def test_cancelled_run_still_cleans_up_workspace(monkeypatch, tmp_path) -> None:
+    dispatcher = DockerSandboxDispatcher(None, workspace_root=tmp_path)  # type: ignore[arg-type]
+    dispatcher._cancelled.add(1)
+    events: list[tuple[str, str]] = []
+    cleaned: list[Path] = []
+
+    async def mount(_workspace, _limits) -> None:
+        return None
+
+    async def event(_run_id, status, detail, **_kwargs) -> None:
+        events.append((status, detail))
+
+    async def cleanup(workspace) -> None:
+        cleaned.append(workspace)
+
+    monkeypatch.setattr(dispatcher, "_mount_workspace", mount)
+    monkeypatch.setattr(dispatcher, "_event", event)
+    monkeypatch.setattr(dispatcher, "_cleanup_workspace", cleanup)
+
+    asyncio.run(dispatcher._dispatch_one(object(), 1, WorkerLimits()))  # type: ignore[arg-type]
+
+    assert events == [("running", "run started"), ("cancelled", "cancelled before operation")]
+    assert cleaned == [tmp_path / "chitti-run-1"]
 
 
 def test_stale_cleanup_attempts_every_workspace_before_failing(monkeypatch, tmp_path) -> None:
