@@ -3,7 +3,7 @@
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0015_promotion_approval_attribution"
+revision = "0015_approval_actor"
 down_revision = "0014_live_output_chunks"
 branch_labels = None
 depends_on = None
