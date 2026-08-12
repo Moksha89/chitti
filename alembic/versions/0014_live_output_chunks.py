@@ -73,7 +73,7 @@ def upgrade() -> None:
         "status IN ('queued','running','operation_running','operation_complete',"
         "'passed','failed','cancel_requested','cancelled','task_finished',"
         "'model_tool_running','model_tool_failed','model_route_switched',"
-        "'model_context_compacted','review_complete')",
+        "'model_context_compacted','live_output_degraded','review_complete')",
     )
 
 

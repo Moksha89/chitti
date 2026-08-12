@@ -420,11 +420,26 @@ async def test_live_output_chunks_are_cursorable_bounded_and_pruned_after_artifa
     await dispatcher._append_output_chunk(
         run_id, 0, "stdout", 0, 0, b"first\n"
     )
+    await dispatcher._append_output_chunk(
+        run_id, 2, "stdout", 0, 0, b"build output\n"
+    )
+    await dispatcher._append_output_chunk(
+        run_id, 3, "stdout", 0, 0, b"test output\n"
+    )
     manager = WorkerRunManager(adapter)  # type: ignore[arg-type]
     chunks = await manager.output_chunks_after(run_id, 0)
-    assert [chunk["content"] for chunk in chunks] == ["first\n"]
+    assert [chunk["content"] for chunk in chunks if chunk["operation_index"] == 0] == [
+        "first\n"
+    ]
+    all_chunks = await manager.output_chunks_after(run_id, -1)
+    assert {
+        (chunk["operation_index"], chunk["content"]) for chunk in all_chunks
+    } >= {(2, "build output\n"), (3, "test output\n")}
     resumed = await manager.output_chunks_after(run_id, int(chunks[0]["id"]))
-    assert resumed == []
+    assert all(chunk["operation_index"] != 0 for chunk in resumed)
+    assert {
+        (chunk["operation_index"], chunk["content"]) for chunk in resumed
+    } >= {(2, "build output\n"), (3, "test output\n")}
 
     await dispatcher._append_output_chunk(
         run_id, 0, "stdout", 1, 6, b"x" * (256 * 1024)

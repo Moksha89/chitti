@@ -307,6 +307,61 @@ def test_model_tool_progress_detail_is_bounded_and_names_target() -> None:
     ) <= 1000
 
 
+def test_live_chunk_persistence_failure_degrades_without_failing_reader() -> None:
+    dispatcher = DockerSandboxDispatcher(None)  # type: ignore[arg-type]
+    degraded: list[int] = []
+    persisted: list[bytes] = []
+
+    async def fail_persist(*_args) -> None:
+        raise RuntimeError("database unavailable")
+
+    async def record_degraded(run_id, _status, _detail, **_kwargs) -> None:
+        degraded.append(run_id)
+
+    async def exercise() -> tuple[str, bool]:
+        dispatcher._append_output_chunk = fail_persist  # type: ignore[method-assign]
+        dispatcher._event = record_degraded  # type: ignore[method-assign]
+        return await dispatcher._read_stream_live_async(
+            7, 2, "stdout", BytesIO(b"operation output\n"), 1024
+        )
+
+    output, exceeded = asyncio.run(exercise())
+    assert output == "operation output\n"
+    assert not exceeded
+    assert degraded == [7]
+    assert persisted == []
+
+
+def test_live_reader_keeps_multibyte_boundary_intact(monkeypatch) -> None:
+    class OneByteStream:
+        def __init__(self, content: bytes) -> None:
+            self.content = content
+
+        def read(self, _size: int) -> bytes:
+            if not self.content:
+                return b""
+            chunk, self.content = self.content[:1], self.content[1:]
+            return chunk
+
+    dispatcher = DockerSandboxDispatcher(None)  # type: ignore[arg-type]
+    chunks: list[bytes] = []
+
+    async def persist(_run, _operation, _stream, _sequence, _offset, content) -> None:
+        chunks.append(content)
+
+    async def exercise() -> str:
+        dispatcher._append_output_chunk = persist  # type: ignore[method-assign]
+        return (
+            await dispatcher._read_stream_live_async(
+                7, 2, "stdout", OneByteStream("é".encode()), 1024
+            )
+        )[0]
+
+    monkeypatch.setattr("chitti.worker.LIVE_OUTPUT_FLUSH_BYTES", 1)
+    assert asyncio.run(exercise()) == "é"
+    assert b"".join(chunks).decode("utf-8") == "é"
+
+
 def test_failed_unmount_keeps_workspace_image(monkeypatch, tmp_path) -> None:
     dispatcher = DockerSandboxDispatcher(None)  # type: ignore[arg-type]
     workspace = tmp_path / "chitti-run-1"

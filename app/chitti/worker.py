@@ -254,6 +254,16 @@ def _model_tool_progress_detail(tool: str, arguments: Mapping[str, object]) -> s
     return f"{tool}: {target}"[:1000]
 
 
+def _utf8_safe_prefix(content: bytes) -> int:
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if exc.reason == "unexpected end of data" and exc.end == len(content):
+            return exc.start
+        return len(content)
+    return len(content)
+
+
 @dataclass(frozen=True)
 class WorkerLimits:
     cpus: float = 1.0
@@ -384,6 +394,7 @@ class DockerSandboxDispatcher:
         self._containers: dict[int, str] = {}
         self._processes: dict[int, subprocess.Popen[bytes]] = {}
         self._cancelled: set[int] = set()
+        self._live_output_degraded: set[int] = set()
         self._slot = asyncio.Semaphore(1)
 
     async def cancel(self, run_id: int) -> None:
@@ -1049,6 +1060,7 @@ class DockerSandboxDispatcher:
                 "> artifacts/workspace.diff",
             ),
         )
+        operation_index += 1
         diff_result, _diff_out, diff_err = await self._run_container(
             run_id, self._docker_command(diff, workspace, run_id, limits), limits,
             operation_index=operation_index,
@@ -1898,6 +1910,31 @@ class DockerSandboxDispatcher:
         offset = 0
         sequence = 0
         exceeded = False
+
+        async def flush_buffer(final: bool = False) -> None:
+            nonlocal offset, sequence
+            if not buffer:
+                return
+            candidate = bytes(buffer)
+            safe_length = len(candidate) if final else _utf8_safe_prefix(candidate)
+            if safe_length == 0:
+                return
+            payload = candidate[:safe_length]
+            try:
+                await self._append_output_chunk(
+                    run_id,
+                    operation_index,
+                    stream_name,
+                    sequence,
+                    offset,
+                    payload,
+                )
+            except Exception:
+                await self._mark_live_output_degraded(run_id)
+            sequence += 1
+            offset += len(payload)
+            del buffer[:safe_length]
+
         read_task = asyncio.create_task(
             asyncio.to_thread(stream.read, min(65536, limit + 1))
         )
@@ -1908,21 +1945,12 @@ class DockerSandboxDispatcher:
                 timeout=max(0.01, LIVE_OUTPUT_FLUSH_SECONDS - (time.monotonic() - last_flush)),
             )
             if not done:
-                if buffer:
-                    await self._append_output_chunk(
-                        run_id, operation_index, stream_name, sequence, offset, bytes(buffer)
-                    )
-                    sequence += 1
-                    offset += len(buffer)
-                    buffer.clear()
+                await flush_buffer()
                 last_flush = time.monotonic()
                 continue
             chunk = read_task.result()
             if not chunk:
-                if buffer:
-                    await self._append_output_chunk(
-                        run_id, operation_index, stream_name, sequence, offset, bytes(buffer)
-                    )
+                await flush_buffer(final=True)
                 break
             remaining = limit - total
             if remaining <= 0:
@@ -1935,23 +1963,28 @@ class DockerSandboxDispatcher:
             if len(chunk) > remaining:
                 exceeded = True
             if len(buffer) >= LIVE_OUTPUT_FLUSH_BYTES:
-                await self._append_output_chunk(
-                    run_id, operation_index, stream_name, sequence, offset, bytes(buffer)
-                )
-                sequence += 1
-                offset += len(buffer)
-                buffer.clear()
+                await flush_buffer()
                 last_flush = time.monotonic()
             if exceeded:
-                if buffer:
-                    await self._append_output_chunk(
-                        run_id, operation_index, stream_name, sequence, offset, bytes(buffer)
-                    )
+                await flush_buffer(final=True)
                 break
             read_task = asyncio.create_task(
                 asyncio.to_thread(stream.read, min(65536, limit - total + 1))
             )
         return b"".join(chunks).decode("utf-8", errors="replace"), exceeded
+
+    async def _mark_live_output_degraded(self, run_id: int) -> None:
+        if run_id in self._live_output_degraded:
+            return
+        self._live_output_degraded.add(run_id)
+        try:
+            await self._event(
+                run_id,
+                "live_output_degraded",
+                "live output is temporarily unavailable; final artifacts remain authoritative",
+            )
+        except Exception:
+            return
 
     async def _append_output_chunk(
         self,
