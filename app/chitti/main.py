@@ -32,7 +32,7 @@ from .plans import (
     reject_revision,
     revision_by_id,
 )
-from .previews import safe_preview_file
+from .previews import manifest_from_json, safe_preview_file
 from .project_state import ProjectState
 from .provider import FakeProvider, LiteLLMProvider
 from .service import ChittiService
@@ -51,6 +51,13 @@ RUN_EVENT_POLL_SECONDS = 1.0
 RUN_EVENT_HEARTBEAT_SECONDS = 15.0
 WORKSPACE_RUN_LIST_LIMIT = 25
 TERMINAL_RUN_STATUSES = {"passed", "failed", "cancelled"}
+MAX_DIFF_BODY_BYTES = 12_000
+GENERATED_DIFF_ROOTS = {"out", "dist", "build", ".next"}
+GENERATED_DIFF_FILENAMES = {
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+}
 
 
 class ChatRequest(BaseModel):
@@ -383,7 +390,133 @@ def _run_status(detail: dict[str, object]) -> str:
     return str(events[-1].get("status", "queued"))
 
 
+def _diff_file_role(path: str) -> str:
+    parts = Path(path).parts
+    if parts and (parts[0] in GENERATED_DIFF_ROOTS or Path(path).name in GENERATED_DIFF_FILENAMES):
+        return "generated"
+    return "authored"
+
+
+def _parse_diff(payload: bytes) -> list[dict[str, object]]:
+    text_payload = payload.decode("utf-8", errors="replace")
+    lines = text_payload.splitlines(keepends=True)
+    entries: list[dict[str, object]] = []
+    current: list[str] = []
+    current_path: str | None = None
+
+    def append_entry() -> None:
+        if current_path is None:
+            return
+        body = "".join(current)
+        additions = sum(
+            1 for line in current if line.startswith("+") and not line.startswith("+++")
+        )
+        deletions = sum(
+            1 for line in current if line.startswith("-") and not line.startswith("---")
+        )
+        entries.append(
+            {
+                "index": len(entries),
+                "kind": "diff",
+                "path": current_path,
+                "role": _diff_file_role(current_path),
+                "additions": additions,
+                "deletions": deletions,
+                "body_bytes": len(body.encode("utf-8")),
+                "summary": f"+{additions} / -{deletions}",
+            }
+        )
+
+    for line in lines:
+        if line.startswith("diff --git "):
+            append_entry()
+            current = [line]
+            match = re.match(r"diff --git a/(.+) b/(.+)\n?$", line.rstrip("\n"))
+            current_path = match.group(2) if match else None
+        elif current_path is not None:
+            current.append(line)
+    append_entry()
+    return entries
+
+
+def _diff_body(payload: bytes, index: int) -> dict[str, object] | None:
+    text_payload = payload.decode("utf-8", errors="replace")
+    blocks = re.split(r"(?=^diff --git )", text_payload, flags=re.MULTILINE)
+    blocks = [block for block in blocks if block.startswith("diff --git ")]
+    if index < 0 or index >= len(blocks):
+        return None
+    encoded = blocks[index].encode("utf-8")
+    clipped = len(encoded) > MAX_DIFF_BODY_BYTES
+    body = encoded[:MAX_DIFF_BODY_BYTES].decode("utf-8", errors="replace")
+    match = re.match(r"diff --git a/(.+) b/(.+)\n?$", blocks[index].splitlines()[0])
+    path = match.group(2) if match else f"file-{index}"
+    return {
+        "path": path,
+        "body": body,
+        "clipped": clipped,
+    }
+
+
+def _tree_nodes(entries: list[dict[str, object]]) -> list[dict[str, object]]:
+    root: dict[str, object] = {}
+    for entry in entries:
+        cursor = root
+        parts = Path(str(entry["path"])).parts
+        for part in parts[:-1]:
+            children = cast(dict[str, object], cursor.setdefault("children", {}))
+            cursor = cast(dict[str, object], children.setdefault(part, {}))
+        children = cast(dict[str, object], cursor.setdefault("children", {}))
+        children[parts[-1]] = {"entry": entry}
+
+    def render(node: dict[str, object]) -> list[dict[str, object]]:
+        children = cast(dict[str, dict[str, object]], node.get("children", {}))
+        result: list[dict[str, object]] = []
+        for name in sorted(children):
+            child = children[name]
+            entry = child.get("entry")
+            item: dict[str, object] = {"name": name}
+            if entry is not None:
+                item["entry"] = entry
+            else:
+                item["children"] = render(child)
+            result.append(item)
+        return result
+
+    return render(root)
+
+
+def _prepare_files_view(
+    payload: bytes | None, artifact: dict[str, object] | None
+) -> dict[str, object]:
+    if artifact is None:
+        return {"state": "empty", "tree": [], "entries": []}
+    if payload is None:
+        return {
+            "state": "expired",
+            "tree": [],
+            "entries": [],
+            "artifact_id": artifact["id"],
+        }
+    entries = _parse_diff(payload)
+    return {
+        "state": "available",
+        "tree": _tree_nodes(entries),
+        "authored_tree": _tree_nodes(
+            [entry for entry in entries if entry["role"] == "authored"]
+        ),
+        "generated_tree": _tree_nodes(
+            [entry for entry in entries if entry["role"] == "generated"]
+        ),
+        "entries": entries,
+        "artifact_id": artifact["id"],
+        "authored_count": sum(entry["role"] == "authored" for entry in entries),
+        "generated_count": sum(entry["role"] == "generated" for entry in entries),
+    }
+
+
 def _prepare_workspace_run(detail: dict[str, object]) -> dict[str, object]:
+    detail.setdefault("files_view", {"state": "empty", "tree": [], "entries": []})
+    detail.setdefault("export_view", {"state": "empty", "tree": [], "entries": []})
     operations = []
     artifacts = cast(list[dict[str, object]], detail.get("artifacts", []))
     output_artifacts: dict[tuple[int, str], int] = {}
@@ -563,6 +696,76 @@ async def workspace_run_page(
             {"run_id": run_id},
         )
         run["promotion"] = promotion_result.mappings().one_or_none()
+        diff_result = await db_session.execute(
+            text(
+                "SELECT a.id, a.byte_size, a.sha256, p.content "
+                "FROM worker_artifacts a "
+                "LEFT JOIN worker_artifact_payloads p ON p.artifact_id = a.id "
+                "WHERE a.run_id = :run_id AND a.kind = 'diff' "
+                "ORDER BY a.id DESC LIMIT 1"
+            ),
+            {"run_id": run_id},
+        )
+        diff_row = diff_result.mappings().one_or_none()
+        diff_artifact = (
+            {key: value for key, value in diff_row.items() if key != "content"}
+            if diff_row is not None
+            else None
+        )
+        files_view = _prepare_files_view(
+            bytes(diff_row["content"]) if diff_row and diff_row["content"] is not None else None,
+            diff_artifact,
+        )
+        run["files_view"] = files_view
+        if files_view["state"] == "available" and diff_artifact is not None:
+            files_view["artifact_url"] = (
+                f"/runs/{run_id}/artifacts/{diff_artifact['id']}"
+            )
+        manifest_result = await db_session.execute(
+            text(
+                "SELECT manifest, digest, total_bytes, file_count, max_depth "
+                "FROM export_manifests WHERE run_id = :run_id "
+                "ORDER BY id DESC LIMIT 1"
+            ),
+            {"run_id": run_id},
+        )
+        manifest_row = manifest_result.mappings().one_or_none()
+        export_view: dict[str, object] = {"state": "empty", "tree": [], "entries": []}
+        if manifest_row is not None:
+            try:
+                manifest = manifest_from_json(
+                    manifest_row["manifest"], str(manifest_row["digest"])
+                )
+                entries = [
+                    {
+                        "path": entry.path,
+                        "size": entry.size,
+                        "sha256": entry.sha256,
+                    }
+                    for entry in manifest.entries
+                ]
+                export_view = {
+                    "state": "available",
+                    "tree": _tree_nodes(
+                        [
+                            {
+                                **entry,
+                                "index": index,
+                                "kind": "manifest",
+                                "role": "generated",
+                                "summary": f"{entry['size']} bytes",
+                            }
+                            for index, entry in enumerate(entries)
+                        ]
+                    ),
+                    "entries": entries,
+                    "file_count": int(manifest_row["file_count"]),
+                    "total_bytes": int(manifest_row["total_bytes"]),
+                    "digest": str(manifest_row["digest"]),
+                }
+            except (TypeError, ValueError, KeyError):
+                export_view = {"state": "invalid", "tree": [], "entries": []}
+        run["export_view"] = export_view
         reviewer_result = await db_session.execute(
             text(
                 "SELECT p.content FROM worker_artifacts a "
@@ -598,6 +801,38 @@ async def workspace_run_page(
             "current_task": current_task,
         },
     )
+
+
+@app.get("/workspace/runs/{run_id}/diff/{file_index}", response_model=None)
+async def workspace_diff_file(
+    run_id: int, file_index: int, request: Request
+) -> dict[str, object]:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        raise HTTPException(status_code=401, detail="authentication required")
+    database: Database = request.app.state.database
+    async with database.sessions() as session:
+        artifact_result = await session.execute(
+            text(
+                "SELECT a.id, p.content FROM worker_artifacts a "
+                "LEFT JOIN worker_artifact_payloads p ON p.artifact_id = a.id "
+                "WHERE a.run_id = :run_id AND a.kind = 'diff' "
+                "ORDER BY a.id DESC LIMIT 1"
+            ),
+            {"run_id": run_id},
+        )
+        artifact = artifact_result.mappings().one_or_none()
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="run has no diff artifact")
+    if artifact["content"] is None:
+        raise HTTPException(status_code=410, detail="diff artifact payload has expired")
+    body = _diff_body(bytes(artifact["content"]), file_index)
+    if body is None:
+        raise HTTPException(status_code=404, detail="diff file not found")
+    return {
+        **body,
+        "full_artifact_url": f"/runs/{run_id}/artifacts/{artifact['id']}",
+    }
 
 
 @app.get("/workspace")

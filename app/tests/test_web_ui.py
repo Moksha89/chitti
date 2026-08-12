@@ -5,12 +5,16 @@ import pytest
 from fastapi import HTTPException
 
 from chitti.main import (
+    _diff_body,
+    _prepare_files_view,
     _prepare_workspace_run,
     _run_event_stream,
+    _tree_nodes,
     humanize_belief_key,
     project_from_brief,
     render_markdown,
     templates,
+    workspace_diff_file,
     workspace_index,
     workspace_run_events,
 )
@@ -212,6 +216,7 @@ def test_workspace_cold_load_contains_durable_state_and_safe_empty_panels() -> N
     assert "No screenshots have been captured for this run yet." in rendered
     assert "No reviewer verdict has been recorded yet." in rendered
     assert "No completed operations yet." in rendered
+    assert "No diff artifact was recorded for this run." in rendered
 
 
 def test_workspace_surfaces_latest_capture_per_path() -> None:
@@ -247,6 +252,158 @@ def test_workspace_surfaces_latest_capture_per_path() -> None:
 
     assert [artifact["id"] for artifact in prepared["screenshots"]] == [12, 11]
     assert prepared["browser_errors"]["id"] == 13
+
+
+def test_diff_tree_parses_authored_and_generated_files() -> None:
+    payload = (
+        b"diff --git a/app/page.js b/app/page.js\n"
+        b"--- /dev/null\n+++ b/app/page.js\n@@ -0,0 +1 @@\n+page\n"
+        b"diff --git a/out/index.html b/out/index.html\n"
+        b"--- /dev/null\n+++ b/out/index.html\n@@ -0,0 +1 @@\n+html\n"
+        b"diff --git a/package-lock.json b/package-lock.json\n"
+        b"--- /dev/null\n+++ b/package-lock.json\n@@ -0,0 +1 @@\n+lock\n"
+    )
+
+    view = _prepare_files_view(payload, {"id": 41, "byte_size": len(payload)})
+
+    assert view["state"] == "available"
+    assert view["authored_count"] == 1
+    assert view["generated_count"] == 2
+    assert {entry["path"] for entry in view["entries"]} == {
+        "app/page.js",
+        "out/index.html",
+        "package-lock.json",
+    }
+
+
+def test_workspace_files_tab_renders_bounded_loading_and_manifest_trees() -> None:
+    run = _finished_run()
+    payload = (
+        b"diff --git a/app/page.js b/app/page.js\n"
+        b"--- /dev/null\n+++ b/app/page.js\n@@ -0,0 +1 @@\n+page\n"
+    )
+    run["files_view"] = _prepare_files_view(
+        payload, {"id": 41, "byte_size": len(payload)}
+    )
+    run["files_view"]["artifact_url"] = "/runs/7/artifacts/41"
+    run["export_view"] = {
+        "state": "available",
+        "file_count": 1,
+        "total_bytes": 4,
+        "digest": "d" * 64,
+        "tree": _tree_nodes(
+            [
+                {
+                    "path": "index.html",
+                    "size": 4,
+                    "sha256": "e" * 64,
+                    "kind": "manifest",
+                    "role": "generated",
+                    "summary": "4 bytes",
+                    "index": 0,
+                }
+            ]
+        ),
+    }
+
+    rendered = _workspace_context(run)
+
+    assert "Source diff" in rendered
+    assert "Authored source" in rendered
+    assert "Select a file to load its bounded diff body." in rendered
+    assert "Static export manifest" in rendered
+    assert "Open full diff artifact" in rendered
+    assert "eeeeeeeeeeeeeeee" in rendered
+
+
+def test_diff_body_is_bounded_with_explicit_clip_marker() -> None:
+    payload = (
+        b"diff --git a/app/page.js b/app/page.js\n"
+        b"--- /dev/null\n+++ b/app/page.js\n@@ -1 +1 @@\n+"
+        + b"x" * 20_000
+    )
+
+    body = _diff_body(payload, 0)
+
+    assert body is not None
+    assert body["clipped"] is True
+    assert len(str(body["body"]).encode()) <= 12_000
+
+
+def test_expired_diff_payload_is_explicit() -> None:
+    view = _prepare_files_view(None, {"id": 41, "byte_size": 100})
+
+    assert view["state"] == "expired"
+    rendered = _workspace_context(
+        {
+            **_finished_run(),
+            "files_view": view,
+            "export_view": {"state": "empty", "tree": [], "entries": []},
+        }
+    )
+    assert "diff evidence has aged out of payload retention" in rendered
+
+
+def test_workspace_diff_body_loads_on_demand() -> None:
+    class Auth:
+        def get_session(self, _token):
+            return SimpleNamespace(username="akirah")
+
+    class Result:
+        def mappings(self):
+            return self
+
+        def one_or_none(self):
+            return {
+                "id": 41,
+                "content": (
+                    b"diff --git a/app/page.js b/app/page.js\n"
+                    b"--- /dev/null\n+++ b/app/page.js\n@@ -0,0 +1 @@\n+page\n"
+                ),
+            }
+
+    class SessionContext:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, *_args, **_kwargs):
+            return Result()
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                auth=Auth(),
+                database=SimpleNamespace(sessions=lambda: SessionContext()),
+            )
+        ),
+        cookies={"chitti_session": "session"},
+        headers={},
+    )
+
+    body = asyncio.run(workspace_diff_file(7, 0, request))
+
+    assert body["path"] == "app/page.js"
+    assert body["clipped"] is False
+    assert "full_artifact_url" in body
+
+
+def test_workspace_diff_body_requires_authentication() -> None:
+    class Auth:
+        def get_session(self, _token):
+            return None
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(auth=Auth())),
+        cookies={},
+        headers={},
+        url=SimpleNamespace(path="/workspace/runs/7/diff/0", query=""),
+    )
+
+    with pytest.raises(HTTPException, match="authentication required"):
+        asyncio.run(workspace_diff_file(7, 0, request))
 
 
 def test_run_event_stream_replays_after_last_event_id() -> None:
