@@ -417,11 +417,31 @@ def _prepare_workspace_run(detail: dict[str, object]) -> dict[str, object]:
     detail["reasoning_share"] = (
         (reasoning_tokens / total_tokens * 100) if total_tokens else 0.0
     )
-    detail["screenshots"] = [
-        artifact for artifact in artifacts if artifact.get("kind") == "screenshot"
-    ]
+    latest_capture: dict[tuple[str, str], dict[str, object]] = {}
+    for artifact in artifacts:
+        kind = str(artifact.get("kind", ""))
+        if kind not in {"screenshot", "browser_evidence"}:
+            continue
+        key = (kind, str(artifact.get("path", "")))
+        current = latest_capture.get(key)
+        if current is None or int(str(artifact.get("id", 0))) > int(
+            str(current.get("id", 0))
+        ):
+            latest_capture[key] = artifact
+    detail["screenshots"] = sorted(
+        (
+            artifact
+            for (kind, _), artifact in latest_capture.items()
+            if kind == "screenshot"
+        ),
+        key=lambda artifact: str(artifact.get("path", "")),
+    )
     detail["browser_errors"] = next(
-        (artifact for artifact in artifacts if artifact.get("kind") == "browser_evidence"),
+        (
+            artifact
+            for (kind, _), artifact in latest_capture.items()
+            if kind == "browser_evidence"
+        ),
         None,
     )
     return detail

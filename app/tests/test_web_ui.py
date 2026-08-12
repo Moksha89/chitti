@@ -214,6 +214,41 @@ def test_workspace_cold_load_contains_durable_state_and_safe_empty_panels() -> N
     assert "No completed operations yet." in rendered
 
 
+def test_workspace_surfaces_latest_capture_per_path() -> None:
+    run = _finished_run()
+    run["artifacts"] = [
+        {
+            "id": 10,
+            "kind": "screenshot",
+            "path": "artifacts/desktop.png",
+            "byte_size": 3,
+        },
+        {
+            "id": 12,
+            "kind": "screenshot",
+            "path": "artifacts/desktop.png",
+            "byte_size": 5,
+        },
+        {
+            "id": 11,
+            "kind": "screenshot",
+            "path": "artifacts/phone.png",
+            "byte_size": 4,
+        },
+        {
+            "id": 13,
+            "kind": "browser_evidence",
+            "path": "artifacts/browser-errors.json",
+            "byte_size": 2,
+        },
+    ]
+
+    prepared = _prepare_workspace_run(run)
+
+    assert [artifact["id"] for artifact in prepared["screenshots"]] == [12, 11]
+    assert prepared["browser_errors"]["id"] == 13
+
+
 def test_run_event_stream_replays_after_last_event_id() -> None:
     class Request:
         async def is_disconnected(self):

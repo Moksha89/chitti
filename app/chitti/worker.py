@@ -33,6 +33,8 @@ from .provider import (
     ModelTransportError,
 )
 
+MAX_CAPTURE_ARTIFACTS_PER_RUN = 32
+
 if TYPE_CHECKING:
     from .db import Database
 
@@ -1839,57 +1841,33 @@ class DockerSandboxDispatcher:
                 else "diff"
             )
             async with self.database.sessions() as session:
-                existing = await session.execute(
+                if kind in {"screenshot", "browser_evidence"}:
+                    capture_count = await session.execute(
+                        text(
+                            "SELECT COUNT(*) FROM worker_artifacts "
+                            "WHERE run_id = :run_id "
+                            "AND kind IN ('screenshot', 'browser_evidence')"
+                        ),
+                        {"run_id": run_id},
+                    )
+                    if int(capture_count.scalar_one()) >= MAX_CAPTURE_ARTIFACTS_PER_RUN:
+                        continue
+                artifact = await session.execute(
                     text(
-                        "SELECT id FROM worker_artifacts "
-                        "WHERE run_id = :run_id AND kind = :kind AND path = :path "
-                        "LIMIT 1"
+                        "INSERT INTO worker_artifacts "
+                        "(run_id, kind, path, sha256, byte_size) "
+                        "VALUES (:run_id, :kind, :path, :sha256, :byte_size) "
+                        "RETURNING id"
                     ),
                     {
                         "run_id": run_id,
                         "kind": kind,
                         "path": str(path.relative_to(workspace)),
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                        "byte_size": len(content),
                     },
                 )
-                artifact_id = existing.scalar_one_or_none()
-                values = {
-                    "run_id": run_id,
-                    "kind": kind,
-                    "path": str(path.relative_to(workspace)),
-                    "sha256": hashlib.sha256(content).hexdigest(),
-                    "byte_size": len(content),
-                }
-                if artifact_id is None:
-                    artifact = await session.execute(
-                        text(
-                            "INSERT INTO worker_artifacts "
-                            "(run_id, kind, path, sha256, byte_size) "
-                            "VALUES (:run_id, :kind, :path, :sha256, :byte_size) "
-                            "RETURNING id"
-                        ),
-                        values,
-                    )
-                    artifact_id = int(artifact.scalar_one())
-                else:
-                    await session.execute(
-                        text(
-                            "DELETE FROM worker_artifact_payloads "
-                            "WHERE artifact_id = :artifact_id"
-                        ),
-                        {"artifact_id": int(artifact_id)},
-                    )
-                    await session.execute(
-                        text(
-                            "UPDATE worker_artifacts SET sha256 = :sha256, "
-                            "byte_size = :byte_size, original_byte_size = NULL, "
-                            "truncated = FALSE WHERE id = :artifact_id"
-                        ),
-                        {
-                            "artifact_id": int(artifact_id),
-                            "sha256": values["sha256"],
-                            "byte_size": values["byte_size"],
-                        },
-                    )
+                artifact_id = int(artifact.scalar_one())
                 await session.execute(
                     text(
                         "INSERT INTO worker_artifact_payloads "
