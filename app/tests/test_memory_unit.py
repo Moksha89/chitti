@@ -1,3 +1,5 @@
+import pytest
+
 from chitti.embedding import FakeEmbedder
 from chitti.memory import MemoryStore, normalize, normalize_key
 from chitti.provider import ExtractedMemory
@@ -49,3 +51,11 @@ def test_matching_belief_uses_only_normalized_keys() -> None:
     )
     assert related is not None
     assert score == 1.0
+
+
+def test_retrieval_requires_an_explicit_namespace_argument() -> None:
+    store = MemoryStore(FakeEmbedder())
+    with pytest.raises(TypeError):
+        store.recall(None, "query")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        store.active_beliefs(None)  # type: ignore[arg-type]

@@ -41,22 +41,23 @@ async def test_append_only_and_retrieval(store) -> None:
         item = ExtractedMemory("stack", "FastAPI", "user stated", None, "user_stated")
         async with session.begin():
             first = await memory.append_decision(session, item)
-            conflicts = await memory.record_memories(session, [item])
+            conflicts = await memory.record_memories(session, [item], "general")
             assert first > 0
             assert conflicts == []
             conflicts = await memory.record_memories(
                 session,
                 [ExtractedMemory("stack", "Django", "conflicting preference", None, "user_stated")],
+                "general",
             )
             assert conflicts and conflicts[0].existing == "FastAPI"
-            await memory.add_chunk(session, "FastAPI is preferred", "note", None, {})
+            await memory.add_chunk(session, "FastAPI is preferred", "note", None, {}, "general")
         with pytest.raises(DBAPIError):
             await session.execute(
                 text("UPDATE decisions SET decision = 'forbidden' WHERE id = :id"),
                 {"id": first},
             )
         await session.rollback()
-        recalled = await memory.recall(session, "FastAPI", 1)
+        recalled = await memory.recall(session, "FastAPI", "general", 1)
         assert recalled and "FastAPI" in recalled[0].content
 
 
@@ -68,14 +69,16 @@ async def test_rephrased_key_conflicts_and_forget_hides_without_deleting(store) 
             ExtractedMemory(
                 "preferred_stack.frontend_framework", "SvelteKit", "user stated", None, "user_stated"
             ),
+            namespace="general",
         )
         conflicts = await memory.record_memories(
             session,
             [ExtractedMemory("preferred_frontend_framework", "Next.js", "replacement", None, "user_stated")],
+            "general",
         )
         assert conflicts and conflicts[0].key == "frontend_framework"
         await memory.forget_decision(session, first)
-        assert await memory.decisions(session) == []
+        assert await memory.decisions(session, "general") == []
         result = await session.execute(text("SELECT id FROM decisions WHERE id = :id"), {"id": first})
         assert result.scalar_one() == first
 
@@ -89,6 +92,7 @@ async def test_conflicting_extractions_in_one_batch_use_real_decision_ids(store)
                 ExtractedMemory("deployment_target", "VPS", "first", None, "user_stated"),
                 ExtractedMemory("deployment_target", "managed cloud", "second", None, "user_stated"),
             ],
+            "general",
         )
         assert len(conflicts) == 1
         assert conflicts[0].decision_id > 0
@@ -96,3 +100,112 @@ async def test_conflicting_extractions_in_one_batch_use_real_decision_ids(store)
             text("SELECT COUNT(*) FROM decisions WHERE decision_key = 'deployment_target'")
         )
         assert result.scalar_one() == 1
+
+
+async def test_memory_namespaces_isolate_business_data_and_share_general_data(store) -> None:
+    engine, memory = store
+    async with engine.begin() as session:
+        await memory.add_chunk(session, "PJ private context", "note", None, {}, "pj-digi")
+        await memory.add_chunk(session, "JSV private context", "note", None, {}, "jsv-fashion")
+        await memory.add_chunk(session, "Owner shared context", "note", None, {}, "general")
+        await memory.append_decision(
+            session,
+            ExtractedMemory("pj_rule", "PJ only", None, "PJ Digi", "user_stated"),
+            "pj-digi",
+        )
+        await memory.append_decision(
+            session,
+            ExtractedMemory("jsv_rule", "JSV only", None, "JSV Fashion", "user_stated"),
+            "jsv-fashion",
+        )
+        await memory.append_decision(
+            session,
+            ExtractedMemory("shared_rule", "Owner-wide", None, None, "user_stated"),
+            "general",
+        )
+        pj_recall = await memory.recall(session, "context", "pj-digi", 10)
+        jsv_recall = await memory.recall(session, "context", "jsv-fashion", 10)
+        assert any(item.content == "PJ private context" for item in pj_recall)
+        assert not any(item.content == "JSV private context" for item in pj_recall)
+        assert any(item.content == "Owner shared context" for item in pj_recall)
+        assert any(item.content == "JSV private context" for item in jsv_recall)
+        assert not any(item.content == "PJ private context" for item in jsv_recall)
+        pj_beliefs = await memory.active_beliefs(session, "pj-digi")
+        jsv_beliefs = await memory.active_beliefs(session, "jsv-fashion")
+        assert {str(item["decision_key"]) for item in pj_beliefs} == {"pj_rule", "shared_rule"}
+        assert {str(item["decision_key"]) for item in jsv_beliefs} == {"jsv_rule", "shared_rule"}
+
+
+async def test_memory_retrieval_rejects_unknown_namespace_instead_of_global_read(store) -> None:
+    engine, memory = store
+    async with engine.begin() as session:
+        with pytest.raises(ValueError, match="unknown memory namespace"):
+            await memory.recall(session, "anything", "not-a-business")
+
+
+async def test_namespace_migration_preserves_legacy_rows_and_backfills_honestly(store) -> None:
+    engine, _ = store
+    env = {
+        **os.environ,
+        "DATABASE_URL": engine.url.render_as_string(hide_password=False).replace(
+            "+asyncpg", "+psycopg"
+        ),
+    }
+    subprocess.run(
+        ["python", "-m", "alembic", "-c", "alembic.ini", "downgrade", "0015_approval_actor"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+    embedding = "[" + ",".join(["0"] * 384) + "]"
+    async with engine.begin() as session:
+        await session.execute(
+            text(
+                "INSERT INTO decisions "
+                "(project, decision, rationale, source, decision_key) "
+                "VALUES ('PJ Digi', 'legacy belief', NULL, 'user_stated', 'legacy_belief')"
+            )
+        )
+        await session.execute(
+            text(
+                "INSERT INTO memory_chunks "
+                "(content, source_type, source_id, metadata, embedding) "
+                "VALUES ('explicit namespace', 'note', NULL, "
+                "CAST('{\"namespace\":\"pj-digi\"}' AS json), CAST(:embedding AS vector))"
+            ),
+            {"embedding": embedding},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO memory_chunks "
+                "(content, source_type, source_id, metadata, embedding) "
+                "VALUES ('undetermined namespace', 'note', NULL, "
+                "CAST('{}' AS json), CAST(:embedding AS vector))"
+            ),
+            {"embedding": embedding},
+        )
+    subprocess.run(
+        ["python", "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+    async with engine.connect() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT content, namespace FROM memory_chunks "
+                    "ORDER BY content"
+                )
+            )
+        ).all()
+        decision_namespace = (
+            await session.execute(
+                text("SELECT namespace FROM decisions WHERE decision_key = 'legacy_belief'")
+            )
+        ).scalar_one()
+    assert rows == [
+        ("explicit namespace", "pj-digi"),
+        ("undetermined namespace", "general"),
+    ]
+    assert decision_namespace == "general"
