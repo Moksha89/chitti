@@ -13,6 +13,7 @@ from chitti.worker import (
     DockerSandboxDispatcher,
     FixedOperation,
     WorkerLimits,
+    _model_tool_progress_detail,
     fixed_operations,
 )
 
@@ -295,6 +296,15 @@ def test_output_reader_stops_at_budget_without_buffering_unbounded_output() -> N
     output, exceeded = asyncio.run(exercise())
     assert len(output) == 1024
     assert exceeded
+
+
+def test_model_tool_progress_detail_is_bounded_and_names_target() -> None:
+    assert _model_tool_progress_detail("write_file", {"path": "app/page.js"}) == (
+        "write_file: app/page.js"
+    )
+    assert len(
+        _model_tool_progress_detail("run_command", {"name": "x" * 5000})
+    ) <= 1000
 
 
 def test_failed_unmount_keeps_workspace_image(monkeypatch, tmp_path) -> None:

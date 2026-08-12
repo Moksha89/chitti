@@ -6,20 +6,24 @@ GRANT CONNECT ON DATABASE chitti TO chitti_runner;
 GRANT USAGE ON SCHEMA public TO chitti_runner;
 GRANT SELECT ON plan_revisions, plan_approvals, decisions, decision_forgets, worker_runs,
     worker_run_events, worker_operations, worker_artifacts,
+    worker_operation_output_chunks,
     worker_retention_policy, worker_artifact_payloads, worker_model_calls,
     export_manifests, promotion_approvals, previews
     TO chitti_runner;
 GRANT INSERT ON plan_task_events, worker_run_events, worker_operations, worker_artifacts,
-    worker_artifact_payloads, worker_model_calls, export_manifests, previews
+    worker_operation_output_chunks, worker_artifact_payloads, worker_model_calls,
+    export_manifests, previews
     TO chitti_runner;
 -- The runner uses SELECT ... FOR UPDATE OF worker_runs to claim a queued row.
 GRANT UPDATE ON worker_runs TO chitti_runner;
 GRANT DELETE ON worker_artifact_payloads TO chitti_runner;
+GRANT DELETE ON worker_operation_output_chunks TO chitti_runner;
 GRANT USAGE, SELECT ON SEQUENCE
     plan_task_events_id_seq,
     worker_run_events_id_seq,
     worker_operations_id_seq,
     worker_artifacts_id_seq,
+    worker_operation_output_chunks_id_seq,
     worker_model_calls_id_seq,
     export_manifests_id_seq
     TO chitti_runner;

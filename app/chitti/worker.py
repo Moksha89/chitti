@@ -34,6 +34,9 @@ from .provider import (
 )
 
 MAX_CAPTURE_ARTIFACTS_PER_RUN = 32
+LIVE_OUTPUT_FLUSH_BYTES = 16 * 1024
+LIVE_OUTPUT_FLUSH_SECONDS = 0.25
+LIVE_OUTPUT_TAIL_BYTES = 256 * 1024
 
 if TYPE_CHECKING:
     from .db import Database
@@ -239,6 +242,18 @@ def _reset_file_write_counter(tool: str, current: int) -> int:
     return 0 if tool == "run_command" else current
 
 
+def _model_tool_progress_detail(tool: str, arguments: Mapping[str, object]) -> str:
+    if tool in {"read_file", "write_file", "list_files"}:
+        target = str(arguments.get("path", "."))
+    elif tool == "run_command":
+        target = str(arguments.get("name", ""))
+    elif tool == "capture_screenshot":
+        target = str(arguments.get("route", "/"))
+    else:
+        target = str(arguments.get("summary", ""))
+    return f"{tool}: {target}"[:1000]
+
+
 @dataclass(frozen=True)
 class WorkerLimits:
     cpus: float = 1.0
@@ -425,7 +440,7 @@ class DockerSandboxDispatcher:
                 command = self._docker_command(operation, workspace, run_id, limits)
                 try:
                     result, stdout, stderr = await self._run_container(
-                        run_id, command, limits
+                        run_id, command, limits, operation_index=index
                     )
                 except TimeoutError:
                     await self.cancel(run_id)
@@ -468,7 +483,8 @@ class DockerSandboxDispatcher:
         (workspace / "artifacts").mkdir(parents=True, exist_ok=True)
         init = FixedOperation("runner", "git-init", ("sh", "-c", "git init -q /workspace"))
         init_result, _init_out, init_err = await self._run_container(
-            run_id, self._docker_command(init, workspace, run_id, limits), limits
+            run_id, self._docker_command(init, workspace, run_id, limits), limits,
+            operation_index=0,
         )
         if init_result.returncode:
             raise RuntimeError(init_err[-1000:] or "git initialization failed")
@@ -482,7 +498,8 @@ class DockerSandboxDispatcher:
             ("sh", "-c", "cp -r /opt/fixture/. /workspace/ && mkdir -p /workspace/artifacts"),
         )
         fixture_result, fixture_out, fixture_err = await self._run_container(
-            run_id, self._docker_command(fixture, workspace, run_id, limits), limits
+            run_id, self._docker_command(fixture, workspace, run_id, limits), limits,
+            operation_index=1,
         )
         if fixture_result.returncode:
             raise RuntimeError(fixture_err[-1000:] or "fixture initialization failed")
@@ -746,6 +763,12 @@ class DockerSandboxDispatcher:
                                 messages.append(_tool_result_message(native_call, result_text))
                             else:
                                 try:
+                                    await self._event(
+                                        run_id,
+                                        "model_tool_running",
+                                        _model_tool_progress_detail(tool, arguments),
+                                        task_id=task.id,
+                                    )
                                     result_text, written, operation_index = (
                                         await self._execute_model_tool(
                                             run_id, task.id, operation_index, tool,
@@ -923,6 +946,12 @@ class DockerSandboxDispatcher:
                     await compact_history()
                     continue
                 try:
+                    await self._event(
+                        run_id,
+                        "model_tool_running",
+                        _model_tool_progress_detail(tool, arguments),
+                        task_id=task.id,
+                    )
                     result_text, written, operation_index = await self._execute_model_tool(
                         run_id, task.id, operation_index, tool, arguments,
                         workspace, limits, route,
@@ -1021,7 +1050,8 @@ class DockerSandboxDispatcher:
             ),
         )
         diff_result, _diff_out, diff_err = await self._run_container(
-            run_id, self._docker_command(diff, workspace, run_id, limits), limits
+            run_id, self._docker_command(diff, workspace, run_id, limits), limits,
+            operation_index=operation_index,
         )
         if diff_result.returncode:
             raise RuntimeError(diff_err[-1000:] or "git diff failed")
@@ -1129,7 +1159,8 @@ class DockerSandboxDispatcher:
                 raise ValueError("invalid screenshot route or width")
             operation = FixedOperation(task_id, "capture-screenshot", ("python3", "/opt/next_screenshot.py"))
             result, stdout, stderr = await self._run_container(
-                run_id, self._docker_command(operation, workspace, run_id, limits), limits
+                run_id, self._docker_command(operation, workspace, run_id, limits), limits,
+                operation_index=operation_index + 1,
             )
             operation_index += 1
             await self._operation(
@@ -1153,7 +1184,8 @@ class DockerSandboxDispatcher:
             op_name, command, network = MODEL_COMMANDS[name]
             operation = FixedOperation(task_id, op_name, command, network=network)
             result, stdout, stderr = await self._run_container(
-                run_id, self._docker_command(operation, workspace, run_id, limits), limits
+                run_id, self._docker_command(operation, workspace, run_id, limits), limits,
+                operation_index=operation_index + 1,
             )
             operation_index += 1
             status = "passed" if result.returncode == 0 else "failed"
@@ -1743,7 +1775,12 @@ class DockerSandboxDispatcher:
             await asyncio.to_thread(remove_preview, self.preview_root / identifier)
 
     async def _run_container(
-        self, run_id: int, command: list[str], limits: WorkerLimits
+        self,
+        run_id: int,
+        command: list[str],
+        limits: WorkerLimits,
+        *,
+        operation_index: int,
     ) -> tuple[subprocess.CompletedProcess[str], str, str]:
         container = f"chitti-worker-{run_id}"
         self._containers[run_id] = container
@@ -1751,13 +1788,21 @@ class DockerSandboxDispatcher:
         self._processes[run_id] = process
         try:
             stdout_task = asyncio.create_task(
-                asyncio.to_thread(
-                    self._read_limited, process.stdout, max(1, limits.output_bytes // 2)
+                self._read_stream_live_async(
+                    run_id,
+                    operation_index,
+                    "stdout",
+                    process.stdout,
+                    max(1, limits.output_bytes // 2),
                 )
             )
             stderr_task = asyncio.create_task(
-                asyncio.to_thread(
-                    self._read_limited, process.stderr, max(1, limits.output_bytes // 2)
+                self._read_stream_live_async(
+                    run_id,
+                    operation_index,
+                    "stderr",
+                    process.stderr,
+                    max(1, limits.output_bytes // 2),
                 )
             )
             try:
@@ -1836,6 +1881,136 @@ class DockerSandboxDispatcher:
             )
         except TimeoutError:
             return
+
+    async def _read_stream_live_async(
+        self,
+        run_id: int,
+        operation_index: int,
+        stream_name: str,
+        stream: IO[bytes] | None,
+        limit: int,
+    ) -> tuple[str, bool]:
+        if stream is None:
+            return "", False
+        chunks: list[bytes] = []
+        buffer = bytearray()
+        total = 0
+        offset = 0
+        sequence = 0
+        exceeded = False
+        read_task = asyncio.create_task(
+            asyncio.to_thread(stream.read, min(65536, limit + 1))
+        )
+        last_flush = time.monotonic()
+        while True:
+            done, _ = await asyncio.wait(
+                {read_task},
+                timeout=max(0.01, LIVE_OUTPUT_FLUSH_SECONDS - (time.monotonic() - last_flush)),
+            )
+            if not done:
+                if buffer:
+                    await self._append_output_chunk(
+                        run_id, operation_index, stream_name, sequence, offset, bytes(buffer)
+                    )
+                    sequence += 1
+                    offset += len(buffer)
+                    buffer.clear()
+                last_flush = time.monotonic()
+                continue
+            chunk = read_task.result()
+            if not chunk:
+                if buffer:
+                    await self._append_output_chunk(
+                        run_id, operation_index, stream_name, sequence, offset, bytes(buffer)
+                    )
+                break
+            remaining = limit - total
+            if remaining <= 0:
+                exceeded = True
+                break
+            retained = chunk[:remaining]
+            chunks.append(retained)
+            buffer.extend(retained)
+            total += len(retained)
+            if len(chunk) > remaining:
+                exceeded = True
+            if len(buffer) >= LIVE_OUTPUT_FLUSH_BYTES:
+                await self._append_output_chunk(
+                    run_id, operation_index, stream_name, sequence, offset, bytes(buffer)
+                )
+                sequence += 1
+                offset += len(buffer)
+                buffer.clear()
+                last_flush = time.monotonic()
+            if exceeded:
+                if buffer:
+                    await self._append_output_chunk(
+                        run_id, operation_index, stream_name, sequence, offset, bytes(buffer)
+                    )
+                break
+            read_task = asyncio.create_task(
+                asyncio.to_thread(stream.read, min(65536, limit - total + 1))
+            )
+        return b"".join(chunks).decode("utf-8", errors="replace"), exceeded
+
+    async def _append_output_chunk(
+        self,
+        run_id: int,
+        operation_index: int,
+        stream_name: str,
+        sequence: int,
+        byte_offset: int,
+        content: bytes,
+    ) -> None:
+        if not content:
+            return
+        async with self.database.sessions() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO worker_operation_output_chunks "
+                    "(run_id, operation_index, stream, sequence, byte_offset, content) "
+                    "VALUES (:run_id, :operation_index, :stream, :sequence, "
+                    ":byte_offset, :content)"
+                ),
+                {
+                    "run_id": run_id,
+                    "operation_index": operation_index,
+                    "stream": stream_name,
+                    "sequence": sequence,
+                    "byte_offset": byte_offset,
+                    "content": content,
+                },
+            )
+            await session.execute(
+                text(
+                    "WITH retained AS ("
+                    "SELECT id, COALESCE(SUM(octet_length(content)) OVER ("
+                    "PARTITION BY run_id, operation_index ORDER BY id DESC"
+                    "), 0) AS retained_bytes "
+                    "FROM worker_operation_output_chunks "
+                    "WHERE run_id = :run_id AND operation_index = :operation_index"
+                    ") DELETE FROM worker_operation_output_chunks c "
+                    "USING retained r WHERE c.id = r.id "
+                    "AND r.retained_bytes > :maximum"
+                ),
+                {
+                    "run_id": run_id,
+                    "operation_index": operation_index,
+                    "maximum": LIVE_OUTPUT_TAIL_BYTES,
+                },
+            )
+            await session.commit()
+
+    async def _prune_output_chunks(self, run_id: int, operation_index: int) -> None:
+        async with self.database.sessions() as session:
+            await session.execute(
+                text(
+                    "DELETE FROM worker_operation_output_chunks "
+                    "WHERE run_id = :run_id AND operation_index = :operation_index"
+                ),
+                {"run_id": run_id, "operation_index": operation_index},
+            )
+            await session.commit()
 
     def _read_limited(
         self, stream: IO[bytes] | None, limit: int
@@ -1957,6 +2132,14 @@ class DockerSandboxDispatcher:
                     {"artifact_id": artifact_id, "content": content.encode()},
                 )
             await session.commit()
+        await self._prune_output_chunks(run_id, index)
+        await self._event(
+            run_id,
+            "operation_complete",
+            f"{operation.name} · {status} · exit {exit_code}",
+            operation_index=index,
+            task_id=operation.task_id,
+        )
 
     async def _capture_workspace_artifacts(
         self,
@@ -2147,6 +2330,29 @@ class WorkerRunManager:
                 {"run_id": run_id, "event_id": event_id},
             )
             return [dict(row._mapping) for row in result]
+
+    async def output_chunks_after(
+        self, run_id: int, chunk_id: int
+    ) -> list[dict[str, object]]:
+        async with self.database.sessions() as session:
+            result = await session.execute(
+                text(
+                    "SELECT id, operation_index, stream, sequence, byte_offset, "
+                    "content, created_at "
+                    "FROM worker_operation_output_chunks "
+                    "WHERE run_id = :run_id AND id > :chunk_id ORDER BY id"
+                ),
+                {"run_id": run_id, "chunk_id": chunk_id},
+            )
+            return [
+                {
+                    **dict(row._mapping),
+                    "content": bytes(row._mapping["content"]).decode(
+                        "utf-8", errors="replace"
+                    ),
+                }
+                for row in result
+            ]
 
 def _confined_path(workspace: Path, requested: str) -> Path:
     if not requested or "\x00" in requested:

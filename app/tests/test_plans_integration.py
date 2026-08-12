@@ -1,8 +1,10 @@
+import hashlib
 import os
 import shutil
 import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import text
@@ -27,7 +29,9 @@ from chitti.runner import (
 from chitti.worker import (
     MAX_CAPTURE_ARTIFACTS_PER_RUN,
     DockerSandboxDispatcher,
+    FixedOperation,
     WorkerLimits,
+    WorkerRunManager,
     approved_revision,
 )
 
@@ -395,3 +399,77 @@ async def test_claimed_cancellation_is_not_reconciled(database) -> None:
             {"run": run_id},
         )
     assert await reconcile_cancelled_run(adapter) is None  # type: ignore[arg-type]
+
+
+async def test_live_output_chunks_are_cursorable_bounded_and_pruned_after_artifact(
+    database,
+) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(session, "runner", "Build fixture.", document())
+        result = await session.execute(
+            text(
+                "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
+                "VALUES (:revision, '{}'::json, 'live-output-test') RETURNING id"
+            ),
+            {"revision": revision_id},
+        )
+        run_id = int(result.scalar_one())
+
+    adapter = _DatabaseAdapter(database)
+    dispatcher = DockerSandboxDispatcher(adapter)  # type: ignore[arg-type]
+    await dispatcher._append_output_chunk(
+        run_id, 0, "stdout", 0, 0, b"first\n"
+    )
+    manager = WorkerRunManager(adapter)  # type: ignore[arg-type]
+    chunks = await manager.output_chunks_after(run_id, 0)
+    assert [chunk["content"] for chunk in chunks] == ["first\n"]
+    resumed = await manager.output_chunks_after(run_id, int(chunks[0]["id"]))
+    assert resumed == []
+
+    await dispatcher._append_output_chunk(
+        run_id, 0, "stdout", 1, 6, b"x" * (256 * 1024)
+    )
+    async with database.begin() as session:
+        count = await session.execute(
+            text(
+                "SELECT COALESCE(SUM(octet_length(content)), 0) "
+                "FROM worker_operation_output_chunks "
+                "WHERE run_id = :run AND operation_index = 0"
+            ),
+            {"run": run_id},
+        )
+        assert int(count.scalar_one()) <= 256 * 1024
+
+    operation = FixedOperation("scene", "build", ("true",))
+    await dispatcher._operation(
+        run_id,
+        operation,
+        0,
+        "passed",
+        "authoritative output\n",
+        "",
+        0,
+        datetime.now(UTC),
+    )
+    async with database.begin() as session:
+        chunks_left = await session.execute(
+            text(
+                "SELECT COUNT(*) FROM worker_operation_output_chunks "
+                "WHERE run_id = :run AND operation_index = 0"
+            ),
+            {"run": run_id},
+        )
+        artifact = await session.execute(
+            text(
+                "SELECT a.sha256, p.content FROM worker_artifacts a "
+                "JOIN worker_artifact_payloads p ON p.artifact_id = a.id "
+                "WHERE a.run_id = :run AND a.operation_id = "
+                "(SELECT id FROM worker_operations WHERE run_id = :run "
+                "AND operation_index = 0) AND a.kind = 'stdout'"
+            ),
+            {"run": run_id},
+        )
+        assert chunks_left.scalar_one() == 0
+        row = artifact.one()
+        assert row[0] == hashlib.sha256(b"authoritative output\n").hexdigest()
+        assert bytes(row[1]) == b"authoritative output\n"
