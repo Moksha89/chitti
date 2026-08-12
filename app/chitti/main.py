@@ -41,9 +41,11 @@ from .plans import (
 from .previews import manifest_from_json, safe_preview_file
 from .project_state import ProjectState
 from .provider import FakeProvider, LiteLLMProvider
+from .run_context import RunContextError, build_run_evidence
 from .service import ChittiService
 from .settings import Settings, get_settings
 from .telegram import TelegramPoller
+from .transcripts import recent_entries
 from .worker import WorkerLimits, WorkerRunManager
 
 logging.basicConfig(
@@ -73,6 +75,7 @@ class ChatRequest(BaseModel):
     namespace: str = SHARED_NAMESPACE
     plan_requested: bool = False
     history: list[dict[str, str]] = Field(default_factory=list)
+    run_id: int | None = None
 
 
 def build_service(settings: Settings) -> ChittiService:
@@ -355,6 +358,7 @@ async def dashboard_context(
         decisions = await memory.decisions(db_session, namespace)
         conflicts = await memory.conflicts(db_session, namespace)
         plans = await latest_revisions(db_session, namespace)
+        transcript = await recent_entries(db_session, namespace)
         for plan in plans:
             approval_result = await db_session.execute(
                 text(
@@ -388,6 +392,7 @@ async def dashboard_context(
         "display_timezone": request.app.state.settings.display_timezone,
         "namespace": namespace,
         "namespace_options": namespace_options(),
+        "transcript": transcript,
     }
 
 
@@ -1363,13 +1368,21 @@ async def chat(payload: ChatRequest, request: Request) -> dict[str, object]:
         )
     try:
         async with database.sessions() as db_session:
+            run_evidence = (
+                await build_run_evidence(db_session, payload.run_id, namespace)
+                if payload.run_id is not None
+                else None
+            )
             result = await service.turn(
                 db_session,
                 payload.message,
                 payload.project,
                 payload.history,
                 namespace,
+                run_evidence,
             )
+    except RunContextError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         logging.getLogger(__name__).exception("chat_provider_failed")
         raise HTTPException(status_code=503, detail="model provider unavailable") from exc
@@ -1384,12 +1397,16 @@ async def chat(payload: ChatRequest, request: Request) -> dict[str, object]:
             "\n\nI created a plan draft for "
             f"{plan_project}. It is waiting for your approval; nothing will execute."
         )
-    return {
+    response: dict[str, object] = {
         "reply": reply,
         "reply_html": render_markdown(reply),
         "conflicts": [asdict(item) for item in result.conflicts],
         "plan_job_id": plan_job_id,
     }
+    if run_evidence is not None:
+        response["evidence_used"] = list(run_evidence.evidence_used)
+        response["evidence_clipped"] = run_evidence.clipped
+    return response
 
 
 @app.get("/plans/jobs/{job_id}")

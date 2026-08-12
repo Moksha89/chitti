@@ -23,11 +23,13 @@ from chitti.plans import (
     revision_by_id,
     validate_approval_binding,
 )
+from chitti.run_context import RunContextError, build_run_evidence
 from chitti.runner import (
     cancellation_requested,
     next_queued_run,
     reconcile_cancelled_run,
 )
+from chitti.transcripts import append_entry, recent_entries
 from chitti.worker import (
     MAX_CAPTURE_ARTIFACTS_PER_RUN,
     DockerSandboxDispatcher,
@@ -127,6 +129,137 @@ async def test_plan_project_keeps_namespace_as_a_separate_scope(database) -> Non
         assert revision.project == "animated-3d"
         assert revision.namespace == "pj-digi"
         assert hidden is None
+
+
+async def test_run_evidence_is_namespace_scoped_and_failure_first(database) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(
+            session,
+            "animated-3d",
+            "Build the site.",
+            document(),
+            namespace="pj-digi",
+        )
+        run_id = int(
+            (
+                await session.execute(
+                    text(
+                        "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
+                        "VALUES (:revision, '{}'::json, 'run-context') RETURNING id"
+                    ),
+                    {"revision": revision_id},
+                )
+            ).scalar_one()
+        )
+        now = datetime.now(UTC)
+        await session.execute(
+            text(
+                "INSERT INTO worker_run_events "
+                "(run_id, status, detail, operation_index, task_id) "
+                "VALUES (:run, 'failed', 'task failed', 1, 'scene')"
+            ),
+            {"run": run_id},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO worker_operations "
+                "(run_id, task_id, operation_index, name, status, stdout, stderr, "
+                "exit_code, started_at, finished_at) "
+                "VALUES (:run, 'scene', 1, 'build', 'failed', "
+                "'failure output', 'missing module', 1, :now, :now)"
+            ),
+            {"run": run_id, "now": now},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO worker_operations "
+                "(run_id, task_id, operation_index, name, status, stdout, stderr, "
+                "exit_code, started_at, finished_at) "
+                "VALUES (:run, 'scene', 2, 'test', 'passed', "
+                "'success output', '', 0, :now, :now)"
+            ),
+            {"run": run_id, "now": now},
+        )
+        reviewer_id = int(
+            (
+                await session.execute(
+                    text(
+                        "INSERT INTO worker_artifacts "
+                        "(run_id, kind, path, content, sha256, byte_size) "
+                        "VALUES (:run, 'reviewer_report', 'reviewer.json', NULL, :sha, 20) "
+                        "RETURNING id"
+                    ),
+                    {"run": run_id, "sha": "r" * 64},
+                )
+            ).scalar_one()
+        )
+        diff_id = int(
+            (
+                await session.execute(
+                    text(
+                        "INSERT INTO worker_artifacts "
+                        "(run_id, kind, path, content, sha256, byte_size) "
+                        "VALUES (:run, 'diff', 'change.diff', NULL, :sha, 50) "
+                        "RETURNING id"
+                    ),
+                    {"run": run_id, "sha": "d" * 64},
+                )
+            ).scalar_one()
+        )
+        await session.execute(
+            text(
+                "INSERT INTO worker_artifact_payloads (artifact_id, content) "
+                "VALUES (:reviewer, :reviewer_content), (:diff, :diff_content)"
+            ),
+            {
+                "reviewer": reviewer_id,
+                "reviewer_content": b'{"verdict":"fail","summary":"missing module"}',
+                "diff": diff_id,
+                "diff_content": b"diff --git a/page.js b/page.js\n+new\n-old\n",
+            },
+        )
+        await session.execute(
+            text(
+                "INSERT INTO plan_task_events "
+                "(revision_id, task_id, event_type, status, detail) "
+                "VALUES (:revision, 'scene', 'completed', 'failed', 'missing module')"
+            ),
+            {"revision": revision_id},
+        )
+
+        evidence = await build_run_evidence(session, run_id, "pj-digi")
+
+        assert "missing module" in evidence.context
+        assert evidence.context.index("[failed operation]") < evidence.context.index(
+            "[successful operations]"
+        )
+        assert "page.js" in evidence.context
+        assert "screenshot" not in evidence.context.lower()
+        assert "model prompt" not in evidence.context.lower()
+        with pytest.raises(RunContextError):
+            await build_run_evidence(session, run_id, "jsv-fashion")
+        with pytest.raises(RunContextError):
+            await build_run_evidence(session, 999999, "pj-digi")
+
+
+async def test_transcript_is_append_only_and_namespace_scoped(database) -> None:
+    async with database.begin() as session:
+        await append_entry(session, "pj-digi", "user", "PJ question")
+        await append_entry(session, "pj-digi", "assistant", "PJ answer")
+        await append_entry(session, "jsv-fashion", "user", "JSV question")
+
+        pj_entries = await recent_entries(session, "pj-digi")
+        jsv_entries = await recent_entries(session, "jsv-fashion")
+
+        assert [entry["content"] for entry in pj_entries] == ["PJ question", "PJ answer"]
+        assert [entry["content"] for entry in jsv_entries] == ["JSV question"]
+        with pytest.raises(DBAPIError):
+            await session.execute(
+                text(
+                    "UPDATE chat_transcript_entries SET content = 'rewritten' "
+                    "WHERE namespace = 'pj-digi'"
+                )
+            )
 
 
 async def test_worker_approval_gate_rechecks_exact_content_hash(database) -> None:

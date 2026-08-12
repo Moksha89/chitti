@@ -403,7 +403,8 @@ BEGIN
     'reject_worker_model_call_mutation_trigger',
     'reject_export_manifest_mutation_trigger',
     'reject_promotion_approval_mutation_trigger',
-    'reject_preview_mutation_trigger'
+    'reject_preview_mutation_trigger',
+    'chat_transcript_entries_immutable'
   ] LOOP
     IF NOT EXISTS (
       SELECT 1 FROM pg_trigger
