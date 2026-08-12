@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import re
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-RUNNER_ACCESS_SOURCE_FILES = (
-    "runner.py",
-    "worker.py",
-    "reminders.py",
-    "runner_health.py",
+RUNNER_ACCESS_MODULES = (
+    "chitti.runner",
+    "chitti.worker",
+    "chitti.reminders",
+    "chitti.runner_health",
 )
 RUNNER_ACCESS_EXCLUSIONS = {
     # These helpers also serve the application process, but the runner never
@@ -29,6 +30,9 @@ _TABLE_ALIAS = re.compile(
 def required_privileges(
     source_texts: list[str], known_tables: set[str] | None = None
 ) -> dict[str, set[str]]:
+    # This deliberately stays a small regex scan, so dynamic table names and
+    # unusual SQL shapes can be missed. False positives fail deployment safely;
+    # the durable runner health surface is the backstop for missed references.
     privileges: dict[str, set[str]] = {}
     aliases: dict[str, str] = {}
     for source in source_texts:
@@ -71,13 +75,36 @@ async def assert_runner_privileges(
             "WHERE table_schema = 'public'"
         )
     }
-    if source_texts is None:
-        source_root = Path("/app/chitti")
-        source_texts = [
-            (source_root / filename).read_text(encoding="utf-8")
-            for filename in RUNNER_ACCESS_SOURCE_FILES
-        ]
+    loaded_runtime_sources = source_texts is None
+    if loaded_runtime_sources:
+        source_texts = []
+        for module_name in RUNNER_ACCESS_MODULES:
+            try:
+                module = import_module(module_name)
+            except Exception as exc:
+                raise SystemExit(
+                    f"runner privilege source is not importable: {module_name}"
+                ) from exc
+            module_file = getattr(module, "__file__", None)
+            if not module_file:
+                raise SystemExit(
+                    f"runner privilege source has no file: {module_name}"
+                )
+            try:
+                source = Path(module_file).resolve().read_text(encoding="utf-8")
+            except OSError as exc:
+                raise SystemExit(
+                    f"runner privilege source cannot be read: {module_name}"
+                ) from exc
+            if not source.strip():
+                raise SystemExit(f"runner privilege source is empty: {module_name}")
+            source_texts.append(source)
+    assert source_texts is not None
+    if loaded_runtime_sources and len(source_texts) != len(RUNNER_ACCESS_MODULES):
+        raise SystemExit("runner privilege source derivation is incomplete")
     required = required_privileges(source_texts, tables)
+    if len(required) < len(source_texts):
+        raise SystemExit("runner privilege source derivation found too few tables")
     for table, privileges in required.items():
         for privilege in privileges:
             allowed = await conn.fetchval(
