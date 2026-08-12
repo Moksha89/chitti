@@ -7,17 +7,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .embedding import EmbedderProtocol, vector_literal
+from .namespaces import MEMORY_NAMESPACES, SHARED_NAMESPACE
 from .provider import ExtractedMemory
 
 logger = logging.getLogger(__name__)
-SHARED_NAMESPACE = "general"
-MEMORY_NAMESPACES = {
-    SHARED_NAMESPACE: "Shared / general",
-    "pj-digi": "PJ Digi",
-    "jsv-fashion": "JSV Fashion",
-    "andhrawala": "Andhrawala",
-    "vsports": "VSports",
-}
 
 
 @dataclass(frozen=True)
@@ -70,7 +63,7 @@ class MemoryStore:
         self.embedder = embedder
 
     async def append_decision(
-        self, session: AsyncSession, item: ExtractedMemory, namespace: str = SHARED_NAMESPACE
+        self, session: AsyncSession, item: ExtractedMemory, namespace: str
     ) -> int:
         namespace = normalize_namespace(namespace)
         result = await session.execute(
@@ -127,7 +120,11 @@ class MemoryStore:
                 "ORDER BY CASE WHEN d.namespace = :namespace THEN 0 ELSE 1 END, d.id "
                 "LIMIT 1"
             ),
-            {"key": normalize_key(memory.key), "namespace": namespace, "shared": SHARED_NAMESPACE},
+            {
+                "key": normalize_key(memory.key),
+                "namespace": namespace,
+                "shared": SHARED_NAMESPACE,
+            },
         )
         item = result.mappings().one_or_none()
         return (dict(item), 1.0) if item is not None else (None, 0.0)
@@ -299,7 +296,7 @@ class MemoryStore:
         source_type: str,
         source_id: str | None,
         metadata: dict[str, object],
-        namespace: str = SHARED_NAMESPACE,
+        namespace: str,
     ) -> None:
         namespace = normalize_namespace(namespace)
         metadata = {**metadata, "namespace": namespace}
@@ -318,8 +315,8 @@ class MemoryStore:
             "metadata": json.dumps(metadata),
             "embedding": embedding,
             "namespace": namespace,
-        },
-    )
+            },
+        )
 
     async def recall(
         self, session: AsyncSession, query: str, namespace: str, limit: int = 5
@@ -335,7 +332,12 @@ class MemoryStore:
                 "ORDER BY embedding <=> CAST(:embedding AS vector) "
                 "LIMIT CAST(:limit AS integer)"
             ),
-        {"embedding": embedding, "namespace": namespace, "shared": SHARED_NAMESPACE, "limit": limit},
+            {
+                "embedding": embedding,
+                "namespace": namespace,
+                "shared": SHARED_NAMESPACE,
+                "limit": limit,
+            },
         )
         return [
             Recall(str(row.content), str(row.source_type), float(row.similarity))
@@ -344,7 +346,7 @@ class MemoryStore:
 
     async def supersede(
         self, session: AsyncSession, old_id: int, replacement: ExtractedMemory,
-        namespace: str = SHARED_NAMESPACE,
+        namespace: str,
     ) -> int:
         new_id = await self.append_decision(session, replacement, namespace)
         await session.execute(

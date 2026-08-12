@@ -40,7 +40,7 @@ async def test_append_only_and_retrieval(store) -> None:
     async with engine.connect() as session:
         item = ExtractedMemory("stack", "FastAPI", "user stated", None, "user_stated")
         async with session.begin():
-            first = await memory.append_decision(session, item)
+            first = await memory.append_decision(session, item, "general")
             conflicts = await memory.record_memories(session, [item], "general")
             assert first > 0
             assert conflicts == []

@@ -59,3 +59,7 @@ def test_retrieval_requires_an_explicit_namespace_argument() -> None:
         store.recall(None, "query")  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         store.active_beliefs(None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        store.append_decision(None, None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        store.add_chunk(None, "content", "note", None, {})  # type: ignore[arg-type]
