@@ -91,6 +91,23 @@ def test_many_failures_do_not_crowd_out_verdict_or_publication() -> None:
     assert "failed operation" in evidence.clipped_sections
 
 
+def test_trimmed_failed_operation_preserves_stderr_tail() -> None:
+    section = (
+        "FAILED operation 1 task scene build (exit 1):\n"
+        "stderr tail:\nold diagnostic\nREAL_ERROR\n"
+        "stdout tail:\n"
+        + "ordinary output " * 40
+    )
+
+    evidence = bound_context(
+        [("run", "Run 22"), ("failed operation", section), ("reviewer", "verdict=fail")],
+        max_bytes=180,
+    )
+
+    assert "REAL_ERROR" in evidence.context
+    assert evidence.context.index("stderr tail") < evidence.context.index("stdout tail")
+
+
 def test_diff_summary_reports_files_and_line_changes_without_body() -> None:
     diff = (
         b"diff --git a/page.js b/page.js\n+new line\n-old line\n"

@@ -26,6 +26,52 @@ class RunEvidence:
     clipped_sections: tuple[str, ...] = ()
 
 
+def _fit_text(value: str, limit: int, from_end: bool = False) -> str:
+    encoded = value.encode()
+    if len(encoded) <= limit:
+        return value
+    retained = encoded[-limit:] if from_end else encoded[:limit]
+    return retained.decode("utf-8", errors="ignore")
+
+
+def _trim_failed_operation(section: str, limit: int) -> str:
+    stderr_marker = "\nstderr tail:\n"
+    stdout_marker = "\nstdout tail:\n"
+    prefix, _, stderr_and_stdout = section.partition(stderr_marker)
+    if not _:
+        heading, separator, body = section.partition("\n")
+        if not separator:
+            return _fit_text(section, limit, from_end=True)
+        heading = heading + separator
+        return heading + _fit_text(body, max(0, limit - len(heading.encode())), from_end=True)
+    stderr, _, stdout = stderr_and_stdout.partition(stdout_marker)
+    prefix_text = prefix + stderr_marker
+    retained = _fit_text(prefix_text, limit)
+    remaining = limit - len(retained.encode())
+    if remaining <= 0:
+        return retained
+    retained_stderr = _fit_text(stderr, remaining, from_end=True)
+    retained += retained_stderr
+    remaining -= len(retained_stderr.encode())
+    if stdout and remaining > len(stdout_marker.encode()):
+        retained += stdout_marker
+        retained += _fit_text(stdout, remaining - len(stdout_marker.encode()), from_end=True)
+    return retained
+
+
+def _trim_section(label: str, section: str, limit: int) -> str:
+    if label == "failed operation":
+        return _trim_failed_operation(section, limit)
+    if label in {"run", "task states"}:
+        heading, separator, body = section.partition("\n")
+        if separator:
+            heading += separator
+            return heading + _fit_text(
+                body, max(0, limit - len(heading.encode())), from_end=True
+            )
+    return _fit_text(section, limit)
+
+
 def bound_context(
     sections: list[tuple[str, str]], max_bytes: int = MAX_RUN_CONTEXT_BYTES
 ) -> RunEvidence:
@@ -34,19 +80,15 @@ def bound_context(
     remaining = max_bytes
     clipped = False
     clipped_sections: list[str] = []
+    reserve_each = min(768, max(16, max_bytes // 20))
     reserve_marker = min(128, max(16, max_bytes // 20))
-    section_sizes = [
-        (label, len(f"[{label}]\n{section}\n".encode()))
-        for label, section in sections
-    ]
     for index, (label, section) in enumerate(sections):
         rendered = f"[{label}]\n{section}\n"
         encoded = rendered.encode("utf-8")
-        later_reserve = sum(
-            min(size, max(4, max_bytes // 20))
-            for later_label, size in section_sizes[index + 1 :]
-            if later_label != label
-        )
+        later_labels = {
+            later_label for later_label, _ in sections[index + 1 :] if later_label != label
+        }
+        later_reserve = len(later_labels) * reserve_each
         available = max(0, remaining - later_reserve - reserve_marker)
         if len(encoded) <= available:
             chunks.append(rendered)
@@ -56,20 +98,13 @@ def bound_context(
         clipped = True
         if label not in clipped_sections:
             clipped_sections.append(label)
-        if available > 0:
-            partial = encoded[:available].decode("utf-8", errors="ignore")
+        if available > 0 and label == "failed operation":
+            partial = _trim_section(label, rendered, available)
             chunks.append(partial)
             if label not in used:
                 used.append(label)
             remaining -= len(partial.encode("utf-8"))
-    marker = (
-        "\n[context clipped: "
-        + ", ".join(clipped_sections)
-        + " omitted or trimmed]\n"
-    )
-    marker_bytes = marker.encode("utf-8")
-    current = "".join(chunks).encode("utf-8")
-    if len(current) + len(marker_bytes) > max_bytes:
+    if clipped:
         compact_labels = {
             "failed operation": "failed output",
             "successful operations": "success",
@@ -77,17 +112,20 @@ def bound_context(
             "event tail": "events",
             "publication": "publication state",
         }
-        label = compact_labels.get(clipped_sections[0], clipped_sections[0])
-        marker = "[context clipped: " + label + "]"
-        marker_bytes = marker.encode("utf-8")
-    if len(current) + len(marker_bytes) > max_bytes:
-        keep = max(0, max_bytes - len(marker_bytes))
-        current = current[:keep]
-    context = current.decode("utf-8", errors="ignore") + marker if clipped else current.decode(
-        "utf-8", errors="ignore"
-    )
-    if len(context.encode("utf-8")) > max_bytes:
-        context = context.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+        labels = ", ".join(
+            compact_labels.get(label, label) for label in clipped_sections
+        )
+        marker = f"\n[context clipped: {labels} omitted or trimmed]\n"
+        if len("".join(chunks).encode()) + len(marker.encode()) > max_bytes:
+            first = compact_labels.get(clipped_sections[0], clipped_sections[0])
+            marker = f"[context clipped: {first}]"
+        marker = _fit_text(marker, max_bytes, from_end=False)
+        context = _fit_text(
+            "".join(chunks),
+            max(0, max_bytes - len(marker.encode())),
+        ) + marker
+    else:
+        context = "".join(chunks)
     return RunEvidence(
         context, tuple(used), clipped, tuple(clipped_sections)
     )
@@ -230,8 +268,8 @@ async def build_run_evidence(
                 f"FAILED operation {operation['operation_index']} "
                 f"task {operation['task_id']} {operation['name']} "
                 f"(exit {operation['exit_code']}):\n"
-                f"stdout tail:\n{_tail(operation['stdout'])}\n"
-                f"stderr tail:\n{_tail(operation['stderr'])}",
+                f"stderr tail:\n{_tail(operation['stderr'])}\n"
+                f"stdout tail:\n{_tail(operation['stdout'])}",
             )
         )
     if reviewer is not None:
