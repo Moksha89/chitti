@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -19,7 +20,12 @@ from chitti.plans import (
     validate_approval_binding,
 )
 from chitti.runner import cancellation_requested, next_queued_run
-from chitti.worker import approved_revision
+from chitti.worker import (
+    MAX_CAPTURE_ARTIFACTS_PER_RUN,
+    DockerSandboxDispatcher,
+    WorkerLimits,
+    approved_revision,
+)
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("RUN_DB_TESTS"), reason="set RUN_DB_TESTS=1 to run PostgreSQL integration tests"
@@ -166,6 +172,117 @@ async def test_worker_artifact_payload_retention_preserves_audit_record(database
         )
         assert record.one() == ("a" * 64, 4)
     assert await cancellation_requested(_DatabaseAdapter(database), run_id)
+
+
+async def test_captured_screenshot_survives_later_run_failure_cleanup(
+    database, tmp_path
+) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(session, "sandbox", "Build fixture.", document())
+        result = await session.execute(
+            text(
+                "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
+                "VALUES (:revision, '{}'::json, 'run-capture') RETURNING id"
+            ),
+            {"revision": revision_id},
+        )
+        run_id = int(result.scalar_one())
+
+    workspace = tmp_path / "workspace"
+    artifacts = workspace / "artifacts"
+    artifacts.mkdir(parents=True)
+    (artifacts / "phone.png").write_bytes(b"phone-image")
+    (artifacts / "desktop.png").write_bytes(b"desktop-image")
+    (artifacts / "browser-errors.json").write_text("[]")
+    dispatcher = DockerSandboxDispatcher(
+        _DatabaseAdapter(database),
+        workspace_root=tmp_path / "runs",
+        preview_root=tmp_path / "previews",
+        preview_staging_root=tmp_path / "staging",
+    )
+
+    await dispatcher._capture_workspace_artifacts(
+        run_id, workspace, WorkerLimits(artifact_bytes=1024)
+    )
+    (artifacts / "phone.png").write_bytes(b"new-phone-image")
+    await dispatcher._capture_workspace_artifacts(
+        run_id, workspace, WorkerLimits(artifact_bytes=1024)
+    )
+    shutil.rmtree(workspace)
+
+    async with database.begin() as session:
+        rows = await session.execute(
+            text(
+                "SELECT a.id, a.kind, a.path, p.content "
+                "FROM worker_artifacts a "
+                "JOIN worker_artifact_payloads p ON p.artifact_id = a.id "
+                "WHERE a.run_id = :run AND a.kind = 'screenshot' "
+                "ORDER BY a.path, a.id"
+            ),
+            {"run": run_id},
+        )
+        screenshot_rows = list(rows)
+        assert len(screenshot_rows) == 4
+        assert [
+            (row[1], row[2], bytes(row[3])) for row in screenshot_rows
+        ] == [
+            ("screenshot", "artifacts/desktop.png", b"desktop-image"),
+            ("screenshot", "artifacts/desktop.png", b"desktop-image"),
+            ("screenshot", "artifacts/phone.png", b"phone-image"),
+            ("screenshot", "artifacts/phone.png", b"new-phone-image"),
+        ]
+        with pytest.raises(DBAPIError):
+            await session.execute(
+                text(
+                    "UPDATE worker_artifacts SET sha256 = :sha "
+                    "WHERE id = :artifact"
+                ),
+                {"sha": "f" * 64, "artifact": screenshot_rows[-1][0]},
+            )
+
+
+async def test_capture_artifact_count_is_bounded(database, tmp_path) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(session, "sandbox", "Build fixture.", document())
+        result = await session.execute(
+            text(
+                "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
+                "VALUES (:revision, '{}'::json, 'run-capture-cap') RETURNING id"
+            ),
+            {"revision": revision_id},
+        )
+        run_id = int(result.scalar_one())
+
+    workspace = tmp_path / "workspace-cap"
+    artifacts = workspace / "artifacts"
+    artifacts.mkdir(parents=True)
+    screenshot = artifacts / "desktop.png"
+    dispatcher = DockerSandboxDispatcher(
+        _DatabaseAdapter(database),
+        workspace_root=tmp_path / "runs",
+        preview_root=tmp_path / "previews",
+        preview_staging_root=tmp_path / "staging",
+    )
+    for index in range(40):
+        screenshot.write_bytes(f"capture-{index}".encode())
+        await dispatcher._capture_workspace_artifacts(
+            run_id, workspace, WorkerLimits(artifact_bytes=1024)
+        )
+
+    async with database.begin() as session:
+        result = await session.execute(
+            text(
+                "SELECT a.id, p.content "
+                "FROM worker_artifacts a "
+                "JOIN worker_artifact_payloads p ON p.artifact_id = a.id "
+                "WHERE a.run_id = :run AND a.kind = 'screenshot' "
+                "ORDER BY a.id"
+            ),
+            {"run": run_id},
+        )
+        rows = list(result)
+        assert len(rows) == MAX_CAPTURE_ARTIFACTS_PER_RUN
+        assert bytes(rows[-1][1]) == b"capture-31"
 
 
 async def test_runner_claim_is_atomic_and_cancellation_is_sticky(database) -> None:
