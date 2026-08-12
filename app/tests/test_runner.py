@@ -83,8 +83,26 @@ def test_reminder_sweep_failure_is_isolated(monkeypatch) -> None:
         reported.append((component, detail))
 
     monkeypatch.setattr("chitti.runner.record_runner_health_failure", report)
+    runner._last_reminder_health_success = 0.0
     asyncio.run(runner.best_effort_reminder_sweep(None))  # type: ignore[arg-type]
     assert reported == [("reminder_sweep", "RuntimeError: database unavailable")]
+
+
+def test_successful_reminder_sweep_health_write_is_throttled(monkeypatch) -> None:
+    async def sweep(_database, **_kwargs) -> int:
+        return 0
+
+    recorded: list[str] = []
+
+    async def report(_database, component) -> None:
+        recorded.append(component)
+
+    monkeypatch.setattr("chitti.runner.sweep_reminders", sweep)
+    monkeypatch.setattr("chitti.runner.record_runner_health_success", report)
+    runner._last_reminder_health_success = 0.0
+    asyncio.run(runner.best_effort_reminder_sweep(None))  # type: ignore[arg-type]
+    asyncio.run(runner.best_effort_reminder_sweep(None))  # type: ignore[arg-type]
+    assert recorded == ["reminder_sweep"]
 
 
 def test_runner_access_derives_new_schema_table_without_table_list() -> None:
