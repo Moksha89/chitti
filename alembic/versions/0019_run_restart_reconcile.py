@@ -4,8 +4,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0018_run_restart_reconcile"
-down_revision = "0017_chat_transcripts"
+revision = "0019_run_restart_reconcile"
+down_revision = "0018_reminders_notifications"
 branch_labels = None
 depends_on = None
 
