@@ -62,7 +62,7 @@ CSRF_FIELD = "csrf_token"
 RUN_EVENT_POLL_SECONDS = 1.0
 RUN_EVENT_HEARTBEAT_SECONDS = 15.0
 WORKSPACE_RUN_LIST_LIMIT = 25
-TERMINAL_RUN_STATUSES = {"passed", "failed", "cancelled"}
+TERMINAL_RUN_STATUSES = {"passed", "failed", "cancelled", "interrupted"}
 MAX_DIFF_BODY_BYTES = 12_000
 PROMOTION_APPROVAL_ACTORS = {"owner", "agent", "system"}
 
