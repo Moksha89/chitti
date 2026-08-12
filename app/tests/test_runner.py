@@ -9,6 +9,7 @@ from chitti import runner
 from chitti.previews import build_manifest, copy_export
 from chitti.provider import GatewayMisconfigurationError, GatewayTransientError
 from chitti.reminders import next_due
+from chitti.runner_access import assert_runner_privileges, required_privileges
 from chitti.worker import RunBudgetExceeded
 
 
@@ -72,7 +73,41 @@ def test_reminder_sweep_failure_is_isolated(monkeypatch) -> None:
         raise RuntimeError("database unavailable")
 
     monkeypatch.setattr("chitti.runner.sweep_reminders", fail)
+    reported: list[tuple[str, str]] = []
+
+    async def report(_database, component, detail) -> None:
+        reported.append((component, detail))
+
+    monkeypatch.setattr("chitti.runner.record_runner_health_failure", report)
     asyncio.run(runner.best_effort_reminder_sweep(None))  # type: ignore[arg-type]
+    assert reported == [("reminder_sweep", "RuntimeError: database unavailable")]
+
+
+def test_runner_access_derives_new_schema_table_without_table_list() -> None:
+    assert required_privileges(
+        ["SELECT id FROM newly_added_table"],
+        {"newly_added_table"},
+    ) == {"newly_added_table": {"SELECT"}}
+
+
+def test_runner_access_fails_when_required_grant_is_missing() -> None:
+    class Connection:
+        async def fetch(self, _query):
+            return [{"table_name": "reminders"}]
+
+        async def fetchval(self, query, table, privilege=None):
+            if "has_table_privilege" in query:
+                return not (table == "reminders" and privilege == "SELECT")
+            return None
+
+    with pytest.raises(SystemExit, match="runner lacks SELECT on reminders"):
+        asyncio.run(
+            assert_runner_privileges(
+                Connection(),
+                ["SELECT id FROM reminders"],
+                {"reminders"},
+            )
+        )
 
 
 def test_recurrence_preserves_local_wall_clock_across_dst() -> None:

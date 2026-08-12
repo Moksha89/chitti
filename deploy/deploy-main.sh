@@ -433,82 +433,8 @@ async def main():
     if current_user != "chitti_runner":
         raise SystemExit("runner role identity check failed")
 
-    # Derived from the SQL paths in worker.py and runner.py, rather than
-    # copied from runner-role.sql.
-    reads = [
-        "plan_revisions", "plan_approvals", "decisions", "decision_forgets",
-        "worker_runs", "worker_run_events", "worker_operations",
-        "worker_artifacts", "worker_retention_policy",
-        "worker_artifact_payloads", "worker_model_calls",
-        "export_manifests", "promotion_approvals", "previews",
-    ]
-    inserts = [
-        "plan_task_events", "worker_run_events", "worker_operations",
-        "worker_artifacts", "worker_artifact_payloads", "worker_model_calls",
-        "export_manifests", "previews",
-    ]
-    updates = ["worker_runs"]  # SELECT ... FOR UPDATE OF worker_runs in runner.py
-    deletes = ["worker_artifact_payloads"]
-    async def require_table_privilege(table, privilege):
-        allowed = await conn.fetchval(
-            "SELECT has_table_privilege(current_user, $1, $2)", table, privilege
-        )
-        if not allowed:
-            raise SystemExit(f"runner lacks {privilege} on {table}")
-
-    async def require_sequence_privilege(table):
-        has_id = await conn.fetchval(
-            "SELECT EXISTS ("
-            "SELECT 1 FROM information_schema.columns "
-            "WHERE table_schema = $$public$$ AND table_name = $1 "
-            "AND column_name = $$id$$"
-            ")", table
-        )
-        if not has_id:
-            return
-        sequence = await conn.fetchval(
-            "SELECT pg_get_serial_sequence($1, $$id$$)", table
-        )
-        if sequence is None:
-            return
-        allowed = await conn.fetchval(
-            "SELECT has_sequence_privilege(current_user, $1, $$USAGE$$)",
-            sequence,
-        )
-        if not allowed:
-            raise SystemExit(f"runner lacks sequence usage on {sequence}")
-
-    for table in reads:
-        await require_table_privilege(table, "SELECT")
-    for table in inserts:
-        await require_table_privilege(table, "INSERT")
-    for table in updates:
-        await require_table_privilege(table, "UPDATE")
-    for table in deletes:
-        await require_table_privilege(table, "DELETE")
-    for table in inserts:
-        await require_sequence_privilege(table)
-
-    negatives = [
-        ("decisions", "INSERT"),
-        ("worker_runs", "INSERT"),
-    ]
-    for table, privilege in negatives:
-        allowed = await conn.fetchval(
-            "SELECT has_table_privilege(current_user, $1, $2)", table, privilege
-        )
-        if allowed:
-            raise SystemExit(f"runner unexpectedly has {privilege} on {table}")
-    worker_runs_sequence = await conn.fetchval(
-        "SELECT pg_get_serial_sequence($1, $$id$$)", "worker_runs"
-    )
-    if worker_runs_sequence and await conn.fetchval(
-        "SELECT has_sequence_privilege(current_user, $1, $$USAGE$$)",
-        worker_runs_sequence,
-    ):
-        raise SystemExit(
-            f"runner unexpectedly has sequence usage on {worker_runs_sequence}"
-        )
+    from chitti.runner_access import assert_runner_privileges
+    await assert_runner_privileges(conn)
 
     await conn.close()
 

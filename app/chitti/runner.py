@@ -31,6 +31,7 @@ from .provider import (
 )
 from .reminders import sweep_reminders
 from .run_status import TERMINAL_RUN_STATUSES
+from .runner_health import clear_runner_health, record_runner_health_failure
 from .runtime_identity import write_loaded_code_identity
 from .settings import Settings, get_settings
 from .worker import (
@@ -71,8 +72,15 @@ async def best_effort_reminder_sweep(
 ) -> None:
     try:
         await sweep_reminders(database, timezone_name=timezone_name)
-    except Exception:
+        await clear_runner_health(database, "reminder_sweep")
+    except Exception as exc:
         logger.exception("reminder sweep failed")
+        try:
+            await record_runner_health_failure(
+                database, "reminder_sweep", f"{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            logger.exception("reminder sweep health reporting failed")
 
 
 async def next_queued_run(
