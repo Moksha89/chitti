@@ -48,6 +48,7 @@ MAX_PROGRESS_LEDGER_ITEM_CHARS = 160
 MAX_FILE_REWRITES_WITHOUT_COMMAND = 4
 MODEL_TOOL_CALL_BUDGET = 240
 MAX_FILE_WRITES_WITHOUT_COMMAND = 24
+REQUIRED_GATE_COMMANDS = ("build", "test", "export")
 
 
 class RunBudgetExceeded(RuntimeError):
@@ -60,6 +61,10 @@ class RunBudgetExceeded(RuntimeError):
 
 class ModelProgressError(RuntimeError):
     """The model loop stopped because it was not making useful progress."""
+
+
+class GateEvidenceContradiction(ModelProgressError):
+    """The loop stopped because gate evidence reached an impossible state."""
 
 
 def _model_call_failure_detail(route: str, exc: Exception) -> str:
@@ -114,19 +119,20 @@ def _model_progress_context(
             "The remaining allowance is short; another inspection-only turn "
             "without a workspace change will consume one of the turns above."
         )
-    if (
-        nonproductive_turns >= FINISH_HINT_AFTER_NONPRODUCTIVE_TURNS
-        and _task_done_checks(completed_commands)
+    lines.append(_gate_evidence_status(completed_commands))
+    if nonproductive_turns >= FINISH_HINT_AFTER_NONPRODUCTIVE_TURNS and _task_done_checks(
+        completed_commands
     ):
         lines.append(
-            "Current successful gate evidence is complete (build, test, export). "
             "The done condition appears satisfiable from that evidence; the "
             "expected next action is to call `finish` with a truthful summary. "
             "The completion gate will independently accept or refuse it."
         )
-    else:
-        missing = ", ".join(_missing_gate_evidence(completed_commands))
-        lines.append(f"Current successful gate evidence is missing: {missing}.")
+    lines.append(
+        f"Rewriting the same file without running a command is bounded at "
+        f"{MAX_FILE_REWRITES_WITHOUT_COMMAND} rewrites. A write made only to reset "
+        "the progress counter still reaches that bound and stops the task."
+    )
     if inspected_paths:
         lines.append("Already inspected paths: " + ", ".join(inspected_paths))
     if command_outcomes:
@@ -158,16 +164,28 @@ def _tool_counts_as_progress(tool: str, command: str | None = None) -> bool:
 
 
 def _missing_gate_evidence(completed_commands: set[str]) -> list[str]:
-    return [
-        name for name in ("build", "test", "export")
-        if name not in completed_commands
-    ]
+    return [name for name in REQUIRED_GATE_COMMANDS if name not in completed_commands]
+
+
+def _gate_evidence_status(completed_commands: set[str]) -> str:
+    missing = _missing_gate_evidence(completed_commands)
+    if missing:
+        return "Current successful gate evidence is missing: " + ", ".join(missing) + "."
+    return (
+        "Current successful gate evidence is complete ("
+        + ", ".join(REQUIRED_GATE_COMMANDS)
+        + ")."
+    )
 
 
 def _gate_refusal(
     completed_commands: set[str], stale_reason: str | None
 ) -> str:
     missing = _missing_gate_evidence(completed_commands)
+    if not missing:
+        raise GateEvidenceContradiction(
+            "gate refusal requested with complete required gate evidence"
+        )
     detail = (
         "missing current successful gates: "
         + ", ".join(missing)
@@ -2197,7 +2215,7 @@ def _tool_rejection_exchange(
 
 
 def _task_done_checks(completed_commands: set[str]) -> bool:
-    return {"build", "test", "export"} <= completed_commands
+    return not _missing_gate_evidence(completed_commands)
 
 
 def _record_gate_command(evidence: set[str], command: str) -> None:
