@@ -7,7 +7,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .diff_parser import parse_diff
-from .memory import SHARED_NAMESPACE, normalize_namespace
+from .memory import normalize_namespace
+from .namespaces import SHARED_NAMESPACE
 
 MAX_RUN_CONTEXT_BYTES = 24_000
 OUTPUT_TAIL_BYTES = 3_000

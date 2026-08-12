@@ -27,11 +27,11 @@ from .db import Database
 from .diff_parser import parse_diff as _parse_diff
 from .embedding import FakeEmbedder, get_embedder
 from .memory import (
-    SHARED_NAMESPACE,
     MemoryStore,
     namespace_options,
     normalize_namespace,
 )
+from .namespaces import SHARED_NAMESPACE
 from .plans import (
     PlanManager,
     approve_revision,

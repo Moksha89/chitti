@@ -16,8 +16,9 @@ from typing import IO, TYPE_CHECKING, Protocol, cast
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .memory import SHARED_NAMESPACE, normalize_namespace
+from .memory import normalize_namespace
 from .model_tools import model_tool_names, model_tool_schemas
+from .namespaces import SHARED_NAMESPACE
 from .plans import (
     PlanApproval,
     PlanRevision,
