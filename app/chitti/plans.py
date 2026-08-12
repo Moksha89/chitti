@@ -13,7 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .memory import SHARED_NAMESPACE, normalize_namespace
+from .memory import normalize_namespace
+from .namespaces import SHARED_NAMESPACE
 
 if TYPE_CHECKING:
     from .db import Database
