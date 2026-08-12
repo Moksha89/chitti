@@ -827,9 +827,10 @@ async def test_reminder_local_time_and_empty_briefing_are_deterministic(database
 
 
 async def test_briefing_never_invokes_model_provider(database, monkeypatch):
-    provider = FakeProvider()
-    provider.chat = AsyncMock()
-    provider.plan = AsyncMock()
+    chat = AsyncMock()
+    plan = AsyncMock()
+    monkeypatch.setattr(FakeProvider, "chat", chat)
+    monkeypatch.setattr(FakeProvider, "plan", plan)
     briefing = await compose_briefing(
         _DatabaseAdapter(database),
         "general",
@@ -837,8 +838,8 @@ async def test_briefing_never_invokes_model_provider(database, monkeypatch):
         datetime(2026, 1, 1, 19, tzinfo=UTC),
     )
     assert briefing["content"] == "Nothing needs your attention today."
-    provider.chat.assert_not_awaited()
-    provider.plan.assert_not_awaited()
+    chat.assert_not_awaited()
+    plan.assert_not_awaited()
 
 
 async def test_late_recurring_reminder_emits_one_notification_with_skip_count(database):
