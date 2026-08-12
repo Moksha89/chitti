@@ -19,7 +19,11 @@ from chitti.plans import (
     revision_by_id,
     validate_approval_binding,
 )
-from chitti.runner import cancellation_requested, next_queued_run
+from chitti.runner import (
+    cancellation_requested,
+    next_queued_run,
+    reconcile_cancelled_run,
+)
 from chitti.worker import (
     MAX_CAPTURE_ARTIFACTS_PER_RUN,
     DockerSandboxDispatcher,
@@ -324,3 +328,70 @@ async def test_runner_claim_is_atomic_and_cancellation_is_sticky(database) -> No
         )
     assert await cancellation_requested(adapter, run_id)  # type: ignore[arg-type]
     assert await next_queued_run(adapter) is None  # type: ignore[arg-type]
+
+
+async def test_queued_cancellation_is_reconciled_without_dispatch(database) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(session, "runner", "Build fixture.", document())
+        result = await session.execute(
+            text(
+                "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
+                "VALUES (:revision, CAST(:limits AS json), 'cancel-test') RETURNING id"
+            ),
+            {"revision": revision_id, "limits": '{"cpus": 1.0}'},
+        )
+        run_id = int(result.scalar_one())
+        await session.execute(
+            text(
+                "INSERT INTO worker_run_events (run_id, status, detail) VALUES "
+                "(:run, 'queued', 'test'), "
+                "(:run, 'cancel_requested', 'owner requested cancellation')"
+            ),
+            {"run": run_id},
+        )
+
+    adapter = _DatabaseAdapter(database)
+    assert await reconcile_cancelled_run(adapter) == run_id  # type: ignore[arg-type]
+    assert await next_queued_run(adapter) is None  # type: ignore[arg-type]
+    async with database.begin() as session:
+        result = await session.execute(
+            text(
+                "SELECT status, detail FROM worker_run_events "
+                "WHERE run_id = :run ORDER BY id DESC LIMIT 1"
+            ),
+            {"run": run_id},
+        )
+        latest = result.mappings().one()
+    assert latest["status"] == "cancelled"
+    assert latest["detail"] == "cancelled before it started"
+
+
+async def test_claimed_cancellation_is_not_reconciled(database) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(session, "runner", "Build fixture.", document())
+        result = await session.execute(
+            text(
+                "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
+                "VALUES (:revision, CAST(:limits AS json), 'claimed-cancel-test') RETURNING id"
+            ),
+            {"revision": revision_id, "limits": '{"cpus": 1.0}'},
+        )
+        run_id = int(result.scalar_one())
+        await session.execute(
+            text(
+                "INSERT INTO worker_run_events (run_id, status, detail) VALUES "
+                "(:run, 'queued', 'test')"
+            ),
+            {"run": run_id},
+        )
+    adapter = _DatabaseAdapter(database)
+    assert await next_queued_run(adapter) is not None  # type: ignore[arg-type]
+    async with database.begin() as session:
+        await session.execute(
+            text(
+                "INSERT INTO worker_run_events (run_id, status, detail) "
+                "VALUES (:run, 'cancel_requested', 'owner requested cancellation')"
+            ),
+            {"run": run_id},
+        )
+    assert await reconcile_cancelled_run(adapter) is None  # type: ignore[arg-type]

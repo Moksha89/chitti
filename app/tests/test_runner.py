@@ -144,6 +144,55 @@ def test_run_budget_exhaustion_is_terminal_without_retryable_tool_failures(monke
     assert all(status != "model_tool_failed" for status, _detail in events)
 
 
+def test_failure_after_owner_cancellation_is_recorded_as_cancelled(monkeypatch) -> None:
+    events: list[tuple[str, str]] = []
+
+    class Provider:
+        async def validate_gateway(self) -> None:
+            return
+
+    class Dispatcher:
+        async def dispatch(self, *_args) -> None:
+            raise RuntimeError("late model failure")
+
+        async def cancel(self, *_args) -> None:
+            return
+
+    async def approved(_session, _revision_id):
+        return object()
+
+    checks = 0
+
+    async def cancelled(_database, _run_id) -> bool:
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            return False
+        events.append(("cancelled", "cancelled by owner"))
+        return True
+
+    async def record_event(_database, _run_id, status, detail, **_kwargs) -> None:
+        events.append((status, detail))
+
+    async def trim_payloads(_database) -> None:
+        return
+
+    monkeypatch.setattr("chitti.runner.approved_revision", approved)
+    monkeypatch.setattr("chitti.runner.record_cancelled_if_requested", cancelled)
+    monkeypatch.setattr("chitti.runner.record_event", record_event)
+    monkeypatch.setattr("chitti.runner.trim_payloads", trim_payloads)
+    asyncio.run(
+        runner.execute_run(
+            _Database(),  # type: ignore[arg-type]
+            Dispatcher(),  # type: ignore[arg-type]
+            {"id": 1, "revision_id": 1, "limits": runner.WorkerLimits().as_json()},
+            Provider(),  # type: ignore[arg-type]
+        )
+    )
+
+    assert events == [("cancelled", "cancelled by owner")]
+
+
 class _Session:
     def __init__(self):
         self.calls = 0

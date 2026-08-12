@@ -6,6 +6,7 @@ from chitti.provider import ModelCompletion, ModelToolCall
 from chitti.worker import (
     DockerSandboxDispatcher,
     RunBudgetExceeded,
+    RunCancelled,
     WorkerLimits,
     _assistant_tool_message,
     _bounded_artifact,
@@ -510,6 +511,13 @@ def test_many_file_scaffold_writes_can_reach_a_command() -> None:
     assert _file_write_stall("app/file-23.js", 1, 24) == (
         "stopped after 24 file writes without running a command"
     )
+
+
+def test_cancelled_model_loop_raises_distinct_terminal_signal() -> None:
+    dispatcher = object.__new__(DockerSandboxDispatcher)
+    dispatcher._cancelled = {7}
+    with pytest.raises(RunCancelled):
+        dispatcher._raise_if_cancelled(7)
 
 
 def test_successful_command_resets_write_stall_counter_but_capture_does_not() -> None:
