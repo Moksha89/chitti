@@ -172,6 +172,7 @@ def test_unauthenticated_api_routes_keep_generic_401(tmp_path) -> None:
         client.get("/health"),
         client.post("/chat", json={"message": "hello"}),
         client.get("/projects/demo/state"),
+        client.get("/notifications/events?namespace=pj-digi"),
     ):
         assert response.status_code == 401
         assert response.json() == {"detail": "authentication required"}

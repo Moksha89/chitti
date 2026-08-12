@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,6 +8,7 @@ import pytest
 from chitti import runner
 from chitti.previews import build_manifest, copy_export
 from chitti.provider import GatewayMisconfigurationError, GatewayTransientError
+from chitti.reminders import next_due
 from chitti.worker import RunBudgetExceeded
 
 
@@ -63,6 +65,21 @@ def test_run_refuses_gateway_misconfiguration_before_workspace(monkeypatch) -> N
 
     assert dispatched is False
     assert events == ["failed: gateway misconfiguration: gateway routes unavailable: reviewer"]
+
+
+def test_reminder_sweep_failure_is_isolated(monkeypatch) -> None:
+    async def fail(_database, **_kwargs) -> int:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr("chitti.runner.sweep_reminders", fail)
+    asyncio.run(runner.best_effort_reminder_sweep(None))  # type: ignore[arg-type]
+
+
+def test_recurrence_preserves_local_wall_clock_across_dst() -> None:
+    due = datetime(2026, 3, 7, 14, tzinfo=UTC)
+    assert next_due(due, "daily", "America/New_York") == datetime(
+        2026, 3, 8, 13, tzinfo=UTC
+    )
 
 
 def test_run_distinguishes_transient_gateway_failure_before_workspace(monkeypatch) -> None:
