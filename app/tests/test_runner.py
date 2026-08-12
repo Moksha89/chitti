@@ -9,7 +9,11 @@ from chitti import runner
 from chitti.previews import build_manifest, copy_export
 from chitti.provider import GatewayMisconfigurationError, GatewayTransientError
 from chitti.reminders import next_due
-from chitti.runner_access import assert_runner_privileges, required_privileges
+from chitti.runner_access import (
+    assert_runner_privileges,
+    owned_sequences,
+    required_privileges,
+)
 from chitti.worker import RunBudgetExceeded
 
 
@@ -108,6 +112,15 @@ def test_runner_access_fails_when_required_grant_is_missing() -> None:
                 {"reminders"},
             )
         )
+
+
+def test_runner_sequence_discovery_failure_is_distinct() -> None:
+    class Connection:
+        async def fetch(self, _query, _table):
+            raise RuntimeError("catalog unavailable")
+
+    with pytest.raises(SystemExit, match="sequence discovery failed"):
+        asyncio.run(owned_sequences(Connection(), "worker_run_heartbeats"))
 
 
 def test_recurrence_preserves_local_wall_clock_across_dst() -> None:

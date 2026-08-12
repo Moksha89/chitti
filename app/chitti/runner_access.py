@@ -63,6 +63,34 @@ def required_privileges(
     return privileges
 
 
+async def owned_sequences(conn: Any, table: str) -> list[str]:
+    try:
+        columns = await conn.fetch(
+            "SELECT a.attname AS column_name "
+            "FROM pg_attribute AS a "
+            "JOIN pg_class AS c ON c.oid = a.attrelid "
+            "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' AND c.relname = $1 "
+            "AND a.attnum > 0 AND NOT a.attisdropped "
+            "ORDER BY a.attnum",
+            table,
+        )
+        sequences: list[str] = []
+        for row in columns:
+            sequence = await conn.fetchval(
+                "SELECT pg_get_serial_sequence('public.' || $1, $2)",
+                table,
+                row["column_name"],
+            )
+            if sequence is not None and sequence not in sequences:
+                sequences.append(str(sequence))
+        return sequences
+    except Exception as exc:
+        raise SystemExit(
+            f"runner sequence discovery failed for {table}: {exc}"
+        ) from exc
+
+
 async def assert_runner_privileges(
     conn: Any,
     source_texts: list[str] | None = None,
@@ -115,26 +143,23 @@ async def assert_runner_privileges(
             if not allowed:
                 raise SystemExit(f"runner lacks {privilege} on {table}")
         if "INSERT" in privileges:
-            sequence = await conn.fetchval(
-                "SELECT pg_get_serial_sequence($1, 'id')", table
-            )
-            if sequence is not None and not await conn.fetchval(
-                "SELECT has_sequence_privilege(current_user, $1, 'USAGE')",
-                sequence,
-            ):
-                raise SystemExit(f"runner lacks sequence usage on {sequence}")
+            for sequence in await owned_sequences(conn, table):
+                if not await conn.fetchval(
+                    "SELECT has_sequence_privilege(current_user, $1, 'USAGE')",
+                    sequence,
+                ):
+                    raise SystemExit(f"runner lacks sequence usage on {sequence}")
 
     if await conn.fetchval(
         "SELECT has_table_privilege(current_user, 'worker_runs', 'INSERT')"
     ):
         raise SystemExit("runner unexpectedly has INSERT on worker_runs")
-    worker_runs_sequence = await conn.fetchval(
-        "SELECT pg_get_serial_sequence('worker_runs', 'id')"
-    )
-    if worker_runs_sequence and await conn.fetchval(
-        "SELECT has_sequence_privilege(current_user, $1, 'USAGE')",
-        worker_runs_sequence,
-    ):
-        raise SystemExit(
-            f"runner unexpectedly has sequence usage on {worker_runs_sequence}"
-        )
+    for worker_runs_sequence in await owned_sequences(conn, "worker_runs"):
+        if await conn.fetchval(
+            "SELECT has_sequence_privilege(current_user, $1, 'USAGE')",
+            worker_runs_sequence,
+        ):
+            raise SystemExit(
+                "runner unexpectedly has sequence usage on "
+                f"{worker_runs_sequence}"
+            )
