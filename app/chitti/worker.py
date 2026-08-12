@@ -95,6 +95,17 @@ def _gate_refusal(
     return f"TOOL FAILURE: done condition requires {detail}; run those gates next"
 
 
+def _gate_refusal_progress(
+    completed_commands: set[str],
+    stale_reason: str | None,
+    previous_missing: frozenset[str] | None,
+) -> tuple[str, bool, frozenset[str]]:
+    missing = frozenset(_missing_gate_evidence(completed_commands))
+    refusal = _gate_refusal(completed_commands, stale_reason)
+    repeated = previous_missing == missing
+    return refusal, not repeated, missing
+
+
 def _model_response_failure(completion: ModelCompletion) -> str | None:
     if completion.finish_reason == "length":
         detail = (
@@ -385,6 +396,7 @@ class DockerSandboxDispatcher:
             file_writes_without_command = 0
             nonproductive_turns = 0
             gate_stale_reason: str | None = None
+            last_refused_missing_gates: frozenset[str] | None = None
             route = CODER_ROUTE
             failures = 0
             messages: list[dict[str, object]] = [
@@ -545,6 +557,7 @@ class DockerSandboxDispatcher:
                     batch_failure: str | None = None
                     batch_completed = True
                     batch_workspace_changed = False
+                    batch_refusal_progress = True
                     for call_index, native_call in enumerate(completion.tool_calls):
                         tool, arguments = native_call.name, native_call.arguments
                         if tool not in model_tool_names():
@@ -573,9 +586,16 @@ class DockerSandboxDispatcher:
                                 done = True
                                 batch_completed = False
                             elif tool == "finish":
-                                result_text = _gate_refusal(
-                                    completed_commands, gate_stale_reason
+                                (
+                                    result_text,
+                                    refusal_progress,
+                                    last_refused_missing_gates,
+                                ) = _gate_refusal_progress(
+                                    completed_commands,
+                                    gate_stale_reason,
+                                    last_refused_missing_gates,
                                 )
+                                batch_refusal_progress = refusal_progress
                                 batch_failure = result_text
                                 messages.append(_tool_result_message(native_call, result_text))
                             else:
@@ -603,6 +623,7 @@ class DockerSandboxDispatcher:
                                                 "previous gate evidence was invalidated "
                                                 "by sync-lockfile"
                                             )
+                                            last_refused_missing_gates = None
                                         elif not _missing_gate_evidence(completed_commands):
                                             gate_stale_reason = None
                                         file_writes_without_command = (
@@ -620,6 +641,7 @@ class DockerSandboxDispatcher:
                                                 f"previous gate evidence was invalidated "
                                                 f"by source change at {path}"
                                             )
+                                            last_refused_missing_gates = None
                                         file_writes_without_command += 1
                                         file_write_counts[path] = (
                                             file_write_counts.get(path, 0) + 1
@@ -678,7 +700,9 @@ class DockerSandboxDispatcher:
                             reset_progress_counters()
                         await record_nonproductive(
                             batch_failure,
-                            workspace_changed=batch_workspace_changed,
+                            workspace_changed=(
+                                batch_workspace_changed and batch_refusal_progress
+                            ),
                         )
                         if failures >= 2 and route == CODER_ROUTE:
                             route = REVIEWER_ROUTE
@@ -742,8 +766,18 @@ class DockerSandboxDispatcher:
                     done = True
                     break
                 if tool == "finish":
-                    result_text = _gate_refusal(completed_commands, gate_stale_reason)
-                    await record_nonproductive(result_text)
+                    (
+                        result_text,
+                        refusal_progress,
+                        last_refused_missing_gates,
+                    ) = _gate_refusal_progress(
+                        completed_commands,
+                        gate_stale_reason,
+                        last_refused_missing_gates,
+                    )
+                    await record_nonproductive(
+                        result_text, workspace_changed=refusal_progress
+                    )
                     messages.extend(_tool_exchange(completion, result_text, native_call))
                     await compact_history()
                     continue
@@ -766,6 +800,7 @@ class DockerSandboxDispatcher:
                             gate_stale_reason = (
                                 "previous gate evidence was invalidated by sync-lockfile"
                             )
+                            last_refused_missing_gates = None
                         elif not _missing_gate_evidence(completed_commands):
                             gate_stale_reason = None
                         file_writes_without_command = _reset_file_write_counter(
@@ -781,6 +816,7 @@ class DockerSandboxDispatcher:
                                 f"previous gate evidence was invalidated "
                                 f"by source change at {path}"
                             )
+                            last_refused_missing_gates = None
                         file_writes_without_command += 1
                         file_write_counts[path] = file_write_counts.get(path, 0) + 1
                         stall = _file_write_stall(
@@ -1805,7 +1841,7 @@ class DockerSandboxDispatcher:
             async with self.database.sessions() as session:
                 existing = await session.execute(
                     text(
-                        "SELECT 1 FROM worker_artifacts "
+                        "SELECT id FROM worker_artifacts "
                         "WHERE run_id = :run_id AND kind = :kind AND path = :path "
                         "LIMIT 1"
                     ),
@@ -1815,23 +1851,45 @@ class DockerSandboxDispatcher:
                         "path": str(path.relative_to(workspace)),
                     },
                 )
-                if existing.scalar_one_or_none() is not None:
-                    continue
-                artifact = await session.execute(
-                    text(
-                        "INSERT INTO worker_artifacts "
-                        "(run_id, kind, path, sha256, byte_size) "
-                        "VALUES (:run_id, :kind, :path, :sha256, :byte_size) "
-                        "RETURNING id"
-                    ),
-                    {
-                        "run_id": run_id, "kind": kind,
-                        "path": str(path.relative_to(workspace)),
-                        "sha256": hashlib.sha256(content).hexdigest(),
-                        "byte_size": len(content),
-                    },
-                )
-                artifact_id = int(artifact.scalar_one())
+                artifact_id = existing.scalar_one_or_none()
+                values = {
+                    "run_id": run_id,
+                    "kind": kind,
+                    "path": str(path.relative_to(workspace)),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "byte_size": len(content),
+                }
+                if artifact_id is None:
+                    artifact = await session.execute(
+                        text(
+                            "INSERT INTO worker_artifacts "
+                            "(run_id, kind, path, sha256, byte_size) "
+                            "VALUES (:run_id, :kind, :path, :sha256, :byte_size) "
+                            "RETURNING id"
+                        ),
+                        values,
+                    )
+                    artifact_id = int(artifact.scalar_one())
+                else:
+                    await session.execute(
+                        text(
+                            "DELETE FROM worker_artifact_payloads "
+                            "WHERE artifact_id = :artifact_id"
+                        ),
+                        {"artifact_id": int(artifact_id)},
+                    )
+                    await session.execute(
+                        text(
+                            "UPDATE worker_artifacts SET sha256 = :sha256, "
+                            "byte_size = :byte_size, original_byte_size = NULL, "
+                            "truncated = FALSE WHERE id = :artifact_id"
+                        ),
+                        {
+                            "artifact_id": int(artifact_id),
+                            "sha256": values["sha256"],
+                            "byte_size": values["byte_size"],
+                        },
+                    )
                 await session.execute(
                     text(
                         "INSERT INTO worker_artifact_payloads "

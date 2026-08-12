@@ -199,6 +199,10 @@ async def test_captured_screenshot_survives_later_run_failure_cleanup(
     await dispatcher._capture_workspace_artifacts(
         run_id, workspace, WorkerLimits(artifact_bytes=1024)
     )
+    (artifacts / "phone.png").write_bytes(b"new-phone-image")
+    await dispatcher._capture_workspace_artifacts(
+        run_id, workspace, WorkerLimits(artifact_bytes=1024)
+    )
     shutil.rmtree(workspace)
 
     async with database.begin() as session:
@@ -214,7 +218,7 @@ async def test_captured_screenshot_survives_later_run_failure_cleanup(
         )
         assert [(row[0], row[1], bytes(row[2])) for row in rows] == [
             ("screenshot", "artifacts/desktop.png", b"desktop-image"),
-            ("screenshot", "artifacts/phone.png", b"phone-image"),
+            ("screenshot", "artifacts/phone.png", b"new-phone-image"),
         ]
 
 
