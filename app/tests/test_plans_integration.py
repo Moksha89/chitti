@@ -5,6 +5,7 @@ import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
@@ -39,6 +40,7 @@ from chitti.worker import (
 pytestmark = pytest.mark.skipif(
     not os.getenv("RUN_DB_TESTS"), reason="set RUN_DB_TESTS=1 to run PostgreSQL integration tests"
 )
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class _DatabaseAdapter:
@@ -58,7 +60,7 @@ async def database():
         env = {**os.environ, "DATABASE_URL": url}
         subprocess.run(
             ["python", "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
-            cwd="..",
+            cwd=REPO_ROOT,
             env=env,
             check=True,
         )
