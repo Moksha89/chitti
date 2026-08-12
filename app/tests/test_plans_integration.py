@@ -661,6 +661,7 @@ async def test_restart_reconciliation_marks_only_stale_runs_interrupted(database
             ("stale", "running"),
             ("preexisting", "running"),
             ("live", "running"),
+            ("unknown_in_flight", "model_context_compacted"),
             ("terminal", "passed"),
         ):
             result = await session.execute(
@@ -704,6 +705,7 @@ async def test_restart_reconciliation_marks_only_stale_runs_interrupted(database
     assert await reconcile_interrupted_runs(adapter, now) == [
         run_ids["stale"],
         run_ids["preexisting"],
+        run_ids["unknown_in_flight"],
     ]  # type: ignore[arg-type]
     assert await reconcile_interrupted_runs(adapter, now) == []  # type: ignore[arg-type]
 

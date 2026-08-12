@@ -46,6 +46,7 @@ from .project_state import ProjectState
 from .provider import FakeProvider, LiteLLMProvider
 from .reminders import create_reminder, recent_reminders
 from .run_context import RunContextError, build_run_evidence
+from .run_status import TERMINAL_RUN_STATUSES
 from .service import ChittiService
 from .settings import Settings, get_settings
 from .telegram import TelegramPoller
@@ -62,7 +63,6 @@ CSRF_FIELD = "csrf_token"
 RUN_EVENT_POLL_SECONDS = 1.0
 RUN_EVENT_HEARTBEAT_SECONDS = 15.0
 WORKSPACE_RUN_LIST_LIMIT = 25
-TERMINAL_RUN_STATUSES = {"passed", "failed", "cancelled", "interrupted"}
 MAX_DIFF_BODY_BYTES = 12_000
 PROMOTION_APPROVAL_ACTORS = {"owner", "agent", "system"}
 
@@ -531,6 +531,7 @@ def _prepare_workspace_run(detail: dict[str, object]) -> dict[str, object]:
         operations.append(item)
     detail["operations"] = operations
     detail["latest_status"] = _run_status(detail)
+    detail["is_terminal"] = detail["latest_status"] in TERMINAL_RUN_STATUSES
     run = cast(dict[str, object], detail["run"])
     created_at = run.get("created_at")
     if isinstance(created_at, datetime):

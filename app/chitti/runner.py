@@ -30,6 +30,7 @@ from .provider import (
     ModelProvider,
 )
 from .reminders import sweep_reminders
+from .run_status import TERMINAL_RUN_STATUSES
 from .runtime_identity import write_loaded_code_identity
 from .settings import Settings, get_settings
 from .worker import (
@@ -54,10 +55,6 @@ TERMINAL_PREVIEW_FAILURES = frozenset(
         PREVIEW_STAGING_MISSING,
     }
 )
-OUTCOME_TERMINAL_RUN_STATUSES = frozenset(
-    {"passed", "preview_failed", "preview_blocked", "interrupted"}
-)
-
 
 def _copy_and_verify_export(
     source: Path, destination: Path, approved: ExportManifest
@@ -152,15 +149,12 @@ async def reconcile_interrupted_runs(
     async with database.sessions() as session:
         result = await session.execute(
             text(
-                "SELECT r.id, heartbeat.run_id AS heartbeat_run_id "
+                "SELECT r.id, latest.status, heartbeat.run_id AS heartbeat_run_id "
                 "FROM worker_runs r "
                 "JOIN LATERAL ("
                 "  SELECT status FROM worker_run_events "
                 "  WHERE run_id = r.id ORDER BY id DESC LIMIT 1"
-                ") latest ON latest.status IN "
-                "('running','operation_running','operation_complete','task_finished',"
-                "'model_tool_running','model_tool_failed','model_route_switched',"
-                "'model_context_compacted','live_output_degraded','review_complete') "
+                ") latest ON latest.status NOT IN ('queued', 'cancel_requested') "
                 "LEFT JOIN worker_run_heartbeats heartbeat "
                 "ON heartbeat.run_id = r.id "
                 "WHERE heartbeat.heartbeat_at IS NULL OR heartbeat.heartbeat_at < :cutoff "
@@ -169,6 +163,8 @@ async def reconcile_interrupted_runs(
             {"cutoff": cutoff},
         )
         for row in result.mappings():
+            if str(row["status"]) in TERMINAL_RUN_STATUSES:
+                continue
             run_id = int(row["id"])
             detail = (
                 "interrupted by runner restart; no execution heartbeat was recorded"
@@ -268,7 +264,7 @@ async def record_cancelled_if_requested(database: Database, run_id: int) -> bool
     if not await cancellation_requested(database, run_id):
         return False
     status = await latest_status(database, run_id)
-    if status in OUTCOME_TERMINAL_RUN_STATUSES or status == "cancelled":
+    if status in TERMINAL_RUN_STATUSES:
         return True
     await record_event(database, run_id, "cancelled", "cancelled by owner")
     return True
