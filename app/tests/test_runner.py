@@ -65,6 +65,14 @@ def test_run_refuses_gateway_misconfiguration_before_workspace(monkeypatch) -> N
     assert events == ["failed: gateway misconfiguration: gateway routes unavailable: reviewer"]
 
 
+def test_reminder_sweep_failure_is_isolated(monkeypatch) -> None:
+    async def fail(_database) -> int:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr("chitti.runner.sweep_reminders", fail)
+    asyncio.run(runner.best_effort_reminder_sweep(None))  # type: ignore[arg-type]
+
+
 def test_run_distinguishes_transient_gateway_failure_before_workspace(monkeypatch) -> None:
     dispatched = False
     events: list[str] = []

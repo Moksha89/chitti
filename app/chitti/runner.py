@@ -27,6 +27,7 @@ from .provider import (
     LiteLLMProvider,
     ModelProvider,
 )
+from .reminders import sweep_reminders
 from .runtime_identity import write_loaded_code_identity
 from .settings import Settings, get_settings
 from .worker import (
@@ -62,6 +63,13 @@ def _copy_and_verify_export(
     if landed != approved:
         raise RuntimeError("preview export changed while publishing")
     return landed
+
+
+async def best_effort_reminder_sweep(database: Database) -> None:
+    try:
+        await sweep_reminders(database)
+    except Exception:
+        logger.exception("reminder sweep failed")
 
 
 async def next_queued_run(database: Database) -> Mapping[str, object] | None:
@@ -503,6 +511,7 @@ async def run_forever() -> None:
             await dispatcher.cleanup_expired_previews()
             await publish_approved_previews(database, settings)
             await reconcile_cancelled_run(database)
+            await best_effort_reminder_sweep(database)
             row = await next_queued_run(database)
             if row is None:
                 await asyncio.sleep(POLL_SECONDS)

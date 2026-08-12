@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 from urllib.parse import quote
@@ -23,6 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .auth import AuthManager, Session
+from .briefings import compose_briefing
 from .db import Database
 from .diff_parser import parse_diff as _parse_diff
 from .embedding import FakeEmbedder, get_embedder
@@ -32,6 +33,7 @@ from .memory import (
     normalize_namespace,
 )
 from .namespaces import SHARED_NAMESPACE
+from .notifications import acknowledge_notification, notifications_after, recent_notifications
 from .plans import (
     PlanManager,
     approve_revision,
@@ -42,6 +44,7 @@ from .plans import (
 from .previews import manifest_from_json, safe_preview_file
 from .project_state import ProjectState
 from .provider import FakeProvider, LiteLLMProvider
+from .reminders import create_reminder, recent_reminders
 from .run_context import RunContextError, build_run_evidence
 from .service import ChittiService
 from .settings import Settings, get_settings
@@ -354,6 +357,8 @@ async def dashboard_context(
         conflicts = await memory.conflicts(db_session, namespace)
         plans = await latest_revisions(db_session, namespace)
         transcript = await recent_entries(db_session, namespace)
+        reminders = await recent_reminders(database, namespace)
+        notifications = await recent_notifications(database, namespace)
         for plan in plans:
             approval_result = await db_session.execute(
                 text(
@@ -372,6 +377,22 @@ async def dashboard_context(
         conflict["display_existing"] = str(conflict["existing_value"])
         conflict["display_proposed"] = str(conflict["proposed_value"])
     now = datetime.now(ZoneInfo(request.app.state.settings.display_timezone))
+    display_zone = ZoneInfo(request.app.state.settings.display_timezone)
+    for reminder in reminders:
+        due_at = reminder.get("due_at")
+        if isinstance(due_at, datetime):
+            reminder["due_at"] = due_at.astimezone(display_zone).isoformat(
+                timespec="minutes"
+            )
+    for notification in notifications:
+        created_at = notification.get("created_at")
+        if isinstance(created_at, datetime):
+            notification["created_at"] = created_at.astimezone(display_zone).isoformat(
+                timespec="minutes"
+            )
+    briefing = await compose_briefing(
+        database, namespace, request.app.state.settings.display_timezone, now.astimezone(UTC)
+    )
     if now.hour < 12:
         greeting = "Good morning"
     elif now.hour < 18:
@@ -388,6 +409,9 @@ async def dashboard_context(
         "namespace": namespace,
         "namespace_options": namespace_options(),
         "transcript": transcript,
+        "reminders": reminders,
+        "notifications": notifications,
+        "briefing": briefing,
     }
 
 
@@ -614,6 +638,90 @@ async def dashboard(request: Request) -> HTMLResponse | RedirectResponse:
         request=request,
         name="dashboard.html",
         context=await dashboard_context(request, session, requested_namespace(request)),
+    )
+
+
+@app.post("/reminders")
+async def create_dashboard_reminder(request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
+    text_value = str(form.get("text", "")).strip()
+    local_value = str(form.get("due_local", "")).strip()
+    recurrence = str(form.get("recurrence", "")).strip() or None
+    if not text_value or not local_value or recurrence not in {None, "daily", "weekly"}:
+        raise HTTPException(status_code=400, detail="invalid reminder")
+    try:
+        local_due = datetime.fromisoformat(local_value).replace(
+            tzinfo=ZoneInfo(request.app.state.settings.display_timezone)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid reminder time") from exc
+    await create_reminder(
+        request.app.state.database,
+        namespace,
+        text_value,
+        local_due.astimezone(UTC),
+        recurrence,
+    )
+    return RedirectResponse(f"/?namespace={namespace}", status_code=303)
+
+
+@app.post("/notifications/{notification_id}/acknowledge")
+async def acknowledge_dashboard_notification(
+    notification_id: int, request: Request
+) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
+    await acknowledge_notification(request.app.state.database, namespace, notification_id)
+    return RedirectResponse(f"/?namespace={namespace}", status_code=303)
+
+
+async def _notification_stream(
+    request: Request, database: Database, namespace: str, cursor: int
+) -> AsyncIterator[str]:
+    last_heartbeat = time.monotonic()
+    while not await request.is_disconnected():
+        for notification in await notifications_after(database, namespace, cursor):
+            cursor = int(str(notification["id"]))
+            created_at = notification.get("created_at")
+            if isinstance(created_at, datetime):
+                notification["created_at"] = created_at.astimezone(
+                    ZoneInfo(request.app.state.settings.display_timezone)
+                ).isoformat(timespec="minutes")
+            payload = json.dumps(notification, default=str, separators=(",", ":"))
+            yield f"id: {cursor}\nevent: notification\ndata: {payload}\n\n"
+            last_heartbeat = time.monotonic()
+        if time.monotonic() - last_heartbeat >= RUN_EVENT_HEARTBEAT_SECONDS:
+            yield ": heartbeat\n\n"
+            last_heartbeat = time.monotonic()
+        await asyncio.sleep(RUN_EVENT_POLL_SECONDS)
+
+
+@app.get("/notifications/events")
+async def notification_events(request: Request) -> StreamingResponse:
+    current_session(request)
+    namespace = requested_namespace(request)
+    try:
+        cursor = max(
+            0,
+            int(request.headers.get("Last-Event-ID", request.query_params.get("event_cursor", "0"))),
+        )
+    except ValueError:
+        cursor = 0
+    return StreamingResponse(
+        _notification_stream(request, request.app.state.database, namespace, cursor),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
