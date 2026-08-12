@@ -3,13 +3,22 @@
 from alembic import op
 import sqlalchemy as sa
 
-from chitti.namespaces import MEMORY_NAMESPACES, NAMESPACE_ROWS, SHARED_NAMESPACE
-
 
 revision = "0016_memory_namespaces"
 down_revision = "0015_approval_actor"
 branch_labels = None
 depends_on = None
+
+
+MIGRATION_SHARED_NAMESPACE = "general"
+MIGRATION_NAMESPACE_ROWS = (
+    {"slug": "general", "display_name": "Shared / general", "is_shared": True},
+    {"slug": "pj-digi", "display_name": "PJ Digi", "is_shared": False},
+    {"slug": "jsv-fashion", "display_name": "JSV Fashion", "is_shared": False},
+    {"slug": "andhrawala", "display_name": "Andhrawala", "is_shared": False},
+    {"slug": "vsports", "display_name": "VSports", "is_shared": False},
+)
+
 
 def upgrade() -> None:
     op.create_table(
@@ -25,7 +34,7 @@ def upgrade() -> None:
             sa.column("display_name", sa.String(128)),
             sa.column("is_shared", sa.Boolean()),
         ),
-        list(NAMESPACE_ROWS),
+        list(MIGRATION_NAMESPACE_ROWS),
     )
 
     for table_name in ("memory_chunks", "decisions", "memory_conflicts", "plan_revisions", "plan_jobs"):
@@ -35,7 +44,7 @@ def upgrade() -> None:
                 "namespace",
                 sa.String(64),
                 nullable=False,
-                server_default=SHARED_NAMESPACE,
+                server_default=MIGRATION_SHARED_NAMESPACE,
             ),
         )
         op.create_foreign_key(
@@ -46,7 +55,7 @@ def upgrade() -> None:
             ["slug"],
         )
 
-    valid_slugs = ", ".join(f"'{slug}'" for slug in MEMORY_NAMESPACES)
+    valid_slugs = ", ".join(f"'{row['slug']}'" for row in MIGRATION_NAMESPACE_ROWS)
     op.execute(
         f"""
         UPDATE memory_chunks
@@ -54,7 +63,7 @@ def upgrade() -> None:
             WHEN metadata ->> 'namespace' IN
                 ({valid_slugs})
             THEN metadata ->> 'namespace'
-            ELSE '{SHARED_NAMESPACE}'
+            ELSE '{MIGRATION_SHARED_NAMESPACE}'
         END
         """
     )

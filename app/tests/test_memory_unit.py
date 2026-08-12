@@ -1,7 +1,11 @@
+import importlib.util
+from pathlib import Path
+
 import pytest
 
 from chitti.embedding import FakeEmbedder
 from chitti.memory import MemoryStore, normalize, normalize_key
+from chitti.namespaces import NAMESPACE_ROWS
 from chitti.provider import ExtractedMemory
 
 
@@ -63,3 +67,17 @@ def test_retrieval_requires_an_explicit_namespace_argument() -> None:
         store.append_decision(None, None)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         store.add_chunk(None, "content", "note", None, {})  # type: ignore[arg-type]
+
+
+def test_runtime_namespace_registry_matches_memory_migration_seed() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[2]
+        / "alembic"
+        / "versions"
+        / "0016_memory_namespaces.py"
+    )
+    spec = importlib.util.spec_from_file_location("memory_namespaces_migration", migration_path)
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    assert tuple(NAMESPACE_ROWS) == tuple(migration.MIGRATION_NAMESPACE_ROWS)
