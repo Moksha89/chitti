@@ -25,7 +25,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .auth import AuthManager, Session
 from .db import Database
 from .embedding import FakeEmbedder, get_embedder
-from .memory import MemoryStore
+from .memory import (
+    SHARED_NAMESPACE,
+    MemoryStore,
+    namespace_options,
+    normalize_namespace,
+)
 from .plans import (
     PlanManager,
     approve_revision,
@@ -65,6 +70,7 @@ GENERATED_DIFF_FILENAMES = {
 class ChatRequest(BaseModel):
     message: str
     project: str | None = None
+    namespace: str = SHARED_NAMESPACE
     plan_requested: bool = False
     history: list[dict[str, str]] = Field(default_factory=list)
 
@@ -114,6 +120,14 @@ def current_session(request: Request) -> tuple[str, Session]:
     if not token or session is None or session.username is None:
         raise HTTPException(status_code=401, detail="authentication required")
     return token, session
+
+
+def requested_namespace(request: Request, value: str | None = None) -> str:
+    candidate = value if value is not None else request.query_params.get("namespace")
+    try:
+        return normalize_namespace(candidate)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def safe_next_path(value: str | None) -> str:
@@ -327,7 +341,10 @@ async def change_password(request: Request) -> HTMLResponse | RedirectResponse:
     return RedirectResponse(next_path, status_code=303)
 
 
-async def dashboard_context(request: Request, session: Session) -> dict[str, object]:
+async def dashboard_context(
+    request: Request, session: Session, namespace: str = SHARED_NAMESPACE
+) -> dict[str, object]:
+    namespace = normalize_namespace(namespace)
     database: Database = request.app.state.database
     memory = MemoryStore(
         FakeEmbedder()
@@ -335,9 +352,9 @@ async def dashboard_context(request: Request, session: Session) -> dict[str, obj
         else get_embedder(request.app.state.settings.embedding_model)
     )
     async with database.sessions() as db_session:
-        decisions = await memory.decisions(db_session)
-        conflicts = await memory.conflicts(db_session)
-        plans = await latest_revisions(db_session)
+        decisions = await memory.decisions(db_session, namespace)
+        conflicts = await memory.conflicts(db_session, namespace)
+        plans = await latest_revisions(db_session, namespace)
         for plan in plans:
             approval_result = await db_session.execute(
                 text(
@@ -369,6 +386,8 @@ async def dashboard_context(request: Request, session: Session) -> dict[str, obj
         "plans": plans,
         "greeting": greeting,
         "display_timezone": request.app.state.settings.display_timezone,
+        "namespace": namespace,
+        "namespace_options": namespace_options(),
     }
 
 
@@ -643,7 +662,7 @@ async def dashboard(request: Request) -> HTMLResponse | RedirectResponse:
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
-        context=await dashboard_context(request, session),
+        context=await dashboard_context(request, session, requested_namespace(request)),
     )
 
 
@@ -665,7 +684,11 @@ async def workspace_run_page(
     database: Database = request.app.state.database
     async with database.sessions() as db_session:
         run_record = cast(dict[str, object], run["run"])
-        revision = await revision_by_id(db_session, int(str(run_record["revision_id"])))
+        revision = await revision_by_id(
+            db_session,
+            int(str(run_record["revision_id"])),
+            str(run_record.get("namespace", SHARED_NAMESPACE)),
+        )
         if revision is None:
             raise HTTPException(status_code=404, detail="plan revision not found")
         run_rows = await db_session.execute(
@@ -931,10 +954,14 @@ async def approve_plan(revision_id: int, request: Request) -> RedirectResponse:
     form = await request.form()
     require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
     reason = str(form.get("reason", "")).strip() or None
+    namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
     database: Database = request.app.state.database
     async with database.sessions() as db_session:
         try:
-            await approve_revision(db_session, revision_id, reason)
+            revision = await revision_by_id(db_session, revision_id, namespace)
+            if revision is None:
+                raise ValueError("plan revision not found")
+            await approve_revision(db_session, revision_id, reason, namespace)
             await db_session.commit()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -949,9 +976,10 @@ async def plan_page(revision_id: int, request: Request) -> HTMLResponse | Redire
     _, session = result
     if auth_manager(request).must_change_password:
         return RedirectResponse("/change-password", status_code=303)
+    namespace = requested_namespace(request)
     database: Database = request.app.state.database
     async with database.sessions() as db_session:
-        revision = await revision_by_id(db_session, revision_id)
+        revision = await revision_by_id(db_session, revision_id, namespace)
         if revision is None:
             raise HTTPException(status_code=404, detail="plan revision not found")
         approval_result = await db_session.execute(
@@ -1028,6 +1056,7 @@ async def plan_page(revision_id: int, request: Request) -> HTMLResponse | Redire
         name="plan.html",
         context={
             "csrf_token": session.csrf_token,
+            "namespace": revision.namespace,
             "revision": revision,
             "approval": dict(approval) if approval else None,
             "task_statuses": task_statuses,
@@ -1126,12 +1155,15 @@ async def start_run(revision_id: int, request: Request) -> RedirectResponse:
         return RedirectResponse("/change-password", status_code=303)
     form = await request.form()
     require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
     manager: WorkerRunManager = request.app.state.worker_manager
     try:
-        run_id = await manager.enqueue(revision_id, WorkerLimits())
+        run_id = await manager.enqueue(revision_id, WorkerLimits(), namespace)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return RedirectResponse(f"/plans/{revision_id}?run={run_id}", status_code=303)
+    return RedirectResponse(
+        f"/plans/{revision_id}?run={run_id}&namespace={namespace}", status_code=303
+    )
 
 
 @app.post("/runs/{run_id}/cancel")
@@ -1264,11 +1296,12 @@ async def reject_plan(revision_id: int, request: Request) -> RedirectResponse:
     reason = str(form.get("reason", "")).strip()
     database: Database = request.app.state.database
     async with database.sessions() as db_session:
-        revision = await revision_by_id(db_session, revision_id)
+        namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
+        revision = await revision_by_id(db_session, revision_id, namespace)
         if revision is None:
             raise HTTPException(status_code=404, detail="plan revision not found")
         try:
-            await reject_revision(db_session, revision_id, reason)
+            await reject_revision(db_session, revision_id, reason, namespace)
             await db_session.commit()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1278,6 +1311,7 @@ async def reject_plan(revision_id: int, request: Request) -> RedirectResponse:
         revision.brief,
         revision_id,
         reason,
+        revision.namespace,
     )
     return RedirectResponse("/", status_code=303)
 
@@ -1319,6 +1353,7 @@ async def chat(payload: ChatRequest, request: Request) -> dict[str, object]:
     if auth_manager(request).must_change_password:
         raise HTTPException(status_code=403, detail="password change required")
     require_csrf(request, session)
+    namespace = requested_namespace(request, payload.namespace)
     database: Database = request.app.state.database
     service: ChittiService = request.app.state.service
     plan_project = project_from_brief(payload.project, payload.plan_requested)
@@ -1328,7 +1363,13 @@ async def chat(payload: ChatRequest, request: Request) -> dict[str, object]:
         )
     try:
         async with database.sessions() as db_session:
-            result = await service.turn(db_session, payload.message, payload.project, payload.history)
+            result = await service.turn(
+                db_session,
+                payload.message,
+                payload.project,
+                payload.history,
+                namespace,
+            )
     except Exception as exc:
         logging.getLogger(__name__).exception("chat_provider_failed")
         raise HTTPException(status_code=503, detail="model provider unavailable") from exc
@@ -1336,7 +1377,9 @@ async def chat(payload: ChatRequest, request: Request) -> dict[str, object]:
     reply = result.reply
     if plan_project:
         manager: PlanManager = request.app.state.plan_manager
-        plan_job_id = await manager.enqueue(plan_project, payload.message)
+        plan_job_id = await manager.enqueue(
+            plan_project, payload.message, namespace=namespace
+        )
         reply += (
             "\n\nI created a plan draft for "
             f"{plan_project}. It is waiting for your approval; nothing will execute."

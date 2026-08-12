@@ -38,8 +38,9 @@ class ChittiService:
         user_message: str,
         project: str | None,
         history: list[dict[str, str]] | None = None,
+        namespace: str = "general",
     ) -> TurnResult:
-        recall = await self.memory.recall(session, user_message)
+        recall = await self.memory.recall(session, user_message, namespace)
         messages: list[dict[str, object]] = [
             {"role": item["role"], "content": item["content"]}
             for item in history or []
@@ -47,16 +48,26 @@ class ChittiService:
         messages.append({"role": "user", "content": user_message})
         reply = await self.provider.chat(self.system_prompt(recall), messages, "chitti-chat")
         await self.memory.add_chunk(
-            session, user_message, "conversation_user", project, {"project": project}
+            session,
+            user_message,
+            "conversation_user",
+            project,
+            {"project": project},
+            namespace,
         )
         await self.memory.add_chunk(
-            session, reply, "conversation_assistant", project, {"project": project}
+            session,
+            reply,
+            "conversation_assistant",
+            project,
+            {"project": project},
+            namespace,
         )
-        existing_keys = await self.memory.active_keys(session)
+        existing_keys = await self.memory.active_keys(session, namespace)
         extracted = await self.provider.extract_memories(
             self.profile, user_message, reply, existing_keys
         )
-        conflicts = await self.memory.record_memories(session, extracted)
+        conflicts = await self.memory.record_memories(session, extracted, namespace)
         await session.commit()
         if conflicts:
             logger.info("memory_conflict", extra={"keys": [item.key for item in conflicts]})

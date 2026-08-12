@@ -13,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .memory import SHARED_NAMESPACE, normalize_namespace
+
 if TYPE_CHECKING:
     from .db import Database
     from .memory import MemoryStore
@@ -95,6 +97,7 @@ class PlanRevision:
     content_hash: str
     created_at: datetime
     parent_revision_id: int | None
+    namespace: str = SHARED_NAMESPACE
 
 
 @dataclass(frozen=True)
@@ -119,7 +122,9 @@ async def create_revision(
     brief: str,
     document: PlanDocument,
     parent_revision_id: int | None = None,
+    namespace: str = SHARED_NAMESPACE,
 ) -> int:
+    namespace = normalize_namespace(namespace)
     content = document.model_dump(mode="json")
     digest = plan_hash(document)
     revision_result = await session.execute(
@@ -133,12 +138,13 @@ async def create_revision(
     result = await session.execute(
         text(
             "INSERT INTO plan_revisions "
-            "(project, brief, revision, content, content_hash, parent_revision_id) "
-            "VALUES (:project, :brief, :revision, CAST(:content AS jsonb), :content_hash, "
-            ":parent_revision_id) RETURNING id"
+            "(project, namespace, brief, revision, content, content_hash, parent_revision_id) "
+            "VALUES (:project, :namespace, :brief, :revision, CAST(:content AS jsonb), "
+            ":content_hash, :parent_revision_id) RETURNING id"
         ),
         {
             "project": project,
+            "namespace": namespace,
             "brief": brief,
             "revision": revision,
             "content": json.dumps(content),
@@ -178,15 +184,19 @@ class PlanManager:
         brief: str,
         parent_revision_id: int | None = None,
         rejection: str | None = None,
+        namespace: str = SHARED_NAMESPACE,
     ) -> int:
+        namespace = normalize_namespace(namespace)
         async with self.database.sessions() as session:
             result = await session.execute(
                 text(
-                    "INSERT INTO plan_jobs (project, brief, parent_revision_id, rejection) "
-                    "VALUES (:project, :brief, :parent, :rejection) RETURNING id"
+                    "INSERT INTO plan_jobs "
+                    "(project, namespace, brief, parent_revision_id, rejection) "
+                    "VALUES (:project, :namespace, :brief, :parent, :rejection) RETURNING id"
                 ),
                 {
                     "project": project,
+                    "namespace": namespace,
                     "brief": brief,
                     "parent": parent_revision_id,
                     "rejection": rejection,
@@ -215,7 +225,7 @@ class PlanManager:
             job = (
                 await session.execute(
                     text(
-                        "SELECT project, brief, parent_revision_id, rejection "
+                        "SELECT project, namespace, brief, parent_revision_id, rejection "
                         "FROM plan_jobs WHERE id = :id"
                     ),
                     {"id": job_id},
@@ -230,7 +240,7 @@ class PlanManager:
             await session.commit()
         try:
             async with self.database.sessions() as session:
-                beliefs = await self.memory.active_beliefs(session)
+                beliefs = await self.memory.active_beliefs(session, str(job["namespace"]))
             raw = await self.provider.plan(
                 str(job["brief"]),
                 str(job["project"]),
@@ -248,6 +258,7 @@ class PlanManager:
                     str(job["brief"]),
                     document,
                     int(job["parent_revision_id"]) if job["parent_revision_id"] else None,
+                    str(job["namespace"]),
                 )
                 await session.execute(
                     text("UPDATE plan_jobs SET status = 'complete', revision_id = :revision WHERE id = :id"),
@@ -266,7 +277,7 @@ class PlanManager:
         async with self.database.sessions() as session:
             result = await session.execute(
                 text(
-                    "SELECT id, project, brief, status, error, revision_id, created_at "
+                    "SELECT id, project, namespace, brief, status, error, revision_id, created_at "
                     "FROM plan_jobs WHERE id = :id"
                 ),
                 {"id": job_id},
@@ -275,12 +286,18 @@ class PlanManager:
             return dict(row) if row else None
 
 
-async def latest_revisions(session: AsyncSession) -> list[dict[str, object]]:
+async def latest_revisions(
+    session: AsyncSession, namespace: str = SHARED_NAMESPACE
+) -> list[dict[str, object]]:
+    namespace = normalize_namespace(namespace)
     result = await session.execute(
         text(
-            "SELECT DISTINCT ON (project) id, project, revision, content, content_hash, "
-            "created_at, parent_revision_id FROM plan_revisions ORDER BY project, revision DESC"
-        )
+            "SELECT DISTINCT ON (project) id, project, namespace, revision, content, "
+            "content_hash, created_at, parent_revision_id FROM plan_revisions "
+            "WHERE namespace IN (:namespace, :shared) "
+            "ORDER BY project, namespace = :namespace DESC, revision DESC"
+        ),
+        {"namespace": namespace, "shared": SHARED_NAMESPACE},
     )
     plans = [
         {
@@ -303,13 +320,17 @@ async def latest_revisions(session: AsyncSession) -> list[dict[str, object]]:
     return plans
 
 
-async def revision_by_id(session: AsyncSession, revision_id: int) -> PlanRevision | None:
+async def revision_by_id(
+    session: AsyncSession, revision_id: int, namespace: str = SHARED_NAMESPACE
+) -> PlanRevision | None:
+    namespace = normalize_namespace(namespace)
     result = await session.execute(
         text(
-            "SELECT id, project, brief, revision, content, content_hash, created_at, parent_revision_id "
-            "FROM plan_revisions WHERE id = :id"
+            "SELECT id, project, namespace, brief, revision, content, content_hash, "
+            "created_at, parent_revision_id FROM plan_revisions "
+            "WHERE id = :id AND namespace IN (:namespace, :shared)"
         ),
-        {"id": revision_id},
+        {"id": revision_id, "namespace": namespace, "shared": SHARED_NAMESPACE},
     )
     row = result.mappings().one_or_none()
     if row is None:
@@ -317,6 +338,7 @@ async def revision_by_id(session: AsyncSession, revision_id: int) -> PlanRevisio
     return PlanRevision(
         id=int(row["id"]),
         project=str(row["project"]),
+        namespace=str(row["namespace"]),
         brief=str(row["brief"]),
         revision=int(row["revision"]),
         document=_document_from_row(row["content"]),
@@ -327,9 +349,12 @@ async def revision_by_id(session: AsyncSession, revision_id: int) -> PlanRevisio
 
 
 async def approve_revision(
-    session: AsyncSession, revision_id: int, reason: str | None = None
+    session: AsyncSession,
+    revision_id: int,
+    reason: str | None = None,
+    namespace: str = SHARED_NAMESPACE,
 ) -> PlanApproval:
-    revision = await revision_by_id(session, revision_id)
+    revision = await revision_by_id(session, revision_id, namespace)
     if revision is None:
         raise ValueError("plan revision not found")
     prior = await session.execute(
@@ -363,11 +388,14 @@ async def approve_revision(
 
 
 async def reject_revision(
-    session: AsyncSession, revision_id: int, reason: str
+    session: AsyncSession,
+    revision_id: int,
+    reason: str,
+    namespace: str = SHARED_NAMESPACE,
 ) -> PlanApproval:
     if not reason.strip():
         raise ValueError("a rejection reason is required")
-    revision = await revision_by_id(session, revision_id)
+    revision = await revision_by_id(session, revision_id, namespace)
     if revision is None:
         raise ValueError("plan revision not found")
     prior = await session.execute(

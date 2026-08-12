@@ -112,6 +112,23 @@ async def test_rejection_and_approval_are_append_only_and_hash_bound(database) -
         await session.rollback()
 
 
+async def test_plan_project_keeps_namespace_as_a_separate_scope(database) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(
+            session,
+            "animated-3d",
+            "Build the site.",
+            document(),
+            namespace="pj-digi",
+        )
+        revision = await revision_by_id(session, revision_id, "pj-digi")
+        hidden = await revision_by_id(session, revision_id, "jsv-fashion")
+        assert revision is not None
+        assert revision.project == "animated-3d"
+        assert revision.namespace == "pj-digi"
+        assert hidden is None
+
+
 async def test_worker_approval_gate_rechecks_exact_content_hash(database) -> None:
     async with database.begin() as session:
         revision_id = await create_revision(

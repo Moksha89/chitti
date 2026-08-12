@@ -16,6 +16,7 @@ from typing import IO, TYPE_CHECKING, Protocol, cast
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .memory import SHARED_NAMESPACE, normalize_namespace
 from .model_tools import model_tool_names, model_tool_schemas
 from .plans import (
     PlanApproval,
@@ -2243,10 +2244,16 @@ class WorkerRunManager:
     ) -> None:
         self.database = database
         self.dispatcher = dispatcher
-    async def enqueue(self, revision_id: int, limits: WorkerLimits | None = None) -> int:
+    async def enqueue(
+        self,
+        revision_id: int,
+        limits: WorkerLimits | None = None,
+        namespace: str = SHARED_NAMESPACE,
+    ) -> int:
         chosen = limits or WorkerLimits()
+        namespace = normalize_namespace(namespace)
         async with self.database.sessions() as session:
-            revision = await approved_revision(session, revision_id)
+            revision = await approved_revision(session, revision_id, namespace)
             result = await session.execute(
                 text(
                     "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
@@ -2287,8 +2294,10 @@ class WorkerRunManager:
         async with self.database.sessions() as session:
             run_result = await session.execute(
                 text(
-                    "SELECT id, revision_id, limits, workspace_id, created_at "
-                    "FROM worker_runs WHERE id = :run_id"
+                    "SELECT r.id, r.revision_id, r.limits, r.workspace_id, r.created_at, "
+                    "p.namespace "
+                    "FROM worker_runs r JOIN plan_revisions p ON p.id = r.revision_id "
+                    "WHERE r.id = :run_id"
                 ),
                 {"run_id": run_id},
             )
@@ -2792,9 +2801,11 @@ def _directory_size(path: Path) -> int:
 
 
 async def approved_revision(
-    session: AsyncSession, revision_id: int
+    session: AsyncSession,
+    revision_id: int,
+    namespace: str = SHARED_NAMESPACE,
 ) -> PlanRevision:
-    revision = await revision_by_id(session, revision_id)
+    revision = await revision_by_id(session, revision_id, namespace)
     if revision is None:
         raise ValueError("plan revision not found")
     result = await session.execute(
