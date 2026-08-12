@@ -16,11 +16,14 @@ from chitti.worker import (
     _install_failure_detail,
     _is_lockfile_mismatch,
     _model_call_failure_detail,
+    _model_progress_context,
     _model_response_failure,
     _model_system_prompt,
     _parse_tool_call,
     _progress_counters,
     _record_gate_command,
+    _remember_progress_ledger,
+    _replace_model_progress_status,
     _reset_file_write_counter,
     _reviewer_diagnosis_messages,
     _source_path_invalidates_gates,
@@ -111,6 +114,55 @@ def test_inspection_does_not_clear_stall_but_write_progress_does() -> None:
     assert _progress_counters(
         failures, turns, workspace_changed=True
     ) == (0, 0)
+
+
+def test_model_progress_context_warns_more_sharply_as_turns_run_out() -> None:
+    early = _model_progress_context(0, set(), [], [])
+    late = _model_progress_context(7, set(), [], [])
+    assert "8 nonproductive turn(s) remain" in early
+    assert "1 nonproductive turn(s) remain" in late
+    assert "another inspection-only turn" in late
+
+
+def test_model_progress_context_only_hints_finish_with_current_gates() -> None:
+    incomplete = _model_progress_context(1, {"build", "test"}, [], [])
+    opening = _model_progress_context(0, {"build", "test", "export"}, [], [])
+    complete = _model_progress_context(3, {"build", "test", "export"}, [], [])
+    assert "expected next action is to call `finish`" not in incomplete
+    assert "expected next action is to call `finish`" not in opening
+    assert "Current successful gate evidence is missing: export." in incomplete
+    assert "expected next action is to call `finish`" in complete
+    assert "gate will independently accept or refuse it" in complete
+
+
+def test_model_progress_status_replaces_stale_copy_and_survives_compaction() -> None:
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "task"},
+    ]
+    for turn in range(5):
+        _replace_model_progress_status(messages, f"PROGRESS STATUS (system fact): {turn}")
+        messages.append({"role": "assistant", "content": "x" * 500})
+    compacted, _, _ = _compact_model_messages(messages, recent_turns=2)
+    _replace_model_progress_status(compacted, "PROGRESS STATUS (system fact): newest")
+    statuses = [
+        message for message in compacted
+        if str(message.get("content", "")).startswith(
+            "PROGRESS STATUS (system fact):"
+        )
+    ]
+    assert statuses == [
+        {"role": "user", "content": "PROGRESS STATUS (system fact): newest"}
+    ]
+
+
+def test_progress_ledger_is_bounded_and_kept_outside_compacted_file_bodies() -> None:
+    ledger: list[str] = []
+    for index in range(40):
+        _remember_progress_ledger(ledger, f"read_file app/file-{index}.js")
+    assert len(ledger) == 24
+    assert "app/file-0.js" not in "\n".join(ledger)
+    assert "app/file-39.js" in ledger[-1]
 
 
 def test_successful_required_gate_command_counts_as_progress() -> None:

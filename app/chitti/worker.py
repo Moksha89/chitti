@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 
 NONPRODUCTIVE_TURN_LIMIT = 3
 MAX_TURNS_WITHOUT_WORKSPACE_CHANGE = 8
+FINISH_HINT_AFTER_NONPRODUCTIVE_TURNS = 3
+MAX_PROGRESS_LEDGER_ENTRIES = 24
+MAX_PROGRESS_LEDGER_ITEM_CHARS = 160
 MAX_FILE_REWRITES_WITHOUT_COMMAND = 4
 MODEL_TOOL_CALL_BUDGET = 240
 MAX_FILE_WRITES_WITHOUT_COMMAND = 24
@@ -75,6 +78,76 @@ def _progress_counters(
     if workspace_changed:
         return 0, 0
     return failures + int(failure), nonproductive_turns + 1
+
+
+def _remember_progress_ledger(
+    ledger: list[str], entry: str, *, maximum: int = MAX_PROGRESS_LEDGER_ENTRIES
+) -> None:
+    bounded = entry[:MAX_PROGRESS_LEDGER_ITEM_CHARS]
+    if bounded in ledger:
+        ledger.remove(bounded)
+    ledger.append(bounded)
+    del ledger[:-maximum]
+
+
+def _model_progress_context(
+    nonproductive_turns: int,
+    completed_commands: set[str],
+    inspected_paths: list[str],
+    command_outcomes: list[str],
+) -> str:
+    remaining = max(0, MAX_TURNS_WITHOUT_WORKSPACE_CHANGE - nonproductive_turns)
+    lines = [
+        "PROGRESS STATUS (system fact):",
+        (
+            f"This task stops after {MAX_TURNS_WITHOUT_WORKSPACE_CHANGE} model "
+            f"turns without workspace changes. {nonproductive_turns} have been "
+            f"used; {remaining} nonproductive turn(s) remain before that stop."
+        ),
+        (
+            "Read-only inspection turns do not reset this counter. Workspace "
+            "writes, captures, and successful project commands do."
+        ),
+    ]
+    if remaining <= 2:
+        lines.append(
+            "The remaining allowance is short; another inspection-only turn "
+            "without a workspace change will consume one of the turns above."
+        )
+    if (
+        nonproductive_turns >= FINISH_HINT_AFTER_NONPRODUCTIVE_TURNS
+        and _task_done_checks(completed_commands)
+    ):
+        lines.append(
+            "Current successful gate evidence is complete (build, test, export). "
+            "The done condition appears satisfiable from that evidence; the "
+            "expected next action is to call `finish` with a truthful summary. "
+            "The completion gate will independently accept or refuse it."
+        )
+    else:
+        missing = ", ".join(_missing_gate_evidence(completed_commands))
+        lines.append(f"Current successful gate evidence is missing: {missing}.")
+    if inspected_paths:
+        lines.append("Already inspected paths: " + ", ".join(inspected_paths))
+    if command_outcomes:
+        lines.append("Commands already run: " + ", ".join(command_outcomes))
+    return "\n".join(lines)
+
+
+def _replace_model_progress_status(
+    messages: list[dict[str, object]], status: str
+) -> None:
+    messages[:] = [
+        message
+        for message in messages
+        if not (
+            message.get("role") == "user"
+            and str(message.get("content", "")).startswith(
+                "PROGRESS STATUS (system fact):"
+            )
+        )
+    ]
+    messages.append({"role": "user", "content": status})
 
 
 def _tool_counts_as_progress(tool: str, command: str | None = None) -> bool:
@@ -410,6 +483,8 @@ class DockerSandboxDispatcher:
             nonproductive_turns = 0
             gate_stale_reason: str | None = None
             last_refused_missing_gates: frozenset[str] | None = None
+            inspected_paths: list[str] = []
+            command_outcomes: list[str] = []
             route = CODER_ROUTE
             failures = 0
             messages: list[dict[str, object]] = [
@@ -482,9 +557,41 @@ class DockerSandboxDispatcher:
                     failures, nonproductive_turns, workspace_changed=True
                 )
 
+            def remember_tool_result(
+                tool: str,
+                arguments: dict[str, object],
+                *,
+                succeeded: bool,
+                inspected_paths: list[str] = inspected_paths,
+                command_outcomes: list[str] = command_outcomes,
+            ) -> None:
+                if tool in {"read_file", "list_files"}:
+                    path = str(arguments.get("path", ""))
+                    if path:
+                        _remember_progress_ledger(
+                            inspected_paths,
+                            f"{tool} {path} ({'passed' if succeeded else 'failed'})",
+                        )
+                elif tool == "run_command":
+                    command = str(arguments.get("name", ""))
+                    if command:
+                        _remember_progress_ledger(
+                            command_outcomes,
+                            f"{command} ({'passed' if succeeded else 'failed'})",
+                        )
+
             for iteration in range(1, limits.model_iterations + 1):
                 if time.monotonic() - started > limits.run_timeout_seconds:
                     raise RunBudgetExceeded("model run wall-clock")
+                _replace_model_progress_status(
+                    messages,
+                    _model_progress_context(
+                        nonproductive_turns,
+                        completed_commands,
+                        inspected_paths,
+                        command_outcomes,
+                    ),
+                )
                 try:
                     completion = await self.model_provider.agent_completion(
                         messages,
@@ -610,6 +717,7 @@ class DockerSandboxDispatcher:
                                     writes += written
                                     if writes > limits.model_write_bytes:
                                         raise RunBudgetExceeded("model write-byte")
+                                    remember_tool_result(tool, arguments, succeeded=True)
                                     if tool == "run_command":
                                         command_name = str(arguments.get("name", ""))
                                         _record_gate_command(completed_commands, command_name)
@@ -664,6 +772,7 @@ class DockerSandboxDispatcher:
                                             run_id, task.id, "failed", str(exc)[:1000]
                                         )
                                         raise
+                                    remember_tool_result(tool, arguments, succeeded=False)
                                     result_text = (
                                         f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
                                     )
@@ -780,6 +889,7 @@ class DockerSandboxDispatcher:
                     writes += written
                     if writes > limits.model_write_bytes:
                         raise RunBudgetExceeded("model write-byte")
+                    remember_tool_result(tool, arguments, succeeded=True)
                     if tool == "run_command":
                         command_name = str(arguments.get("name", ""))
                         _record_gate_command(completed_commands, command_name)
@@ -825,6 +935,7 @@ class DockerSandboxDispatcher:
                             run_id, task.id, "failed", str(exc)[:1000]
                         )
                         raise
+                    remember_tool_result(tool, arguments, succeeded=False)
                     result_text = f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
                     await record_nonproductive(result_text)
                     if failures >= 2 and route == CODER_ROUTE:
