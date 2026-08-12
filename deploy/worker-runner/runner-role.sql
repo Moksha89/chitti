@@ -7,13 +7,19 @@ GRANT USAGE ON SCHEMA public TO chitti_runner;
 GRANT SELECT ON plan_revisions, plan_approvals, decisions, decision_forgets, worker_runs,
     worker_run_events, worker_operations, worker_artifacts,
     worker_operation_output_chunks,
+    worker_run_heartbeats,
     worker_retention_policy, worker_artifact_payloads, worker_model_calls,
-    export_manifests, promotion_approvals, previews
+    export_manifests, promotion_approvals, previews,
+    reminders, reminder_occurrences, notifications,
+    notification_acknowledgements, daily_briefings, runner_health
     TO chitti_runner;
 GRANT INSERT ON plan_task_events, worker_run_events, worker_operations, worker_artifacts,
     worker_operation_output_chunks, worker_artifact_payloads, worker_model_calls,
-    export_manifests, previews
+    export_manifests, previews, reminder_occurrences, notifications,
+    worker_run_heartbeats
     TO chitti_runner;
+GRANT UPDATE, DELETE ON worker_run_heartbeats TO chitti_runner;
+GRANT INSERT, UPDATE ON runner_health TO chitti_runner;
 -- The runner uses SELECT ... FOR UPDATE OF worker_runs to claim a queued row.
 GRANT UPDATE ON worker_runs TO chitti_runner;
 GRANT DELETE ON worker_artifact_payloads TO chitti_runner;
@@ -25,7 +31,9 @@ GRANT USAGE, SELECT ON SEQUENCE
     worker_artifacts_id_seq,
     worker_operation_output_chunks_id_seq,
     worker_model_calls_id_seq,
-    export_manifests_id_seq
+    export_manifests_id_seq,
+    reminder_occurrences_id_seq,
+    notifications_id_seq
     TO chitti_runner;
 
 -- Enforce the narrow boundary if this script is applied to an older role.

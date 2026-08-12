@@ -47,6 +47,7 @@ from .provider import FakeProvider, LiteLLMProvider
 from .reminders import create_reminder, recent_reminders
 from .run_context import RunContextError, build_run_evidence
 from .run_status import TERMINAL_RUN_STATUSES
+from .runner_health import recent_runner_health
 from .service import ChittiService
 from .settings import Settings, get_settings
 from .telegram import TelegramPoller
@@ -359,6 +360,7 @@ async def dashboard_context(
         transcript = await recent_entries(db_session, namespace)
         reminders = await recent_reminders(database, namespace)
         notifications = await recent_notifications(database, namespace)
+        runner_health = await recent_runner_health(database)
         for plan in plans:
             approval_result = await db_session.execute(
                 text(
@@ -411,6 +413,7 @@ async def dashboard_context(
         "transcript": transcript,
         "reminders": reminders,
         "notifications": notifications,
+        "runner_health": runner_health,
         "briefing": briefing,
     }
 

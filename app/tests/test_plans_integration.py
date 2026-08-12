@@ -39,6 +39,7 @@ from chitti.runner import (
     reconcile_cancelled_run,
     reconcile_interrupted_runs,
 )
+from chitti.runner_health import recent_runner_health, record_runner_health_failure
 from chitti.transcripts import append_entry, recent_entries
 from chitti.worker import (
     MAX_CAPTURE_ARTIFACTS_PER_RUN,
@@ -937,3 +938,15 @@ async def test_late_recurring_reminder_emits_one_notification_with_skip_count(da
         count, latest = occurrences.one()
         assert count == 8
         assert latest == now
+
+
+async def test_persistent_runner_failure_is_visible_in_durable_health(database):
+    adapter = _DatabaseAdapter(database)
+    await record_runner_health_failure(
+        adapter, "reminder_sweep", "permission denied for table reminders"
+    )
+    health = await recent_runner_health(adapter)
+    assert len(health) == 1
+    assert health[0]["component"] == "reminder_sweep"
+    assert health[0]["status"] == "failed"
+    assert "permission denied" in str(health[0]["detail"])
