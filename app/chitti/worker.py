@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 NONPRODUCTIVE_TURN_LIMIT = 3
 MAX_TURNS_WITHOUT_WORKSPACE_CHANGE = 8
+FINISH_HINT_AFTER_NONPRODUCTIVE_TURNS = 3
 MAX_PROGRESS_LEDGER_ENTRIES = 24
 MAX_PROGRESS_LEDGER_ITEM_CHARS = 160
 MAX_FILE_REWRITES_WITHOUT_COMMAND = 4
@@ -113,7 +114,10 @@ def _model_progress_context(
             "The remaining allowance is short; another inspection-only turn "
             "without a workspace change will consume one of the turns above."
         )
-    if _task_done_checks(completed_commands):
+    if (
+        nonproductive_turns >= FINISH_HINT_AFTER_NONPRODUCTIVE_TURNS
+        and _task_done_checks(completed_commands)
+    ):
         lines.append(
             "Current successful gate evidence is complete (build, test, export). "
             "The done condition appears satisfiable from that evidence; the "
@@ -128,6 +132,22 @@ def _model_progress_context(
     if command_outcomes:
         lines.append("Commands already run: " + ", ".join(command_outcomes))
     return "\n".join(lines)
+
+
+def _replace_model_progress_status(
+    messages: list[dict[str, object]], status: str
+) -> None:
+    messages[:] = [
+        message
+        for message in messages
+        if not (
+            message.get("role") == "user"
+            and str(message.get("content", "")).startswith(
+                "PROGRESS STATUS (system fact):"
+            )
+        )
+    ]
+    messages.append({"role": "user", "content": status})
 
 
 def _tool_counts_as_progress(tool: str, command: str | None = None) -> bool:
@@ -563,16 +583,14 @@ class DockerSandboxDispatcher:
             for iteration in range(1, limits.model_iterations + 1):
                 if time.monotonic() - started > limits.run_timeout_seconds:
                     raise RunBudgetExceeded("model run wall-clock")
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": _model_progress_context(
-                            nonproductive_turns,
-                            completed_commands,
-                            inspected_paths,
-                            command_outcomes,
-                        ),
-                    }
+                _replace_model_progress_status(
+                    messages,
+                    _model_progress_context(
+                        nonproductive_turns,
+                        completed_commands,
+                        inspected_paths,
+                        command_outcomes,
+                    ),
                 )
                 try:
                     completion = await self.model_provider.agent_completion(

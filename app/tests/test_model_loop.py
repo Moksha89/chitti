@@ -23,6 +23,7 @@ from chitti.worker import (
     _progress_counters,
     _record_gate_command,
     _remember_progress_ledger,
+    _replace_model_progress_status,
     _reset_file_write_counter,
     _reviewer_diagnosis_messages,
     _source_path_invalidates_gates,
@@ -125,11 +126,34 @@ def test_model_progress_context_warns_more_sharply_as_turns_run_out() -> None:
 
 def test_model_progress_context_only_hints_finish_with_current_gates() -> None:
     incomplete = _model_progress_context(1, {"build", "test"}, [], [])
-    complete = _model_progress_context(1, {"build", "test", "export"}, [], [])
+    opening = _model_progress_context(0, {"build", "test", "export"}, [], [])
+    complete = _model_progress_context(3, {"build", "test", "export"}, [], [])
     assert "expected next action is to call `finish`" not in incomplete
+    assert "expected next action is to call `finish`" not in opening
     assert "Current successful gate evidence is missing: export." in incomplete
     assert "expected next action is to call `finish`" in complete
     assert "gate will independently accept or refuse it" in complete
+
+
+def test_model_progress_status_replaces_stale_copy_and_survives_compaction() -> None:
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "task"},
+    ]
+    for turn in range(5):
+        _replace_model_progress_status(messages, f"PROGRESS STATUS (system fact): {turn}")
+        messages.append({"role": "assistant", "content": "x" * 500})
+    compacted, _, _ = _compact_model_messages(messages, recent_turns=2)
+    _replace_model_progress_status(compacted, "PROGRESS STATUS (system fact): newest")
+    statuses = [
+        message for message in compacted
+        if str(message.get("content", "")).startswith(
+            "PROGRESS STATUS (system fact):"
+        )
+    ]
+    assert statuses == [
+        {"role": "user", "content": "PROGRESS STATUS (system fact): newest"}
+    ]
 
 
 def test_progress_ledger_is_bounded_and_kept_outside_compacted_file_bodies() -> None:
