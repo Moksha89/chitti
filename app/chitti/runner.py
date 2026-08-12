@@ -31,6 +31,7 @@ from .runtime_identity import write_loaded_code_identity
 from .settings import Settings, get_settings
 from .worker import (
     DockerSandboxDispatcher,
+    RunBudgetExceeded,
     WorkerLimits,
     approved_revision,
 )
@@ -377,6 +378,11 @@ async def execute_run(
             await asyncio.sleep(1)
             if asyncio.get_running_loop().time() > deadline:
                 await dispatcher.cancel(run_id)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
                 await record_event(database, run_id, "failed", "model run wall-clock budget exceeded")
                 return
             if await cancellation_requested(database, run_id):
@@ -386,6 +392,8 @@ async def execute_run(
         await dispatcher.cancel(run_id)
         await record_event(database, run_id, "cancelled", "runner interrupted")
         raise
+    except RunBudgetExceeded as exc:
+        await record_event(database, run_id, "failed", str(exc))
     except Exception as exc:
         await record_event(database, run_id, "failed", str(exc)[:2000])
     finally:

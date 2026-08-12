@@ -7,6 +7,7 @@ import pytest
 from chitti import runner
 from chitti.previews import build_manifest, copy_export
 from chitti.provider import GatewayMisconfigurationError, GatewayTransientError
+from chitti.worker import RunBudgetExceeded
 
 
 class _Result:
@@ -22,6 +23,9 @@ class _Result:
 
     def one_or_none(self):
         return self._one
+
+    def scalar_one(self):
+        return self._one if isinstance(self._one, bool) else False
 
     def __iter__(self):
         return iter(self._rows or [])
@@ -95,6 +99,49 @@ def test_run_distinguishes_transient_gateway_failure_before_workspace(monkeypatc
     assert events == [
         "failed: gateway temporarily unavailable: gateway did not respond during preflight"
     ]
+
+
+def test_run_budget_exhaustion_is_terminal_without_retryable_tool_failures(monkeypatch) -> None:
+    events: list[tuple[str, str]] = []
+    dispatched = False
+
+    class Provider:
+        async def validate_gateway(self) -> None:
+            return
+
+    class Dispatcher:
+        async def dispatch(self, *_args) -> None:
+            nonlocal dispatched
+            dispatched = True
+            raise RunBudgetExceeded("model tool-call")
+
+        async def cancel(self, *_args) -> None:
+            raise AssertionError("terminal budget failure should not be retried or cancelled")
+
+    async def approved(_session, _revision_id):
+        return object()
+
+    async def record_event(_database, _run_id, status, detail, **_kwargs) -> None:
+        events.append((status, detail))
+
+    async def trim_payloads(_database) -> None:
+        return
+
+    monkeypatch.setattr("chitti.runner.approved_revision", approved)
+    monkeypatch.setattr("chitti.runner.record_event", record_event)
+    monkeypatch.setattr("chitti.runner.trim_payloads", trim_payloads)
+    asyncio.run(
+        runner.execute_run(
+            _Database(),  # type: ignore[arg-type]
+            Dispatcher(),  # type: ignore[arg-type]
+            {"id": 1, "revision_id": 1, "limits": runner.WorkerLimits().as_json()},
+            Provider(),  # type: ignore[arg-type]
+        )
+    )
+
+    assert dispatched
+    assert events == [("failed", "model tool-call budget exceeded")]
+    assert all(status != "model_tool_failed" for status, _detail in events)
 
 
 class _Session:

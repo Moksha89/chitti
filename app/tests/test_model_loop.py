@@ -5,6 +5,7 @@ import pytest
 from chitti.provider import ModelCompletion, ModelToolCall
 from chitti.worker import (
     DockerSandboxDispatcher,
+    RunBudgetExceeded,
     WorkerLimits,
     _assistant_tool_message,
     _bounded_artifact,
@@ -79,6 +80,16 @@ def test_model_limits_round_trip() -> None:
     assert WorkerLimits.from_json(limits.as_json()) == limits
     assert WorkerLimits().run_timeout_seconds == 7200
     assert WorkerLimits().model_tokens == 500000
+    assert WorkerLimits().model_tool_calls == 240
+
+
+@pytest.mark.parametrize(
+    "budget",
+    ["model tool-call", "model token", "model spend", "model write-byte", "model run wall-clock"],
+)
+def test_run_budget_failure_names_the_exhausted_budget(budget: str) -> None:
+    error = RunBudgetExceeded(budget)
+    assert str(error) == f"{budget} budget exceeded"
 
 
 def test_model_call_failure_detail_distinguishes_transport_and_response_errors() -> None:
@@ -448,7 +459,7 @@ def test_model_paths_reject_traversal_and_symlink_escape(tmp_path: Path) -> None
 async def test_model_write_budget_and_command_allowlist(tmp_path: Path) -> None:
     dispatcher = object.__new__(DockerSandboxDispatcher)
     limits = WorkerLimits(model_write_bytes=4)
-    with pytest.raises(ValueError, match="single write"):
+    with pytest.raises(RunBudgetExceeded, match="model write-byte budget exceeded"):
         await dispatcher._execute_model_tool(
             1, "task", 0, "write_file",
             {"path": "app.js", "content": "too big"},

@@ -43,6 +43,15 @@ logger = logging.getLogger(__name__)
 NONPRODUCTIVE_TURN_LIMIT = 3
 MAX_TURNS_WITHOUT_WORKSPACE_CHANGE = 8
 MAX_FILE_REWRITES_WITHOUT_COMMAND = 4
+MODEL_TOOL_CALL_BUDGET = 240
+
+
+class RunBudgetExceeded(RuntimeError):
+    """A run-level budget ended execution and must not be retried by the model."""
+
+    def __init__(self, budget: str) -> None:
+        self.budget = budget
+        super().__init__(f"{budget} budget exceeded")
 MAX_FILE_WRITES_WITHOUT_COMMAND = 24
 
 
@@ -147,7 +156,7 @@ class WorkerLimits:
     workspace_bytes: int = 4 * 1024 * 1024 * 1024
     shm_size: str = "256m"
     model_iterations: int = 40
-    model_tool_calls: int = 120
+    model_tool_calls: int = MODEL_TOOL_CALL_BUDGET
     model_tokens: int = 500000
     model_write_bytes: int = 2 * 1024 * 1024
     model_spend_usd: float = 0.75
@@ -188,7 +197,9 @@ class WorkerLimits:
             workspace_bytes=int(cast(int, values.get("workspace_bytes", artifact_bytes))),
             shm_size=str(values["shm_size"]),
             model_iterations=int(cast(int, values.get("model_iterations", 40))),
-            model_tool_calls=int(cast(int, values.get("model_tool_calls", 120))),
+            model_tool_calls=int(
+                cast(int, values.get("model_tool_calls", MODEL_TOOL_CALL_BUDGET))
+            ),
             model_tokens=int(cast(int, values.get("model_tokens", 500000))),
             model_write_bytes=int(cast(int, values.get("model_write_bytes", 2 * 1024 * 1024))),
             model_spend_usd=float(cast(float, values.get("model_spend_usd", 0.75))),
@@ -473,11 +484,7 @@ class DockerSandboxDispatcher:
 
             for iteration in range(1, limits.model_iterations + 1):
                 if time.monotonic() - started > limits.run_timeout_seconds:
-                    await self._task_event(
-                        run_id, task.id, "failed",
-                        "model run wall-clock budget exceeded",
-                    )
-                    raise RuntimeError("model run wall-clock budget exceeded")
+                    raise RunBudgetExceeded("model run wall-clock")
                 try:
                     completion = await self.model_provider.agent_completion(
                         messages,
@@ -514,15 +521,9 @@ class DockerSandboxDispatcher:
                     prompt=json.dumps(messages, separators=(",", ":")),
                 )
                 if spent_tokens > limits.model_tokens:
-                    await self._task_event(
-                        run_id, task.id, "failed", "model token budget exceeded"
-                    )
-                    raise RuntimeError("model token budget exceeded")
+                    raise RunBudgetExceeded("model token")
                 if spent > limits.model_spend_usd:
-                    await self._task_event(
-                        run_id, task.id, "failed", "model spend budget exceeded"
-                    )
-                    raise RuntimeError("model spend budget exceeded")
+                    raise RunBudgetExceeded("model spend")
                 response_failure = _model_response_failure(completion)
                 if response_failure is not None:
                     detail = response_failure
@@ -567,9 +568,7 @@ class DockerSandboxDispatcher:
                             batch_failure = result_text
                             messages.append(_tool_result_message(native_call, result_text))
                         elif tool_calls_used >= limits.model_tool_calls:
-                            result_text = "TOOL FAILURE: model tool-call budget exceeded"
-                            batch_failure = result_text
-                            messages.append(_tool_result_message(native_call, result_text))
+                            raise RunBudgetExceeded("model tool-call")
                         else:
                             tool_calls_used += 1
                             if tool == "finish" and _task_done_checks(completed_commands):
@@ -610,13 +609,7 @@ class DockerSandboxDispatcher:
                                     )
                                     writes += written
                                     if writes > limits.model_write_bytes:
-                                        await self._task_event(
-                                            run_id, task.id, "failed",
-                                            "model write-byte budget exceeded",
-                                        )
-                                        raise RuntimeError(
-                                            "model write-byte budget exceeded"
-                                        )
+                                        raise RunBudgetExceeded("model write-byte")
                                     if tool == "run_command":
                                         command_name = str(arguments.get("name", ""))
                                         _record_gate_command(completed_commands, command_name)
@@ -666,7 +659,7 @@ class DockerSandboxDispatcher:
                                         )
                                     )
                                 except Exception as exc:
-                                    if isinstance(exc, ModelProgressError):
+                                    if isinstance(exc, ModelProgressError | RunBudgetExceeded):
                                         await self._task_event(
                                             run_id, task.id, "failed", str(exc)[:1000]
                                         )
@@ -750,11 +743,7 @@ class DockerSandboxDispatcher:
                     await compact_history()
                     continue
                 if tool_calls_used >= limits.model_tool_calls:
-                    await self._task_event(
-                        run_id, task.id, "failed",
-                        "model tool-call budget exceeded",
-                    )
-                    raise RuntimeError("model tool-call budget exceeded")
+                    raise RunBudgetExceeded("model tool-call")
                 tool_calls_used += 1
                 if tool == "finish" and _task_done_checks(completed_commands):
                     await self._event(
@@ -790,11 +779,7 @@ class DockerSandboxDispatcher:
                     )
                     writes += written
                     if writes > limits.model_write_bytes:
-                        await self._task_event(
-                            run_id, task.id, "failed",
-                            "model write-byte budget exceeded",
-                        )
-                        raise RuntimeError("model write-byte budget exceeded")
+                        raise RunBudgetExceeded("model write-byte")
                     if tool == "run_command":
                         command_name = str(arguments.get("name", ""))
                         _record_gate_command(completed_commands, command_name)
@@ -835,7 +820,7 @@ class DockerSandboxDispatcher:
                     else:
                         await record_inspection_turn()
                 except Exception as exc:
-                    if isinstance(exc, ModelProgressError):
+                    if isinstance(exc, ModelProgressError | RunBudgetExceeded):
                         await self._task_event(
                             run_id, task.id, "failed", str(exc)[:1000]
                         )
@@ -975,7 +960,7 @@ class DockerSandboxDispatcher:
             content = str(arguments.get("content", ""))
             encoded = content.encode()
             if len(encoded) > limits.model_write_bytes:
-                raise ValueError("single write exceeds model write budget")
+                raise RunBudgetExceeded("model write-byte")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(encoded)
             return f"wrote {len(encoded)} bytes", len(encoded), operation_index
@@ -1067,9 +1052,9 @@ class DockerSandboxDispatcher:
             )
             raise
         if spent_tokens + completion.total_tokens > limits.model_tokens:
-            raise RuntimeError("model token budget exceeded during review")
+            raise RunBudgetExceeded("model token")
         if spent + completion.cost_usd > limits.model_spend_usd:
-            raise RuntimeError("model spend budget exceeded during review")
+            raise RunBudgetExceeded("model spend")
         await self._record_model_call(
             run_id, "review", calls + 1, REVIEWER_ROUTE, completion,
             kind="reviewer_report",

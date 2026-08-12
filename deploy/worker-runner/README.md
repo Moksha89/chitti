@@ -146,7 +146,9 @@ mechanism.
 Model coding runs add a second, runner-enforced budget document to the
 immutable `worker_runs.limits` JSON:
 
-- 40 model iterations per task and 120 total tool calls;
+- 40 model iterations per task and 240 total tool calls; this gives a
+  ten-task plan roughly 24 tool calls per task, with headroom above the
+  approximately 100-120 calls observed in recent full-run attempts;
 - 300,000 total model tokens;
 - 2 MiB total model-authored writes;
 - 7,200 seconds overall run wall-clock, separate from each Docker operation's
