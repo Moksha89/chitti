@@ -68,7 +68,7 @@
 
   <main class="workspace-main">
     <header class="workspace-top">
-      <div><div class="kicker">Run workspace / durable evidence</div><h1>Run {{ run.run.id }}</h1><p class="subhead">{{ revision.project }} · revision {{ revision.revision }} · <span id="stream-status" class="stream-status">{% if run.latest_status in ["passed", "failed", "cancelled"] %}run finished{% else %}live updates connecting{% endif %}</span></p></div>
+      <div><div class="kicker">Run workspace / durable evidence</div><h1>Run {{ run.run.id }}</h1><p class="subhead">{{ revision.project }} · revision {{ revision.revision }} · <span id="stream-status" class="stream-status">{% if run.is_terminal %}run finished{% else %}live updates connecting{% endif %}</span></p></div>
       <a class="button-secondary" href="/plans/{{ revision.id }}">Plan detail</a>
     </header>
     <div class="workspace-tabs" role="tablist">
@@ -136,7 +136,7 @@
 </div>
 <script>
 (() => {
-  const runId={{ run.run.id }}, terminalRun={{ "true" if run.latest_status in ["passed", "failed", "cancelled"] else "false" }}, status=document.getElementById("run-status"), streamStatus=document.getElementById("stream-status"), events=document.getElementById("event-list"), liveOutput=document.getElementById("live-output"), liveOutputTitle=document.getElementById("live-output-title"), liveOutputBody=document.getElementById("live-output-body"), seen=new Set([...document.querySelectorAll("[data-event-id]")].map(item=>item.dataset.eventId));
+  const runId={{ run.run.id }}, terminalRun={{ "true" if run.is_terminal else "false" }}, status=document.getElementById("run-status"), streamStatus=document.getElementById("stream-status"), events=document.getElementById("event-list"), liveOutput=document.getElementById("live-output"), liveOutputTitle=document.getElementById("live-output-title"), liveOutputBody=document.getElementById("live-output-body"), seen=new Set([...document.querySelectorAll("[data-event-id]")].map(item=>item.dataset.eventId));
   document.querySelectorAll(".workspace-tab").forEach(tab=>tab.addEventListener("click",()=>{document.querySelectorAll(".workspace-tab").forEach(item=>item.classList.toggle("active",item===tab));document.querySelectorAll(".workspace-pane").forEach(pane=>pane.classList.toggle("active",pane.dataset.pane===tab.dataset.tab))}));
   const diffDetail=document.getElementById("diff-detail");
   async function loadDiff(file) {

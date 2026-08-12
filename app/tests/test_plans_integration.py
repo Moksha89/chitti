@@ -37,6 +37,7 @@ from chitti.runner import (
     cancellation_requested,
     next_queued_run,
     reconcile_cancelled_run,
+    reconcile_interrupted_runs,
 )
 from chitti.transcripts import append_entry, recent_entries
 from chitti.worker import (
@@ -649,6 +650,75 @@ async def test_claimed_cancellation_is_not_reconciled(database) -> None:
             {"run": run_id},
         )
     assert await reconcile_cancelled_run(adapter) is None  # type: ignore[arg-type]
+
+
+async def test_restart_reconciliation_marks_only_stale_runs_interrupted(database) -> None:
+    now = datetime(2026, 1, 1, 12, tzinfo=UTC)
+    async with database.begin() as session:
+        revision_id = await create_revision(session, "runner", "Build fixture.", document())
+        run_ids: dict[str, int] = {}
+        for name, status in (
+            ("stale", "running"),
+            ("preexisting", "running"),
+            ("live", "running"),
+            ("unknown_in_flight", "model_context_compacted"),
+            ("terminal", "passed"),
+        ):
+            result = await session.execute(
+                text(
+                    "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
+                    "VALUES (:revision, '{}'::json, :workspace) RETURNING id"
+                ),
+                {"revision": revision_id, "workspace": f"restart-{name}"},
+            )
+            run_id = int(result.scalar_one())
+            run_ids[name] = run_id
+            await session.execute(
+                text(
+                    "INSERT INTO worker_run_events (run_id, status, detail) "
+                    "VALUES (:run, :status, :detail)"
+                ),
+                {"run": run_id, "status": status, "detail": "test state"},
+            )
+        await session.execute(
+            text(
+                "INSERT INTO worker_run_heartbeats (run_id, runner_id, heartbeat_at) "
+                "VALUES (:run, 'dead-runner', :heartbeat)"
+            ),
+            {
+                "run": run_ids["stale"],
+                "heartbeat": now - timedelta(seconds=30),
+            },
+        )
+        await session.execute(
+            text(
+                "INSERT INTO worker_run_heartbeats (run_id, runner_id, heartbeat_at) "
+                "VALUES (:run, 'live-runner', :heartbeat)"
+            ),
+            {
+                "run": run_ids["live"],
+                "heartbeat": now - timedelta(seconds=1),
+            },
+        )
+
+    adapter = _DatabaseAdapter(database)
+    assert await reconcile_interrupted_runs(adapter, now) == [
+        run_ids["stale"],
+        run_ids["preexisting"],
+        run_ids["unknown_in_flight"],
+    ]  # type: ignore[arg-type]
+    assert await reconcile_interrupted_runs(adapter, now) == []  # type: ignore[arg-type]
+
+    manager = WorkerRunManager(adapter)  # type: ignore[arg-type]
+    stale_detail = await manager.detail(run_ids["stale"])
+    assert stale_detail is not None
+    assert stale_detail["events"][-1]["status"] == "interrupted"
+    assert "execution heartbeat expired" in stale_detail["events"][-1]["detail"]
+    preexisting_detail = await manager.detail(run_ids["preexisting"])
+    assert preexisting_detail is not None
+    assert "no execution heartbeat was recorded" in preexisting_detail["events"][-1]["detail"]
+    assert await manager.latest_status(run_ids["live"]) == "running"
+    assert await manager.latest_status(run_ids["terminal"]) == "passed"
 
 
 async def test_live_output_chunks_are_cursorable_bounded_and_pruned_after_artifact(
