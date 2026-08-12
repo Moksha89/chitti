@@ -105,7 +105,7 @@ async def compose_briefing(
             due_at = row.due_at
             recurrence = str(row.recurrence) if row.recurrence else None
             while due_at < start_utc:
-                due_at = next_due(due_at, recurrence)
+                due_at = next_due(due_at, recurrence, timezone_name)
                 if due_at is None:
                     break
             if due_at is not None and start_utc <= due_at < end_utc:

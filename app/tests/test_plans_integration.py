@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import text
@@ -15,7 +16,11 @@ from testcontainers.postgres import PostgresContainer
 
 from chitti.briefings import compose_briefing
 from chitti.main import record_promotion_approval
-from chitti.notifications import acknowledge_notification, recent_notifications
+from chitti.notifications import (
+    acknowledge_notification,
+    notifications_after,
+    recent_notifications,
+)
 from chitti.plans import (
     PlanDocument,
     PlanTask,
@@ -25,6 +30,7 @@ from chitti.plans import (
     revision_by_id,
     validate_approval_binding,
 )
+from chitti.provider import FakeProvider
 from chitti.reminders import create_reminder, next_due, sweep_reminders
 from chitti.run_context import RunContextError, build_run_evidence
 from chitti.runner import (
@@ -752,8 +758,8 @@ async def test_reminders_are_exactly_once_and_namespace_scoped(database):
             {"due": now - timedelta(days=2)},
         )
     adapter = _DatabaseAdapter(database)
-    assert await sweep_reminders(adapter, now) == 3
-    assert await sweep_reminders(adapter, now) == 0
+    assert await sweep_reminders(adapter, now) == 1
+    assert await sweep_reminders(_DatabaseAdapter(database), now) == 0
     async with database.begin() as session:
         count = await session.execute(
             text(
@@ -764,8 +770,10 @@ async def test_reminders_are_exactly_once_and_namespace_scoped(database):
         )
         assert count.scalar_one() == 3
     assert await recent_notifications(adapter, "jsv-fashion") == []
+    assert await notifications_after(adapter, "jsv-fashion", 0) == []
+    assert len(await notifications_after(adapter, "pj-digi", 0)) == 1
     notifications = await recent_notifications(adapter, "pj-digi")
-    assert len(notifications) == 3
+    assert len(notifications) == 1
     original = notifications[0]
     assert await acknowledge_notification(
         adapter, "jsv-fashion", int(notifications[0]["id"])
@@ -795,6 +803,12 @@ async def test_reminder_local_time_and_empty_briefing_are_deterministic(database
         None,
     )
     assert reminder_id > 0
+    async with database.begin() as session:
+        stored = await session.execute(
+            text("SELECT due_at FROM reminders WHERE id = :id"),
+            {"id": reminder_id},
+        )
+        assert stored.scalar_one() == datetime(2026, 1, 1, 19, 0, tzinfo=UTC)
     briefing = await compose_briefing(
         _DatabaseAdapter(database),
         "general",
@@ -810,3 +824,45 @@ async def test_reminder_local_time_and_empty_briefing_are_deterministic(database
         datetime(2026, 1, 1, 19, tzinfo=UTC),
     )
     assert empty["content"] == "Nothing needs your attention today."
+
+
+async def test_briefing_never_invokes_model_provider(database, monkeypatch):
+    provider = FakeProvider()
+    provider.chat = AsyncMock()
+    provider.plan = AsyncMock()
+    briefing = await compose_briefing(
+        _DatabaseAdapter(database),
+        "general",
+        "Asia/Kolkata",
+        datetime(2026, 1, 1, 19, tzinfo=UTC),
+    )
+    assert briefing["content"] == "Nothing needs your attention today."
+    provider.chat.assert_not_awaited()
+    provider.plan.assert_not_awaited()
+
+
+async def test_late_recurring_reminder_emits_one_notification_with_skip_count(database):
+    now = datetime(2026, 1, 8, 9, tzinfo=UTC)
+    async with database.begin() as session:
+        await session.execute(
+            text(
+                "INSERT INTO reminders (namespace, text, due_at, recurrence) "
+                "VALUES ('general', 'stand up', :due, 'daily')"
+            ),
+            {"due": datetime(2026, 1, 1, 9, tzinfo=UTC)},
+        )
+    adapter = _DatabaseAdapter(database)
+    assert await sweep_reminders(adapter, now) == 1
+    notifications = await recent_notifications(adapter, "general")
+    assert len(notifications) == 1
+    assert "skipped 7 scheduled occurrences" in str(notifications[0]["body"])
+    async with database.begin() as session:
+        occurrences = await session.execute(
+            text(
+                "SELECT COUNT(*), MAX(due_at) FROM reminder_occurrences "
+                "WHERE reminder_id = (SELECT id FROM reminders WHERE text = 'stand up')"
+            )
+        )
+        count, latest = occurrences.one()
+        assert count == 8
+        assert latest == now

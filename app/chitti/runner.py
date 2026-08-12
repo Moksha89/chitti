@@ -65,9 +65,11 @@ def _copy_and_verify_export(
     return landed
 
 
-async def best_effort_reminder_sweep(database: Database) -> None:
+async def best_effort_reminder_sweep(
+    database: Database, timezone_name: str = "UTC"
+) -> None:
     try:
-        await sweep_reminders(database)
+        await sweep_reminders(database, timezone_name=timezone_name)
     except Exception:
         logger.exception("reminder sweep failed")
 
@@ -511,7 +513,7 @@ async def run_forever() -> None:
             await dispatcher.cleanup_expired_previews()
             await publish_approved_previews(database, settings)
             await reconcile_cancelled_run(database)
-            await best_effort_reminder_sweep(database)
+            await best_effort_reminder_sweep(database, settings.display_timezone)
             row = await next_queued_run(database)
             if row is None:
                 await asyncio.sleep(POLL_SECONDS)
