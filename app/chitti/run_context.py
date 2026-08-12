@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .diff_parser import parse_diff
 from .memory import SHARED_NAMESPACE, normalize_namespace
 
 MAX_RUN_CONTEXT_BYTES = 24_000
@@ -22,6 +23,7 @@ class RunEvidence:
     context: str
     evidence_used: tuple[str, ...]
     clipped: bool
+    clipped_sections: tuple[str, ...] = ()
 
 
 def bound_context(
@@ -31,28 +33,64 @@ def bound_context(
     chunks: list[str] = []
     remaining = max_bytes
     clipped = False
-    for label, section in sections:
+    clipped_sections: list[str] = []
+    reserve_marker = min(128, max(16, max_bytes // 20))
+    section_sizes = [
+        (label, len(f"[{label}]\n{section}\n".encode()))
+        for label, section in sections
+    ]
+    for index, (label, section) in enumerate(sections):
         rendered = f"[{label}]\n{section}\n"
         encoded = rendered.encode("utf-8")
-        if len(encoded) <= remaining:
+        later_reserve = sum(
+            min(size, max(4, max_bytes // 20))
+            for later_label, size in section_sizes[index + 1 :]
+            if later_label != label
+        )
+        available = max(0, remaining - later_reserve - reserve_marker)
+        if len(encoded) <= available:
             chunks.append(rendered)
             used.append(label)
             remaining -= len(encoded)
             continue
         clipped = True
-        marker = "\n[context clipped: remaining run evidence omitted]\n"
+        if label not in clipped_sections:
+            clipped_sections.append(label)
+        if available > 0:
+            partial = encoded[:available].decode("utf-8", errors="ignore")
+            chunks.append(partial)
+            if label not in used:
+                used.append(label)
+            remaining -= len(partial.encode("utf-8"))
+    marker = (
+        "\n[context clipped: "
+        + ", ".join(clipped_sections)
+        + " omitted or trimmed]\n"
+    )
+    marker_bytes = marker.encode("utf-8")
+    current = "".join(chunks).encode("utf-8")
+    if len(current) + len(marker_bytes) > max_bytes:
+        compact_labels = {
+            "failed operation": "failed output",
+            "successful operations": "success",
+            "task states": "tasks",
+            "event tail": "events",
+            "publication": "publication state",
+        }
+        label = compact_labels.get(clipped_sections[0], clipped_sections[0])
+        marker = "[context clipped: " + label + "]"
         marker_bytes = marker.encode("utf-8")
-        if remaining < len(marker_bytes):
-            marker = "[context clipped]"
-            marker_bytes = marker.encode("utf-8")
-            current = "".join(chunks).encode("utf-8")
-            keep = max(0, max_bytes - len(marker_bytes))
-            chunks = [current[:keep].decode("utf-8", errors="ignore")]
-            remaining = max_bytes - len(chunks[0].encode("utf-8"))
-        if remaining >= len(marker_bytes):
-            chunks.append(marker)
-        break
-    return RunEvidence("".join(chunks), tuple(used), clipped)
+    if len(current) + len(marker_bytes) > max_bytes:
+        keep = max(0, max_bytes - len(marker_bytes))
+        current = current[:keep]
+    context = current.decode("utf-8", errors="ignore") + marker if clipped else current.decode(
+        "utf-8", errors="ignore"
+    )
+    if len(context.encode("utf-8")) > max_bytes:
+        context = context.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+    return RunEvidence(
+        context, tuple(used), clipped, tuple(clipped_sections)
+    )
 
 
 def _tail(value: object, limit: int = OUTPUT_TAIL_BYTES) -> str:
@@ -69,26 +107,25 @@ def _diff_summary(payload: object) -> str:
         payload_bytes = bytes(payload)
     else:
         payload_bytes = str(payload).encode("utf-8")
-    lines = payload_bytes.decode("utf-8", errors="replace").splitlines()
-    files: list[str] = []
-    additions = 0
-    deletions = 0
-    for line in lines:
-        if line.startswith("diff --git a/"):
-            parts = line.split(" b/", 1)
-            if len(parts) == 2:
-                files.append(parts[1])
-        elif line.startswith("+++ ") or line.startswith("--- "):
-            continue
-        elif line.startswith("+"):
-            additions += 1
-        elif line.startswith("-"):
-            deletions += 1
-    if not files:
+    entries = parse_diff(payload_bytes)
+    if not entries:
         return "no changed-file summary available"
+    authored = [entry for entry in entries if entry["role"] == "authored"]
+    generated = [entry for entry in entries if entry["role"] == "generated"]
+
+    def summarize(items: list[dict[str, object]]) -> str:
+        additions = sum(int(str(item["additions"])) for item in items)
+        deletions = sum(int(str(item["deletions"])) for item in items)
+        paths = ", ".join(str(item["path"]) for item in items[:80])
+        return f"{len(items)} files (+{additions}/-{deletions}): {paths}"
+
+    parts = []
+    if authored:
+        parts.append(f"authored {summarize(authored)}")
+    if generated:
+        parts.append(f"generated {summarize(generated)}")
     return (
-        f"changed files ({len(files)}): {', '.join(files[:80])}; "
-        f"line changes: +{additions}/-{deletions}"
+        "changed files: " + "; ".join(parts)
     )
 
 

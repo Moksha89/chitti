@@ -64,13 +64,15 @@ class ChittiService:
             self.system_prompt(recall, run_evidence), messages, "chitti-chat"
         )
         if run_evidence is not None:
+            clipped = (
+                f" Clipped categories: {', '.join(run_evidence.clipped_sections)}."
+                if run_evidence.clipped_sections
+                else ""
+            )
             reply += (
                 f"\n\nEvidence used: {', '.join(run_evidence.evidence_used)}."
-                + (
-                    " Context was clipped to the server evidence bound."
-                    if run_evidence.clipped
-                    else ""
-                )
+                + (" Context was clipped to the server evidence bound." + clipped
+                   if run_evidence.clipped else "")
             )
         await self.memory.add_chunk(
             session,

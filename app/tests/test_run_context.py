@@ -70,10 +70,36 @@ def test_run_context_prioritizes_failures_and_marks_byte_clipping() -> None:
     assert "model prompts" not in evidence.context
 
 
+def test_many_failures_do_not_crowd_out_verdict_or_publication() -> None:
+    evidence = bound_context(
+        [
+            ("run", "Run 22"),
+            *(
+                ("failed operation", f"failure {index} " + "x" * 3000)
+                for index in range(8)
+            ),
+            ("reviewer", "verdict=pass; reasoning=all required checks passed"),
+            ("publication", "approval=none; preview=none"),
+        ],
+        max_bytes=4000,
+    )
+
+    assert "[reviewer]" in evidence.context
+    assert "[publication]" in evidence.context
+    assert "failed operation" in evidence.context
+    assert "context clipped" in evidence.context
+    assert "failed operation" in evidence.clipped_sections
+
+
 def test_diff_summary_reports_files_and_line_changes_without_body() -> None:
-    diff = b"diff --git a/page.js b/page.js\n+new line\n-old line\n"
+    diff = (
+        b"diff --git a/page.js b/page.js\n+new line\n-old line\n"
+        b"diff --git a/dist/app.js b/dist/app.js\n+bundle line\n"
+    )
 
     summary = _diff_summary(diff)
 
     assert "page.js" in summary
     assert "+1/-1" in summary
+    assert "authored 1 files" in summary
+    assert "generated 1 files" in summary

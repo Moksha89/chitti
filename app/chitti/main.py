@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .auth import AuthManager, Session
 from .db import Database
+from .diff_parser import parse_diff as _parse_diff
 from .embedding import FakeEmbedder, get_embedder
 from .memory import (
     SHARED_NAMESPACE,
@@ -61,12 +62,6 @@ WORKSPACE_RUN_LIST_LIMIT = 25
 TERMINAL_RUN_STATUSES = {"passed", "failed", "cancelled"}
 MAX_DIFF_BODY_BYTES = 12_000
 PROMOTION_APPROVAL_ACTORS = {"owner", "agent", "system"}
-GENERATED_DIFF_ROOTS = {"out", "dist", "build", ".next"}
-GENERATED_DIFF_FILENAMES = {
-    "package-lock.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-}
 
 
 class ChatRequest(BaseModel):
@@ -414,55 +409,6 @@ def _run_status(detail: dict[str, object]) -> str:
     if not events:
         return "queued"
     return str(events[-1].get("status", "queued"))
-
-
-def _diff_file_role(path: str) -> str:
-    parts = Path(path).parts
-    if parts and (parts[0] in GENERATED_DIFF_ROOTS or Path(path).name in GENERATED_DIFF_FILENAMES):
-        return "generated"
-    return "authored"
-
-
-def _parse_diff(payload: bytes) -> list[dict[str, object]]:
-    text_payload = payload.decode("utf-8", errors="replace")
-    lines = text_payload.splitlines(keepends=True)
-    entries: list[dict[str, object]] = []
-    current: list[str] = []
-    current_path: str | None = None
-
-    def append_entry() -> None:
-        if current_path is None:
-            return
-        body = "".join(current)
-        additions = sum(
-            1 for line in current if line.startswith("+") and not line.startswith("+++")
-        )
-        deletions = sum(
-            1 for line in current if line.startswith("-") and not line.startswith("---")
-        )
-        entries.append(
-            {
-                "index": len(entries),
-                "kind": "diff",
-                "path": current_path,
-                "role": _diff_file_role(current_path),
-                "additions": additions,
-                "deletions": deletions,
-                "body_bytes": len(body.encode("utf-8")),
-                "summary": f"+{additions} / -{deletions}",
-            }
-        )
-
-    for line in lines:
-        if line.startswith("diff --git "):
-            append_entry()
-            current = [line]
-            match = re.match(r"diff --git a/(.+) b/(.+)\n?$", line.rstrip("\n"))
-            current_path = match.group(2) if match else None
-        elif current_path is not None:
-            current.append(line)
-    append_entry()
-    return entries
 
 
 def _diff_body(payload: bytes, index: int) -> dict[str, object] | None:
