@@ -12,6 +12,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.postgres import PostgresContainer
 
+from chitti.main import record_promotion_approval
 from chitti.plans import (
     PlanDocument,
     PlanTask,
@@ -127,6 +128,94 @@ async def test_worker_approval_gate_rechecks_exact_content_hash(database) -> Non
         with pytest.raises(ValueError, match="no longer matches"):
             await approved_revision(session, revision_id)
         await session.rollback()
+
+
+@pytest.mark.parametrize("actor", ["owner", "agent", "system"])
+async def test_promotion_approval_records_actor_and_reason(database, actor) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(session, "sandbox", "Build fixture.", document())
+        run_id = int(
+            (
+                await session.execute(
+                    text(
+                        "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
+                        "VALUES (:revision, '{}'::json, :workspace) RETURNING id"
+                    ),
+                    {"revision": revision_id, "workspace": f"approval-{actor}"},
+                )
+            ).scalar_one()
+        )
+        artifact_ids = []
+        for kind in ("reviewer_report", "diff"):
+            artifact_ids.append(
+                int(
+                    (
+                        await session.execute(
+                            text(
+                                "INSERT INTO worker_artifacts "
+                                "(run_id, kind, path, sha256, byte_size) "
+                                "VALUES (:run, :kind, :path, :sha, 4) RETURNING id"
+                            ),
+                            {
+                                "run": run_id,
+                                "kind": kind,
+                                "path": f"{kind}.json",
+                                "sha": kind[0] * 64,
+                            },
+                        )
+                    ).scalar_one()
+                )
+            )
+        manifest_id = int(
+            (
+                await session.execute(
+                    text(
+                        "INSERT INTO export_manifests "
+                        "(run_id, revision_id, revision_content_hash, "
+                        "reviewer_artifact_id, diff_artifact_id, manifest, digest, "
+                        "total_bytes, file_count, max_depth, staging_path) "
+                        "VALUES (:run, :revision, :revision_hash, :reviewer, :diff, "
+                        "'{}'::json, :digest, 4, 1, 1, :staging) RETURNING id"
+                    ),
+                    {
+                        "run": run_id,
+                        "revision": revision_id,
+                        "revision_hash": "a" * 64,
+                        "reviewer": artifact_ids[0],
+                        "diff": artifact_ids[1],
+                        "digest": "b" * 64,
+                        "staging": f"staging-{actor}",
+                    },
+                )
+            ).scalar_one()
+        )
+        await record_promotion_approval(
+            session,
+            {
+                "run_id": run_id,
+                "revision_id": revision_id,
+                "revision_content_hash": "a" * 64,
+                "manifest_id": manifest_id,
+                "reviewer_artifact_id": artifact_ids[0],
+                "reviewer_sha256": "r" * 64,
+                "diff_artifact_id": artifact_ids[1],
+                "diff_sha256": "d" * 64,
+                "digest": "b" * 64,
+            },
+            actor=actor,
+            reason=f"{actor} note",
+        )
+        row = (
+            await session.execute(
+                text(
+                    "SELECT approved_by, reason FROM promotion_approvals "
+                    "WHERE run_id = :run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+        assert row["approved_by"] == actor
+        assert row["reason"] == f"{actor} note"
 
 
 async def test_worker_artifact_payload_retention_preserves_audit_record(database) -> None:

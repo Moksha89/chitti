@@ -20,6 +20,7 @@ from fastapi.templating import Jinja2Templates
 from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from .auth import AuthManager, Session
 from .db import Database
@@ -52,6 +53,7 @@ RUN_EVENT_HEARTBEAT_SECONDS = 15.0
 WORKSPACE_RUN_LIST_LIMIT = 25
 TERMINAL_RUN_STATUSES = {"passed", "failed", "cancelled"}
 MAX_DIFF_BODY_BYTES = 12_000
+PROMOTION_APPROVAL_ACTORS = {"owner", "agent", "system"}
 GENERATED_DIFF_ROOTS = {"out", "dist", "build", ".next"}
 GENERATED_DIFF_FILENAMES = {
     "package-lock.json",
@@ -700,7 +702,8 @@ async def workspace_run_page(
         promotion_result = await db_session.execute(
             text(
                 "SELECT m.id AS manifest_id, m.digest, m.total_bytes, "
-                "a.id AS approval_id, a.decision, p.preview_id, p.expires_at "
+                "a.id AS approval_id, a.decision, a.approved_by, a.reason, "
+                "a.created_at AS approval_created_at, p.preview_id, p.expires_at "
                 "FROM export_manifests m "
                 "LEFT JOIN promotion_approvals a ON a.manifest_id = m.id "
                 "LEFT JOIN previews p ON p.manifest_id = m.id "
@@ -985,7 +988,8 @@ async def plan_page(revision_id: int, request: Request) -> HTMLResponse | Redire
             promotion_result = await db_session.execute(
                 text(
                     "SELECT m.id AS manifest_id, m.digest, m.total_bytes, "
-                    "a.id AS approval_id, a.decision, p.preview_id, p.expires_at "
+                    "a.id AS approval_id, a.decision, a.approved_by, a.reason, "
+                    "a.created_at AS approval_created_at, p.preview_id, p.expires_at "
                     "FROM export_manifests m "
                     "LEFT JOIN promotion_approvals a ON a.manifest_id = m.id "
                     "LEFT JOIN previews p ON p.manifest_id = m.id "
@@ -1032,6 +1036,41 @@ async def plan_page(revision_id: int, request: Request) -> HTMLResponse | Redire
     )
 
 
+async def record_promotion_approval(
+    db_session: AsyncSession,
+    manifest: dict[str, object],
+    *,
+    actor: str,
+    reason: str | None,
+) -> None:
+    if actor not in PROMOTION_APPROVAL_ACTORS:
+        raise ValueError("invalid promotion approval actor")
+    await db_session.execute(
+        text(
+            "INSERT INTO promotion_approvals "
+            "(run_id, revision_id, revision_content_hash, manifest_id, "
+            "reviewer_artifact_id, reviewer_sha256, diff_artifact_id, "
+            "diff_sha256, manifest_digest, decision, reason, approved_by) VALUES "
+            "(:run_id, :revision_id, :revision_hash, :manifest_id, "
+            ":reviewer_id, :reviewer_sha256, :diff_id, :diff_sha256, "
+            ":digest, 'approved', :reason, :actor)"
+        ),
+        {
+            "run_id": manifest["run_id"],
+            "revision_id": manifest["revision_id"],
+            "revision_hash": manifest["revision_content_hash"],
+            "manifest_id": manifest["manifest_id"],
+            "reviewer_id": manifest["reviewer_artifact_id"],
+            "reviewer_sha256": manifest["reviewer_sha256"],
+            "diff_id": manifest["diff_artifact_id"],
+            "diff_sha256": manifest["diff_sha256"],
+            "digest": manifest["digest"],
+            "reason": reason,
+            "actor": actor,
+        },
+    )
+
+
 @app.post("/runs/{run_id}/approve-result")
 async def approve_result(run_id: int, request: Request) -> RedirectResponse:
     result = browser_session(request)
@@ -1040,6 +1079,7 @@ async def approve_result(run_id: int, request: Request) -> RedirectResponse:
     _, session = result
     form = await request.form()
     require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    reason = str(form.get("reason", "")).strip() or None
     database: Database = request.app.state.database
     async with database.sessions() as db_session:
         manifest_result = await db_session.execute(
@@ -1063,28 +1103,11 @@ async def approve_result(run_id: int, request: Request) -> RedirectResponse:
                 detail="this run is not promotable; static export evidence is missing",
             )
         try:
-            await db_session.execute(
-                text(
-                    "INSERT INTO promotion_approvals "
-                    "(run_id, revision_id, revision_content_hash, manifest_id, "
-                    "reviewer_artifact_id, reviewer_sha256, diff_artifact_id, "
-                    "diff_sha256, manifest_digest, decision, reason) VALUES "
-                    "(:run_id, :revision_id, :revision_hash, :manifest_id, "
-                    ":reviewer_id, :reviewer_sha256, :diff_id, :diff_sha256, "
-                    ":digest, 'approved', :reason)"
-                ),
-                {
-                    "run_id": run_id,
-                    "revision_id": manifest["revision_id"],
-                    "revision_hash": manifest["revision_content_hash"],
-                    "manifest_id": manifest["manifest_id"],
-                    "reviewer_id": manifest["reviewer_artifact_id"],
-                    "reviewer_sha256": manifest["reviewer_sha256"],
-                    "diff_id": manifest["diff_artifact_id"],
-                    "diff_sha256": manifest["diff_sha256"],
-                    "digest": manifest["digest"],
-                    "reason": str(form.get("reason", "")).strip() or None,
-                },
+            await record_promotion_approval(
+                db_session,
+                dict(manifest),
+                actor="owner",
+                reason=reason,
             )
             await db_session.commit()
         except Exception as exc:
