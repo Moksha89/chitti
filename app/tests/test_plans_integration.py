@@ -2,12 +2,15 @@ import hashlib
 import os
 import shutil
 import subprocess
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
+from urllib.parse import urlsplit, urlunsplit
 
+import asyncpg
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
@@ -39,6 +42,7 @@ from chitti.runner import (
     reconcile_cancelled_run,
     reconcile_interrupted_runs,
 )
+from chitti.runner_access import assert_runner_privileges
 from chitti.runner_health import recent_runner_health, record_runner_health_failure
 from chitti.transcripts import append_entry, recent_entries
 from chitti.worker import (
@@ -950,3 +954,43 @@ async def test_persistent_runner_failure_is_visible_in_durable_health(database):
     assert health[0]["component"] == "reminder_sweep"
     assert health[0]["status"] == "failed"
     assert "permission denied" in str(health[0]["detail"])
+
+
+async def test_runner_privilege_assertion_handles_non_id_primary_key(database):
+    database_url = database.url.render_as_string(hide_password=False).replace(
+        "postgresql+asyncpg://", "postgresql://"
+    )
+    parsed = urlsplit(database_url)
+    admin = await asyncpg.connect(database_url)
+    role = f"runner_test_{uuid.uuid4().hex[:12]}"
+    password = uuid.uuid4().hex
+    try:
+        await admin.execute(f'CREATE ROLE "{role}" LOGIN PASSWORD \'{password}\'')
+        await admin.execute(
+            f'GRANT CONNECT ON DATABASE "{parsed.path.lstrip("/")}" TO "{role}"'
+        )
+        await admin.execute(f'GRANT USAGE ON SCHEMA public TO "{role}"')
+        await admin.execute(
+            f'GRANT SELECT, INSERT ON worker_run_heartbeats TO "{role}"'
+        )
+        runner_database_url = urlunsplit(
+            (
+                parsed.scheme,
+                f"{role}:{password}@{parsed.hostname}:{parsed.port}",
+                parsed.path,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+        connection = await asyncpg.connect(runner_database_url)
+        try:
+            await assert_runner_privileges(
+                connection,
+                ["INSERT INTO worker_run_heartbeats (run_id) VALUES (1)"],
+            )
+        finally:
+            await connection.close()
+    finally:
+        await admin.execute(f'DROP OWNED BY "{role}"')
+        await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
+        await admin.close()
