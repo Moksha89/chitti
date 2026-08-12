@@ -23,12 +23,26 @@
   .screenshot-card figcaption{margin-bottom:8px;color:var(--muted);font:10px var(--mono);text-transform:uppercase}.reviewer-grid{display:grid;gap:10px}.reviewer-box{padding:10px;border:1px solid var(--line-soft);border-radius:6px}
   .reviewer-box h3{margin-bottom:5px;font-size:12px}.reviewer-box ul{margin:5px 0 0;padding-left:20px;color:var(--muted)}.empty-state{padding:18px;border:1px dashed var(--line);border-radius:7px;color:var(--muted)}
   .metric-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.metric-card{padding:10px;border:1px solid var(--line-soft);border-radius:6px}.metric-card strong{display:block;color:var(--ink);font:16px var(--mono)}.metric-card span{color:var(--faint);font:10px var(--mono);text-transform:uppercase}
+  .file-groups{display:grid;gap:14px}.file-group{border:1px solid var(--line-soft);border-radius:7px;padding:10px}.file-group h3{margin:0 0 8px;font-size:12px}.file-tree,.file-tree ul{display:grid;gap:4px;list-style:none;margin:0;padding:0}.file-tree ul{margin:4px 0 0 16px}.file-tree li{min-width:0}.file-tree-folder{display:block;color:var(--faint);font:10px var(--mono);padding:3px 0}.diff-file{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;border:0;border-radius:4px;background:transparent;color:var(--muted);padding:5px;text-align:left;font:11px var(--mono);cursor:pointer}.diff-file:hover,.diff-file:focus{background:#122422;color:var(--accent)}.diff-file small{color:var(--faint);white-space:nowrap}.diff-detail{margin-top:14px}.diff-detail pre{max-height:440px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:#cce9df;background:#090d12;padding:12px;border-radius:5px;font:11px var(--mono)}.diff-clip{padding:8px;border:1px solid var(--warning);border-radius:5px;color:var(--warning);font:10px var(--mono)}.manifest-entry{display:flex;justify-content:space-between;gap:10px;padding:4px 0;color:var(--muted);font:10px var(--mono)}.manifest-entry span:last-child{color:var(--faint);white-space:nowrap}
   .workspace-right .panel{margin-bottom:14px}.workspace-right .panel-body{padding:14px 16px}.workspace-right .panel-meta{display:block}
   .workspace-controls{display:grid;gap:8px}.workspace-controls form{display:grid;gap:7px}.workspace-controls textarea{min-height:65px}.workspace-controls button{width:100%}
   .stream-status{color:var(--accent);font:10px var(--mono)}.stream-status.offline{color:var(--warning)}
   @media (max-width:1050px){.workspace-shell{grid-template-columns:210px minmax(0,1fr)}.workspace-right{grid-column:1/-1;border-top:1px solid var(--line-soft);border-right:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.workspace-right .panel{margin:0}}
   @media (max-width:700px){.workspace-shell{display:block}.workspace-column{border-right:0;border-bottom:1px solid var(--line-soft)}.workspace-left{max-height:300px;overflow:auto}.workspace-main{padding:12px}.workspace-right{display:block}.workspace-right .panel{margin-bottom:14px}.screenshot-grid{grid-template-columns:1fr}.workspace-tabs{overflow:auto}.workspace-tab{white-space:nowrap}}
 </style>
+{% macro diff_tree(nodes) %}
+<ul class="file-tree">
+  {% for node in nodes %}
+    {% if node.entry and node.entry.kind == "diff" %}
+    <li><button class="diff-file" type="button" data-file-index="{{ node.entry.index }}"><span>{{ node.name }}</span><small>{{ node.entry.summary }}</small></button></li>
+    {% elif node.entry %}
+    <li><div class="manifest-entry"><span>{{ node.name }}</span><span>{{ node.entry.size }} bytes · {{ node.entry.sha256 }}</span></div></li>
+    {% else %}
+    <li><span class="file-tree-folder">▸ {{ node.name }}</span>{{ diff_tree(node.children) }}</li>
+    {% endif %}
+  {% endfor %}
+</ul>
+{% endmacro %}
 <div class="workspace-shell">
   <aside class="workspace-column workspace-left">
     <div class="workspace-brand"><div class="brand"><div class="brand-mark">C/</div><div><div class="brand-name">Chitti</div><div class="brand-sub">workspace</div></div></div><a href="/">dashboard ↗</a></div>
@@ -59,6 +73,7 @@
     </header>
     <div class="workspace-tabs" role="tablist">
       <button class="workspace-tab active" data-tab="activity" role="tab">Activity</button>
+      <button class="workspace-tab" data-tab="files" role="tab">Files</button>
       <button class="workspace-tab" data-tab="preview" role="tab">Preview</button>
       <button class="workspace-tab" data-tab="reviewer" role="tab">Reviewer</button>
     </div>
@@ -69,6 +84,33 @@
       </div></div></section>
       <section class="panel workspace-panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">02</span><div><h2>Completed operations</h2><div class="panel-meta">stdout and stderr are bounded in-page; full payloads stay behind authenticated artifact links</div></div></div></div><div class="panel-body">
         {% for operation in run.operations %}<article class="operation"><h3>{{ operation.name }} · {{ operation.status }} · exit {{ operation.exit_code }}</h3><details class="operation-output"><summary>Output preview</summary><pre>{{ operation.stdout_preview }}{% if operation.stderr_preview %}{{ "\n" }}{{ operation.stderr_preview }}{% endif %}</pre></details>{% if operation.stdout_artifact_id %}<a class="output-link" href="/runs/{{ run.run.id }}/artifacts/{{ operation.stdout_artifact_id }}">full stdout</a>{% endif %}{% if operation.stderr_artifact_id %}<a class="output-link" href="/runs/{{ run.run.id }}/artifacts/{{ operation.stderr_artifact_id }}">full stderr</a>{% endif %}</article>{% else %}<div class="empty-state">No completed operations yet. Live terminal output is intentionally out of this slice.</div>{% endfor %}
+      </div></section>
+    </section>
+
+    <section class="workspace-pane" data-pane="files">
+      <section class="panel workspace-panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">03</span><div><h2>Source diff</h2><div class="panel-meta">durable Git evidence · authored source first · generated output separated</div></div></div></div><div class="panel-body">
+        {% if run.files_view.state == "available" %}
+        <p class="panel-meta">{{ run.files_view.authored_count }} authored files · {{ run.files_view.generated_count }} generated files · <a class="output-link" href="{{ run.files_view.artifact_url }}">Open full diff artifact</a></p>
+        <div class="file-groups">
+          <section class="file-group"><h3>Authored source</h3>{% if run.files_view.authored_tree %}{{ diff_tree(run.files_view.authored_tree) }}{% else %}<div class="empty-state">No authored source entries were recorded.</div>{% endif %}</section>
+          <section class="file-group"><h3>Generated output and dependency artifacts</h3>{% if run.files_view.generated_tree %}{{ diff_tree(run.files_view.generated_tree) }}{% else %}<div class="empty-state">No generated entries were recorded.</div>{% endif %}</section>
+        </div>
+        <div id="diff-detail" class="diff-detail"><div class="empty-state">Select a file to load its bounded diff body.</div></div>
+        {% elif run.files_view.state == "expired" %}
+        <div class="empty-state">The diff evidence has aged out of payload retention. The immutable artifact record remains, but its body is no longer available. <a class="output-link" href="/runs/{{ run.run.id }}/artifacts/{{ run.files_view.artifact_id }}">Open expired diff artifact</a></div>
+        {% else %}
+        <div class="empty-state">No diff artifact was recorded for this run. Source files are not read from the worker workspace.</div>
+        {% endif %}
+      </div></section>
+      <section class="panel workspace-panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">04</span><div><h2>Static export manifest</h2><div class="panel-meta">published-output paths, sizes, and digests only</div></div></div></div><div class="panel-body">
+        {% if run.export_view.state == "available" %}
+        <p class="panel-meta">{{ run.export_view.file_count }} files · {{ run.export_view.total_bytes }} bytes · digest {{ run.export_view.digest }}</p>
+        <div class="file-group">{{ diff_tree(run.export_view.tree) }}</div>
+        {% elif run.export_view.state == "invalid" %}
+        <div class="empty-state">The stored export manifest could not be verified. No output tree is shown.</div>
+        {% else %}
+        <div class="empty-state">No static export manifest was recorded for this run.</div>
+        {% endif %}
       </div></section>
     </section>
 
@@ -95,8 +137,61 @@
 (() => {
   const runId={{ run.run.id }}, terminalRun={{ "true" if run.latest_status in ["passed", "failed", "cancelled"] else "false" }}, status=document.getElementById("run-status"), streamStatus=document.getElementById("stream-status"), events=document.getElementById("event-list"), seen=new Set([...document.querySelectorAll("[data-event-id]")].map(item=>item.dataset.eventId));
   document.querySelectorAll(".workspace-tab").forEach(tab=>tab.addEventListener("click",()=>{document.querySelectorAll(".workspace-tab").forEach(item=>item.classList.toggle("active",item===tab));document.querySelectorAll(".workspace-pane").forEach(pane=>pane.classList.toggle("active",pane.dataset.pane===tab.dataset.tab))}));
+  const diffDetail=document.getElementById("diff-detail");
+  async function loadDiff(file) {
+    if(!diffDetail)return;
+    diffDetail.innerHTML="<div class=\"empty-state\">Loading diff body…</div>";
+    try {
+      const response=await fetch(`/workspace/runs/${runId}/diff/${file.dataset.fileIndex}`);
+      if(response.status===410){
+        diffDetail.innerHTML="<div class=\"empty-state\">This diff payload has aged out of retention. Open the full artifact link for its current retention status.</div>";
+        return;
+      }
+      if(!response.ok)throw new Error("diff unavailable");
+      const payload=await response.json();
+      const title=document.createElement("h3");
+      title.textContent=payload.path;
+      const pre=document.createElement("pre");
+      pre.textContent=payload.body;
+      diffDetail.replaceChildren(title,pre);
+      if(payload.clipped){
+        const note=document.createElement("div");
+        note.className="diff-clip";
+        note.textContent="This file diff body is clipped to a bounded preview.";
+        const link=document.createElement("a");
+        link.className="output-link";
+        link.href=payload.full_artifact_url;
+        link.textContent="Open full diff artifact";
+        note.append(" ",link);
+        diffDetail.prepend(note);
+      }
+    } catch(_error) {
+      diffDetail.innerHTML="<div class=\"empty-state\">This diff body could not be loaded. The durable artifact may have expired.</div>";
+    }
+  }
+  document.querySelectorAll(".diff-file").forEach(file=>file.addEventListener("click",()=>loadDiff(file)));
   if(terminalRun)return;
-  function addEvent(event){if(seen.has(String(event.id)))return;seen.add(String(event.id));const row=document.createElement("article");row.className="event-row";row.dataset.eventId=event.id;const label=document.createElement("strong");label.textContent=event.status;const detail=document.createElement("span");detail.textContent=event.detail;row.append(label,detail);events.appendChild(row);status.textContent=event.status;const task=document.querySelector(`[data-task-id="${CSS.escape(event.task_id||"")}"]`);if(task&&event.status){task.classList.remove("running","passed","failed");task.classList.add(event.status);const state=task.querySelector("em");if(state)state.textContent=event.status+(event.status==="running"?" · current":"")}}}
+  function addEvent(event){
+    if(seen.has(String(event.id)))return;
+    seen.add(String(event.id));
+    const row=document.createElement("article");
+    row.className="event-row";
+    row.dataset.eventId=event.id;
+    const label=document.createElement("strong");
+    label.textContent=event.status;
+    const detail=document.createElement("span");
+    detail.textContent=event.detail;
+    row.append(label,detail);
+    events.appendChild(row);
+    status.textContent=event.status;
+    const task=document.querySelector(`[data-task-id="${CSS.escape(event.task_id||"")}"]`);
+    if(task&&event.status){
+      task.classList.remove("running","passed","failed");
+      task.classList.add(event.status);
+      const state=task.querySelector("em");
+      if(state)state.textContent=event.status+(event.status==="running"?" · current":"");
+    }
+  }
   const source=new EventSource(`/workspace/runs/${runId}/events`);
   source.onopen=()=>{streamStatus.textContent="live updates connected";streamStatus.classList.remove("offline")};
   source.addEventListener("run",event=>{try{const payload=JSON.parse(event.data);addEvent(payload);if(payload.terminal){streamStatus.textContent="run finished";streamStatus.classList.remove("offline");source.close()}}catch(_error){}});
