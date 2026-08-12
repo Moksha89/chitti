@@ -24,6 +24,7 @@ from chitti.worker import (
     _source_path_invalidates_gates,
     _starter_context,
     _task_done_checks,
+    _tool_counts_as_progress,
     _tool_exchange,
     _tool_rejection_exchange,
     _tool_result_message,
@@ -98,6 +99,23 @@ def test_inspection_does_not_clear_stall_but_write_progress_does() -> None:
     assert _progress_counters(
         failures, turns, workspace_changed=True
     ) == (0, 0)
+
+
+def test_successful_required_gate_command_counts_as_progress() -> None:
+    assert _tool_counts_as_progress("run_command", "build")
+    assert _progress_counters(2, 7, workspace_changed=True, failure=True) == (0, 0)
+
+
+def test_done_refusal_names_missing_gates_and_stale_cause() -> None:
+    from chitti.worker import _gate_refusal
+
+    refusal = _gate_refusal(
+        {"build"},
+        "previous gate evidence was invalidated by sync-lockfile",
+    )
+    assert "missing current successful gates: test, export" in refusal
+    assert "invalidated by sync-lockfile" in refusal
+    assert "run those gates next" in refusal
 
 
 def test_reviewer_return_does_not_reset_progress_counters() -> None:

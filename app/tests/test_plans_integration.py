@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -19,7 +20,7 @@ from chitti.plans import (
     validate_approval_binding,
 )
 from chitti.runner import cancellation_requested, next_queued_run
-from chitti.worker import approved_revision
+from chitti.worker import DockerSandboxDispatcher, WorkerLimits, approved_revision
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("RUN_DB_TESTS"), reason="set RUN_DB_TESTS=1 to run PostgreSQL integration tests"
@@ -166,6 +167,55 @@ async def test_worker_artifact_payload_retention_preserves_audit_record(database
         )
         assert record.one() == ("a" * 64, 4)
     assert await cancellation_requested(_DatabaseAdapter(database), run_id)
+
+
+async def test_captured_screenshot_survives_later_run_failure_cleanup(
+    database, tmp_path
+) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(session, "sandbox", "Build fixture.", document())
+        result = await session.execute(
+            text(
+                "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
+                "VALUES (:revision, '{}'::json, 'run-capture') RETURNING id"
+            ),
+            {"revision": revision_id},
+        )
+        run_id = int(result.scalar_one())
+
+    workspace = tmp_path / "workspace"
+    artifacts = workspace / "artifacts"
+    artifacts.mkdir(parents=True)
+    (artifacts / "phone.png").write_bytes(b"phone-image")
+    (artifacts / "desktop.png").write_bytes(b"desktop-image")
+    (artifacts / "browser-errors.json").write_text("[]")
+    dispatcher = DockerSandboxDispatcher(
+        _DatabaseAdapter(database),
+        workspace_root=tmp_path / "runs",
+        preview_root=tmp_path / "previews",
+        preview_staging_root=tmp_path / "staging",
+    )
+
+    await dispatcher._capture_workspace_artifacts(
+        run_id, workspace, WorkerLimits(artifact_bytes=1024)
+    )
+    shutil.rmtree(workspace)
+
+    async with database.begin() as session:
+        rows = await session.execute(
+            text(
+                "SELECT a.kind, a.path, p.content "
+                "FROM worker_artifacts a "
+                "JOIN worker_artifact_payloads p ON p.artifact_id = a.id "
+                "WHERE a.run_id = :run AND a.kind = 'screenshot' "
+                "ORDER BY a.path"
+            ),
+            {"run": run_id},
+        )
+        assert [(row[0], row[1], bytes(row[2])) for row in rows] == [
+            ("screenshot", "artifacts/desktop.png", b"desktop-image"),
+            ("screenshot", "artifacts/phone.png", b"phone-image"),
+        ]
 
 
 async def test_runner_claim_is_atomic_and_cancellation_is_sticky(database) -> None:

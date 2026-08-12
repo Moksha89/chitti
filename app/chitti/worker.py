@@ -66,6 +66,35 @@ def _progress_counters(
     return failures + int(failure), nonproductive_turns + 1
 
 
+def _tool_counts_as_progress(tool: str, command: str | None = None) -> bool:
+    """Successful workspace-affecting tools reset the model stall budget."""
+    if tool in {"write_file", "capture_screenshot"}:
+        return True
+    return tool == "run_command" and command in MODEL_COMMANDS
+
+
+def _missing_gate_evidence(completed_commands: set[str]) -> list[str]:
+    return [
+        name for name in ("build", "test", "export")
+        if name not in completed_commands
+    ]
+
+
+def _gate_refusal(
+    completed_commands: set[str], stale_reason: str | None
+) -> str:
+    missing = _missing_gate_evidence(completed_commands)
+    detail = (
+        "missing current successful gates: "
+        + ", ".join(missing)
+        if missing
+        else "current successful gates are incomplete"
+    )
+    if stale_reason:
+        detail += f"; {stale_reason}"
+    return f"TOOL FAILURE: done condition requires {detail}; run those gates next"
+
+
 def _model_response_failure(completion: ModelCompletion) -> str | None:
     if completion.finish_reason == "length":
         detail = (
@@ -355,6 +384,7 @@ class DockerSandboxDispatcher:
             file_write_counts: dict[str, int] = {}
             file_writes_without_command = 0
             nonproductive_turns = 0
+            gate_stale_reason: str | None = None
             route = CODER_ROUTE
             failures = 0
             messages: list[dict[str, object]] = [
@@ -385,10 +415,18 @@ class DockerSandboxDispatcher:
                         task_id=task_id,
                     )
 
-            async def record_nonproductive(detail: str, task_id: str = task_id) -> None:
+            async def record_nonproductive(
+                detail: str,
+                *,
+                workspace_changed: bool = False,
+                task_id: str = task_id,
+            ) -> None:
                 nonlocal failures, nonproductive_turns
                 failures, nonproductive_turns = _progress_counters(
-                    failures, nonproductive_turns, workspace_changed=False, failure=True
+                    failures,
+                    nonproductive_turns,
+                    workspace_changed=workspace_changed,
+                    failure=not workspace_changed,
                 )
                 await self._event(run_id, "model_tool_failed", detail, task_id=task_id)
                 if failures >= NONPRODUCTIVE_TURN_LIMIT:
@@ -535,9 +573,8 @@ class DockerSandboxDispatcher:
                                 done = True
                                 batch_completed = False
                             elif tool == "finish":
-                                result_text = (
-                                    "TOOL FAILURE: done condition requires "
-                                    "current successful build, test, and export commands"
+                                result_text = _gate_refusal(
+                                    completed_commands, gate_stale_reason
                                 )
                                 batch_failure = result_text
                                 messages.append(_tool_result_message(native_call, result_text))
@@ -560,9 +597,14 @@ class DockerSandboxDispatcher:
                                         )
                                     if tool == "run_command":
                                         command_name = str(arguments.get("name", ""))
-                                        _record_gate_command(
-                                            completed_commands, command_name
-                                        )
+                                        _record_gate_command(completed_commands, command_name)
+                                        if command_name == "sync-lockfile":
+                                            gate_stale_reason = (
+                                                "previous gate evidence was invalidated "
+                                                "by sync-lockfile"
+                                            )
+                                        elif not _missing_gate_evidence(completed_commands):
+                                            gate_stale_reason = None
                                         file_writes_without_command = (
                                             _reset_file_write_counter(
                                                 tool, file_writes_without_command
@@ -574,6 +616,10 @@ class DockerSandboxDispatcher:
                                         path = str(arguments.get("path", ""))
                                         if _source_path_invalidates_gates(path):
                                             completed_commands.clear()
+                                            gate_stale_reason = (
+                                                f"previous gate evidence was invalidated "
+                                                f"by source change at {path}"
+                                            )
                                         file_writes_without_command += 1
                                         file_write_counts[path] = (
                                             file_write_counts.get(path, 0) + 1
@@ -586,11 +632,9 @@ class DockerSandboxDispatcher:
                                             raise ModelProgressError(
                                                 f"task {task.id} stopped: {stall}"
                                             )
-                                    if tool in {
-                                        "write_file",
-                                        "run_command",
-                                        "capture_screenshot",
-                                    }:
+                                    if _tool_counts_as_progress(
+                                        tool, str(arguments.get("name", ""))
+                                    ):
                                         batch_workspace_changed = True
                                     messages.append(
                                         _tool_result_message(
@@ -632,7 +676,10 @@ class DockerSandboxDispatcher:
                     if batch_failure is not None:
                         if batch_workspace_changed:
                             reset_progress_counters()
-                        await record_nonproductive(batch_failure)
+                        await record_nonproductive(
+                            batch_failure,
+                            workspace_changed=batch_workspace_changed,
+                        )
                         if failures >= 2 and route == CODER_ROUTE:
                             route = REVIEWER_ROUTE
                             messages = _reviewer_diagnosis_messages(
@@ -695,10 +742,7 @@ class DockerSandboxDispatcher:
                     done = True
                     break
                 if tool == "finish":
-                    result_text = (
-                        "TOOL FAILURE: done condition requires current successful "
-                        "build, test, and export commands"
-                    )
+                    result_text = _gate_refusal(completed_commands, gate_stale_reason)
                     await record_nonproductive(result_text)
                     messages.extend(_tool_exchange(completion, result_text, native_call))
                     await compact_history()
@@ -718,6 +762,12 @@ class DockerSandboxDispatcher:
                     if tool == "run_command":
                         command_name = str(arguments.get("name", ""))
                         _record_gate_command(completed_commands, command_name)
+                        if command_name == "sync-lockfile":
+                            gate_stale_reason = (
+                                "previous gate evidence was invalidated by sync-lockfile"
+                            )
+                        elif not _missing_gate_evidence(completed_commands):
+                            gate_stale_reason = None
                         file_writes_without_command = _reset_file_write_counter(
                             tool, file_writes_without_command
                         )
@@ -727,6 +777,10 @@ class DockerSandboxDispatcher:
                         path = str(arguments.get("path", ""))
                         if _source_path_invalidates_gates(path):
                             completed_commands.clear()
+                            gate_stale_reason = (
+                                f"previous gate evidence was invalidated "
+                                f"by source change at {path}"
+                            )
                         file_writes_without_command += 1
                         file_write_counts[path] = file_write_counts.get(path, 0) + 1
                         stall = _file_write_stall(
@@ -736,7 +790,9 @@ class DockerSandboxDispatcher:
                             raise ModelProgressError(
                                 f"task {task.id} stopped: {stall}"
                             )
-                    if tool in {"write_file", "run_command", "capture_screenshot"}:
+                    if _tool_counts_as_progress(
+                        tool, str(arguments.get("name", ""))
+                    ):
                         reset_progress_counters()
                     else:
                         await record_inspection_turn()
@@ -903,6 +959,9 @@ class DockerSandboxDispatcher:
             if result.returncode:
                 await self._capture_workspace_artifacts(run_id, workspace, limits)
                 raise RuntimeError(stderr[-1000:] or "screenshot failed")
+            await self._capture_workspace_artifacts(
+                run_id, workspace, limits, include_diff=False
+            )
             return stdout[-4000:] or "screenshots captured in artifacts/", 0, operation_index
         if tool == "run_command":
             name = str(arguments.get("name", ""))
@@ -1719,7 +1778,12 @@ class DockerSandboxDispatcher:
             await session.commit()
 
     async def _capture_workspace_artifacts(
-        self, run_id: int, workspace: Path, limits: WorkerLimits
+        self,
+        run_id: int,
+        workspace: Path,
+        limits: WorkerLimits,
+        *,
+        include_diff: bool = True,
     ) -> None:
         artifact_root = workspace / "artifacts"
         if not artifact_root.is_dir():
@@ -1728,7 +1792,7 @@ class DockerSandboxDispatcher:
             if not path.is_file() or (
                 path.suffix != ".png"
                 and path.name not in {"workspace.diff", "browser-errors.json"}
-            ):
+            ) or (not include_diff and path.name == "workspace.diff"):
                 continue
             if path.stat().st_size > limits.artifact_bytes:
                 continue
@@ -1739,6 +1803,20 @@ class DockerSandboxDispatcher:
                 else "diff"
             )
             async with self.database.sessions() as session:
+                existing = await session.execute(
+                    text(
+                        "SELECT 1 FROM worker_artifacts "
+                        "WHERE run_id = :run_id AND kind = :kind AND path = :path "
+                        "LIMIT 1"
+                    ),
+                    {
+                        "run_id": run_id,
+                        "kind": kind,
+                        "path": str(path.relative_to(workspace)),
+                    },
+                )
+                if existing.scalar_one_or_none() is not None:
+                    continue
                 artifact = await session.execute(
                     text(
                         "INSERT INTO worker_artifacts "
