@@ -585,6 +585,7 @@ async def _run_event_stream(
     manager: WorkerRunManager,
     run_id: int,
     cursor: int,
+    chunk_cursor: int = 0,
     initial_status: str | None = None,
 ) -> AsyncIterator[str]:
     if await request.is_disconnected():
@@ -597,6 +598,18 @@ async def _run_event_stream(
     while True:
         if await request.is_disconnected():
             return
+        output_chunks_after = getattr(manager, "output_chunks_after", None)
+        pending_chunks = (
+            await output_chunks_after(run_id, chunk_cursor)
+            if output_chunks_after is not None
+            else []
+        )
+        for chunk in pending_chunks:
+            chunk_id = int(str(chunk["id"]))
+            chunk_cursor = chunk_id
+            payload = json.dumps(chunk, default=str, separators=(",", ":"))
+            yield f"event: output\ndata: {payload}\n\n"
+            last_heartbeat = time.monotonic()
         pending = await manager.events_after(run_id, cursor)
         for event in pending:
             event_id = int(str(event["id"]))
@@ -859,11 +872,20 @@ async def workspace_run_events(run_id: int, request: Request) -> StreamingRespon
     if current_status is None:
         raise HTTPException(status_code=404, detail="worker run not found")
     try:
-        cursor = max(0, int(request.headers.get("Last-Event-ID", "0")))
+        cursor_value = request.headers.get(
+            "Last-Event-ID", request.query_params.get("event_cursor", "0")
+        )
+        cursor = max(0, int(cursor_value))
     except ValueError:
         cursor = 0
+    try:
+        chunk_cursor = max(0, int(request.query_params.get("chunk_cursor", "0")))
+    except ValueError:
+        chunk_cursor = 0
     return StreamingResponse(
-        _run_event_stream(request, manager, run_id, cursor, current_status),
+        _run_event_stream(
+            request, manager, run_id, cursor, chunk_cursor, current_status
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -1108,6 +1130,46 @@ async def run_detail(run_id: int, request: Request) -> dict[str, object]:
     if detail is None:
         raise HTTPException(status_code=404, detail="worker run not found")
     return cast(dict[str, object], detail)
+
+
+@app.get("/workspace/runs/{run_id}/operations/{operation_index}")
+async def workspace_operation(
+    run_id: int, operation_index: int, request: Request
+) -> dict[str, object]:
+    current_session(request)
+    database: Database = request.app.state.database
+    async with database.sessions() as session:
+        operation_result = await session.execute(
+            text(
+                "SELECT id, task_id, operation_index, name, status, stdout, stderr, "
+                "exit_code, started_at, finished_at "
+                "FROM worker_operations WHERE run_id = :run_id "
+                "AND operation_index = :operation_index"
+            ),
+            {"run_id": run_id, "operation_index": operation_index},
+        )
+        operation = operation_result.mappings().one_or_none()
+        if operation is None:
+            raise HTTPException(status_code=404, detail="operation not found")
+        artifacts_result = await session.execute(
+            text(
+                "SELECT id, kind FROM worker_artifacts "
+                "WHERE run_id = :run_id AND operation_id = :operation_id"
+            ),
+            {"run_id": run_id, "operation_id": operation["id"]},
+        )
+    output_artifacts = {
+        str(row["kind"]): int(str(row["id"])) for row in artifacts_result.mappings()
+    }
+    return {
+        "operation": {
+            **dict(operation),
+            "stdout": str(operation["stdout"])[-4000:],
+            "stderr": str(operation["stderr"])[-4000:],
+            "stdout_artifact_id": output_artifacts.get("stdout"),
+            "stderr_artifact_id": output_artifacts.get("stderr"),
+        }
+    }
 
 
 @app.get("/runs/{run_id}/artifacts/{artifact_id}")

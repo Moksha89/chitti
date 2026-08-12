@@ -216,7 +216,9 @@ def test_workspace_cold_load_contains_durable_state_and_safe_empty_panels() -> N
     assert "No screenshots have been captured for this run yet." in rendered
     assert "No reviewer verdict has been recorded yet." in rendered
     assert "No completed operations yet." in rendered
+    assert "Live operation output" in rendered
     assert "No diff artifact was recorded for this run." in rendered
+    assert "Live operation output" in rendered
 
 
 def test_workspace_surfaces_latest_capture_per_path() -> None:
@@ -427,6 +429,41 @@ def test_run_event_stream_replays_after_last_event_id() -> None:
 
     assert first.startswith("id: 3\n")
     assert '"status":"operation_running"' in first
+    asyncio.run(stream.aclose())
+
+
+def test_run_event_stream_replays_output_after_separate_chunk_cursor() -> None:
+    class Request:
+        async def is_disconnected(self):
+            return False
+
+    class Manager:
+        async def latest_status(self, _run_id):
+            return "running"
+
+        async def output_chunks_after(self, _run_id, chunk_id):
+            assert chunk_id == 4
+            return [
+                {
+                    "id": 5,
+                    "operation_index": 2,
+                    "stream": "stdout",
+                    "sequence": 1,
+                    "byte_offset": 10,
+                    "content": "next\n",
+                }
+            ]
+
+        async def events_after(self, _run_id, event_id):
+            assert event_id == 3
+            return []
+
+    stream = _run_event_stream(Request(), Manager(), 7, 3, 4)
+    output = asyncio.run(stream.__anext__())
+
+    assert output.startswith("event: output\n")
+    assert '"id":5' in output
+    assert '"content":"next\\n"' in output
     asyncio.run(stream.aclose())
 
 

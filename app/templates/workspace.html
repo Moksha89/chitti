@@ -17,7 +17,7 @@
   .workspace-tab.active{border-color:var(--line);background:var(--panel);color:var(--accent)}.workspace-pane{display:none}.workspace-pane.active{display:block}
   .workspace-panel{margin-bottom:14px}.workspace-panel .panel-body{padding:14px 16px}.event-list{display:grid;gap:7px}.event-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;padding:9px;border:1px solid var(--line-soft);border-radius:6px}
   .event-row strong{color:var(--accent);font:10px var(--mono);text-transform:uppercase}.event-row span{color:var(--muted);overflow-wrap:anywhere}
-  .operation-output{margin-top:8px}.operation-output pre{max-height:180px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:#cce9df;background:#090d12;padding:10px;border-radius:5px;font-size:11px}
+  .operation-output{margin-top:8px}.operation-output pre{max-height:180px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:#cce9df;background:#090d12;padding:10px;border-radius:5px;font-size:11px}.live-output{margin-bottom:14px;border:1px solid var(--line);border-radius:6px;padding:10px}.live-output pre{max-height:220px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:#cce9df;background:#090d12;padding:10px;border-radius:5px;font-size:11px}
   .output-link{display:inline-block;margin:5px 8px 0 0;font:10px var(--mono)}.screenshot-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
   .screenshot-card{min-width:0;padding:10px;border:1px solid var(--line-soft);border-radius:7px}.screenshot-card img{display:block;width:auto;max-width:100%;height:auto;margin:auto}
   .screenshot-card figcaption{margin-bottom:8px;color:var(--muted);font:10px var(--mono);text-transform:uppercase}.reviewer-grid{display:grid;gap:10px}.reviewer-box{padding:10px;border:1px solid var(--line-soft);border-radius:6px}
@@ -83,6 +83,7 @@
         {% for event in run.events %}<article class="event-row" data-event-id="{{ event.id }}"><strong>{{ event.status }}</strong><span>{{ event.detail }}</span></article>{% else %}<div class="empty-state">No events recorded yet.</div>{% endfor %}
       </div></div></section>
       <section class="panel workspace-panel"><div class="panel-head"><div class="panel-title"><span class="panel-index">02</span><div><h2>Completed operations</h2><div class="panel-meta">stdout and stderr are bounded in-page; full payloads stay behind authenticated artifact links</div></div></div></div><div class="panel-body">
+        <article id="live-output" class="live-output" hidden><h3 id="live-output-title">Live operation output</h3><pre id="live-output-body"></pre></article>
         {% for operation in run.operations %}<article class="operation"><h3>{{ operation.name }} · {{ operation.status }} · exit {{ operation.exit_code }}</h3><details class="operation-output"><summary>Output preview</summary><pre>{{ operation.stdout_preview }}{% if operation.stderr_preview %}{{ "\n" }}{{ operation.stderr_preview }}{% endif %}</pre></details>{% if operation.stdout_artifact_id %}<a class="output-link" href="/runs/{{ run.run.id }}/artifacts/{{ operation.stdout_artifact_id }}">full stdout</a>{% endif %}{% if operation.stderr_artifact_id %}<a class="output-link" href="/runs/{{ run.run.id }}/artifacts/{{ operation.stderr_artifact_id }}">full stderr</a>{% endif %}</article>{% else %}<div class="empty-state">No completed operations yet. Live terminal output is intentionally out of this slice.</div>{% endfor %}
       </div></section>
     </section>
@@ -135,7 +136,7 @@
 </div>
 <script>
 (() => {
-  const runId={{ run.run.id }}, terminalRun={{ "true" if run.latest_status in ["passed", "failed", "cancelled"] else "false" }}, status=document.getElementById("run-status"), streamStatus=document.getElementById("stream-status"), events=document.getElementById("event-list"), seen=new Set([...document.querySelectorAll("[data-event-id]")].map(item=>item.dataset.eventId));
+  const runId={{ run.run.id }}, terminalRun={{ "true" if run.latest_status in ["passed", "failed", "cancelled"] else "false" }}, status=document.getElementById("run-status"), streamStatus=document.getElementById("stream-status"), events=document.getElementById("event-list"), liveOutput=document.getElementById("live-output"), liveOutputTitle=document.getElementById("live-output-title"), liveOutputBody=document.getElementById("live-output-body"), seen=new Set([...document.querySelectorAll("[data-event-id]")].map(item=>item.dataset.eventId));
   document.querySelectorAll(".workspace-tab").forEach(tab=>tab.addEventListener("click",()=>{document.querySelectorAll(".workspace-tab").forEach(item=>item.classList.toggle("active",item===tab));document.querySelectorAll(".workspace-pane").forEach(pane=>pane.classList.toggle("active",pane.dataset.pane===tab.dataset.tab))}));
   const diffDetail=document.getElementById("diff-detail");
   async function loadDiff(file) {
@@ -171,6 +172,31 @@
   }
   document.querySelectorAll(".diff-file").forEach(file=>file.addEventListener("click",()=>loadDiff(file)));
   if(terminalRun)return;
+  let eventCursor=Number([...seen].sort((a,b)=>Number(b)-Number(a))[0]||0), chunkCursor=0, source;
+  const liveBuffers=new Map();
+  function appendOutput(chunk){
+    const key=String(chunk.operation_index);
+    const current=liveBuffers.get(key)||"";
+    const next=(current+chunk.content).slice(-262144);
+    liveBuffers.set(key,next);
+    liveOutput.hidden=false;
+    liveOutputTitle.textContent=`Live output · operation ${chunk.operation_index}`;
+    liveOutputBody.textContent=next;
+    liveOutputBody.scrollTop=liveOutputBody.scrollHeight;
+  }
+  async function showCompletedOperation(event){
+    const index=event.operation_index;
+    if(index===undefined)return;
+    try{
+      const response=await fetch(`/workspace/runs/${runId}/operations/${index}`);
+      if(!response.ok)return;
+      const payload=await response.json();
+      const operation=payload.operation;
+      liveOutput.hidden=false;
+      liveOutputTitle.textContent=`${operation.name} · ${operation.status} · exit ${operation.exit_code}`;
+      liveOutputBody.textContent=operation.stdout+(operation.stderr?`\n${operation.stderr}`:"");
+    }catch(_error){}
+  }
   function addEvent(event){
     if(seen.has(String(event.id)))return;
     seen.add(String(event.id));
@@ -191,12 +217,22 @@
       const state=task.querySelector("em");
       if(state)state.textContent=event.status+(event.status==="running"?" · current":"");
     }
+    if(event.status==="operation_running"){
+      liveOutput.hidden=false;
+      liveOutputTitle.textContent=`Live output · ${event.detail}`;
+      liveOutputBody.textContent="";
+    }
+    if(event.status==="operation_complete")showCompletedOperation(event);
   }
-  const source=new EventSource(`/workspace/runs/${runId}/events`);
-  source.onopen=()=>{streamStatus.textContent="live updates connected";streamStatus.classList.remove("offline")};
-  source.addEventListener("run",event=>{try{const payload=JSON.parse(event.data);addEvent(payload);if(payload.terminal){streamStatus.textContent="run finished";streamStatus.classList.remove("offline");source.close()}}catch(_error){}});
-  source.onerror=()=>{streamStatus.textContent="live updates unavailable · reload for durable state";streamStatus.classList.add("offline")};
-  window.addEventListener("beforeunload",()=>source.close());
+  function connect(){
+    source=new EventSource(`/workspace/runs/${runId}/events?event_cursor=${eventCursor}&chunk_cursor=${chunkCursor}`);
+    source.onopen=()=>{streamStatus.textContent="live updates connected";streamStatus.classList.remove("offline")};
+    source.addEventListener("run",event=>{try{eventCursor=Number(event.lastEventId||eventCursor);const payload=JSON.parse(event.data);addEvent(payload);if(payload.terminal){streamStatus.textContent="run finished";streamStatus.classList.remove("offline");source.close()}}catch(_error){}});
+    source.addEventListener("output",event=>{try{const payload=JSON.parse(event.data);chunkCursor=Math.max(chunkCursor,Number(payload.id||0));appendOutput(payload)}catch(_error){}});
+    source.onerror=()=>{source.close();if(!terminalRun){streamStatus.textContent="live updates reconnecting";streamStatus.classList.add("offline");setTimeout(connect,1000)}};
+  }
+  connect();
+  window.addEventListener("beforeunload",()=>source&&source.close());
 })();
 </script>
 {% endblock %}
