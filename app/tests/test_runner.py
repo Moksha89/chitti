@@ -193,6 +193,26 @@ def test_failure_after_owner_cancellation_is_recorded_as_cancelled(monkeypatch) 
     assert events == [("cancelled", "cancelled by owner")]
 
 
+def test_passed_run_is_not_overwritten_by_late_cancellation(monkeypatch) -> None:
+    events: list[tuple[str, str]] = []
+
+    async def requested(_database, _run_id) -> bool:
+        return True
+
+    async def status(_database, _run_id) -> str:
+        return "passed"
+
+    async def record_event(_database, _run_id, event_status, detail, **_kwargs) -> None:
+        events.append((event_status, detail))
+
+    monkeypatch.setattr("chitti.runner.cancellation_requested", requested)
+    monkeypatch.setattr("chitti.runner.latest_status", status)
+    monkeypatch.setattr("chitti.runner.record_event", record_event)
+
+    assert asyncio.run(runner.record_cancelled_if_requested(None, 1)) is True
+    assert events == []
+
+
 class _Session:
     def __init__(self):
         self.calls = 0

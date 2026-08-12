@@ -385,8 +385,11 @@ class DockerSandboxDispatcher:
             await self._remove_container(container)
 
     def _raise_if_cancelled(self, run_id: int) -> None:
-        if run_id in self._cancelled:
+        if self._is_cancelled(run_id):
             raise RunCancelled
+
+    def _is_cancelled(self, run_id: int) -> bool:
+        return run_id in self._cancelled
 
     async def dispatch(
         self, revision: PlanRevision, run_id: int, limits: WorkerLimits
@@ -403,14 +406,14 @@ class DockerSandboxDispatcher:
         try:
             await self._mount_workspace(workspace, limits)
             await self._event(run_id, "running", "run started")
-            if run_id in self._cancelled:
+            if self._is_cancelled(run_id):
                 await self._event(run_id, "cancelled", "cancelled before operation")
                 return
             if self.model_provider is not None:
                 await self._dispatch_model_one(revision, run_id, limits, workspace)
                 return
             for index, operation in enumerate(fixed_operations(revision)):
-                if run_id in self._cancelled:
+                if self._is_cancelled(run_id):
                     await self._event(run_id, "cancelled", "cancelled before operation")
                     return
                 await self._event(
@@ -432,7 +435,7 @@ class DockerSandboxDispatcher:
                     )
                     await self._event(run_id, "failed", "worker exceeded wall-clock timeout")
                     return
-                if run_id in self._cancelled:
+                if self._is_cancelled(run_id):
                     await self._event(run_id, "cancelled", "worker stopped by cancellation")
                     return
                 if result.returncode == 137:
@@ -631,7 +634,7 @@ class DockerSandboxDispatcher:
                         tool_choice="required" if route == CODER_ROUTE else None,
                     )
                 except Exception as exc:
-                    if run_id in self._cancelled:
+                    if self._is_cancelled(run_id):
                         raise RunCancelled from exc
                     detail = _model_call_failure_detail(route, exc)
                     failure = ModelCompletion(
@@ -803,7 +806,7 @@ class DockerSandboxDispatcher:
                                         )
                                     )
                                 except Exception as exc:
-                                    if run_id in self._cancelled:
+                                    if self._is_cancelled(run_id):
                                         raise RunCancelled from exc
                                     if isinstance(exc, ModelProgressError | RunBudgetExceeded):
                                         await self._task_event(
@@ -969,7 +972,7 @@ class DockerSandboxDispatcher:
                     else:
                         await record_inspection_turn()
                 except Exception as exc:
-                    if run_id in self._cancelled:
+                    if self._is_cancelled(run_id):
                         raise RunCancelled from exc
                     if isinstance(exc, ModelProgressError | RunBudgetExceeded):
                         await self._task_event(

@@ -49,6 +49,9 @@ TERMINAL_PREVIEW_FAILURES = frozenset(
         PREVIEW_STAGING_MISSING,
     }
 )
+OUTCOME_TERMINAL_RUN_STATUSES = frozenset(
+    {"passed", "preview_failed", "preview_blocked"}
+)
 
 
 def _copy_and_verify_export(
@@ -102,8 +105,7 @@ async def reconcile_cancelled_run(database: Database) -> int | None:
                 "WHERE NOT EXISTS ("
                 "  SELECT 1 FROM worker_run_events claimed "
                 "  WHERE claimed.run_id = r.id "
-                "    AND claimed.status = 'running' "
-                "    AND claimed.detail = 'claimed by host runner'"
+                "    AND claimed.status = 'running'"
                 ") "
                 "ORDER BY r.id "
                 "LIMIT 1 FOR UPDATE OF r SKIP LOCKED"
@@ -166,8 +168,10 @@ async def latest_status(database: Database, run_id: int) -> str | None:
 async def record_cancelled_if_requested(database: Database, run_id: int) -> bool:
     if not await cancellation_requested(database, run_id):
         return False
-    if await latest_status(database, run_id) != "cancelled":
-        await record_event(database, run_id, "cancelled", "cancelled by owner")
+    status = await latest_status(database, run_id)
+    if status in OUTCOME_TERMINAL_RUN_STATUSES or status == "cancelled":
+        return True
+    await record_event(database, run_id, "cancelled", "cancelled by owner")
     return True
 
 
