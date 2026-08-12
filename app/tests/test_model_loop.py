@@ -459,7 +459,7 @@ def test_model_paths_reject_traversal_and_symlink_escape(tmp_path: Path) -> None
 async def test_model_write_budget_and_command_allowlist(tmp_path: Path) -> None:
     dispatcher = object.__new__(DockerSandboxDispatcher)
     limits = WorkerLimits(model_write_bytes=4)
-    with pytest.raises(RunBudgetExceeded, match="model write-byte budget exceeded"):
+    with pytest.raises(ValueError, match="single write exceeds model write-byte budget"):
         await dispatcher._execute_model_tool(
             1, "task", 0, "write_file",
             {"path": "app.js", "content": "too big"},

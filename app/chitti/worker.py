@@ -44,6 +44,7 @@ NONPRODUCTIVE_TURN_LIMIT = 3
 MAX_TURNS_WITHOUT_WORKSPACE_CHANGE = 8
 MAX_FILE_REWRITES_WITHOUT_COMMAND = 4
 MODEL_TOOL_CALL_BUDGET = 240
+MAX_FILE_WRITES_WITHOUT_COMMAND = 24
 
 
 class RunBudgetExceeded(RuntimeError):
@@ -52,7 +53,6 @@ class RunBudgetExceeded(RuntimeError):
     def __init__(self, budget: str) -> None:
         self.budget = budget
         super().__init__(f"{budget} budget exceeded")
-MAX_FILE_WRITES_WITHOUT_COMMAND = 24
 
 
 class ModelProgressError(RuntimeError):
@@ -960,7 +960,10 @@ class DockerSandboxDispatcher:
             content = str(arguments.get("content", ""))
             encoded = content.encode()
             if len(encoded) > limits.model_write_bytes:
-                raise RunBudgetExceeded("model write-byte")
+                raise ValueError(
+                    "single write exceeds model write-byte budget; "
+                    "split the file into smaller writes"
+                )
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(encoded)
             return f"wrote {len(encoded)} bytes", len(encoded), operation_index
