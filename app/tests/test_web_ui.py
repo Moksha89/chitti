@@ -103,6 +103,7 @@ def test_plan_approval_reason_form_round_trips_to_plan_display() -> None:
     unapproved = _render_plan_run(_finished_run())
     assert 'name="reason"' in unapproved
     assert 'action="/plans/3/approve"' in unapproved
+    assert unapproved.count('action="/plans/3/runs"') == 1
 
     revision = SimpleNamespace(
         id=3,
@@ -130,6 +131,72 @@ def test_plan_approval_reason_form_round_trips_to_plan_display() -> None:
     )
 
     assert "Approved on the owner&#39;s behalf." in rendered
+    assert rendered.count('action="/plans/3/runs"') == 1
+
+
+@pytest.mark.parametrize(
+    ("actor", "expected"),
+    [("owner", "owner"), ("agent", "agent"), (None, "unknown")],
+)
+def test_plan_result_approval_displays_attribution_and_reason(actor, expected) -> None:
+    run = _finished_run(
+        {
+            "manifest_id": 4,
+            "approval_id": 5,
+            "decision": "approved",
+            "approved_by": actor,
+            "reason": "Checked the result.",
+        }
+    )
+    rendered = _render_plan_run(run)
+
+    assert f"Result approved by {expected}" in rendered
+    assert "Checked the result." in rendered
+
+
+def test_workspace_result_approval_displays_unknown_historical_attribution() -> None:
+    run = _finished_run(
+        {
+            "manifest_id": 4,
+            "approval_id": 5,
+            "decision": "approved",
+            "approved_by": None,
+            "reason": None,
+        }
+    )
+    rendered = _workspace_context(run)
+
+    assert "approved · unknown" in rendered
+
+
+def test_approved_plan_keeps_model_run_action_available() -> None:
+    revision = SimpleNamespace(
+        id=3,
+        project="demo",
+        revision=1,
+        brief="Build a demo.",
+        content_hash="a" * 64,
+        document=SimpleNamespace(
+            title="Demo",
+            summary="A demo.",
+            memory_decisions=[],
+            tasks=[],
+        ),
+    )
+    rendered = templates.get_template("plan.html").render(
+        csrf_token="csrf",
+        revision=revision,
+        approval={
+            "decision": "approved",
+            "reason": None,
+            "content_hash": "a" * 64,
+        },
+        task_statuses={},
+        runs=[],
+    )
+
+    assert 'action="/plans/3/runs"' in rendered
+    assert "Run model coding loop" in rendered
 
 
 def test_finished_run_with_manifest_without_approval_can_be_approved() -> None:
