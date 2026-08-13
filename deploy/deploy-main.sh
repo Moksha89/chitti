@@ -11,6 +11,9 @@ RUNNER_ROLE_SQL="${RUNNER_ROLE_SQL:-deploy/worker-runner/runner-role.sql}"
 RUNNER_UNIT_SOURCE="${RUNNER_UNIT_SOURCE:-deploy/worker-runner/chitti-worker-runner.service}"
 RUNNER_VENV_DIR="${RUNNER_VENV_DIR:-/opt/chitti-runner}"
 RUNNER_PYTHON="${RUNNER_PYTHON:-/opt/chitti-runner/bin/python}"
+GOOGLE_SYNC_ENV="${GOOGLE_SYNC_ENV:-/etc/chitti/google-sync.env}"
+GOOGLE_SYNC_UNIT="chitti-google-sync.service"
+GOOGLE_SYNC_UNIT_SOURCE="${GOOGLE_SYNC_UNIT_SOURCE:-deploy/google-sync/chitti-google-sync.service}"
 DEPLOY_COMPLETION_MARKER="CHITTI_DEPLOY_COMPLETE"
 fresh_clone=0
 real_checkout=0
@@ -26,7 +29,9 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
       "Would apply migrations through the normal chitti startup path" \
       "Would build chitti-sandbox:latest" \
       "Would install and enable ${RUNNER_UNIT}" \
+      "Would install and enable ${GOOGLE_SYNC_UNIT}" \
       "Would restart ${RUNNER_UNIT} and verify its loaded-code identity" \
+      "Would create or verify the Google sync-only database role" \
       "Would create or verify the runner-only database role" \
       "Would derive, reconcile, print, and assert runner table privileges" \
       "Would verify schema, privileges, and container network boundaries"
@@ -38,7 +43,9 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
       "Would apply migrations through the normal chitti startup path" \
       "Would build chitti-sandbox:latest" \
       "Would install and enable ${RUNNER_UNIT}" \
+      "Would install and enable ${GOOGLE_SYNC_UNIT}" \
       "Would restart ${RUNNER_UNIT} and verify its loaded-code identity" \
+      "Would create or verify the Google sync-only database role" \
       "Would create or verify the runner-only database role" \
       "Would derive, reconcile, print, and assert runner table privileges" \
       "Would verify schema, privileges, and container network boundaries"
@@ -78,7 +85,8 @@ if [[ "${real_checkout}" -eq 0 ]]; then
   rm -rf "${rollback_dir}/.git"
   rm -f \
     "${rollback_dir}/deploy/worker-runner/runner-role.sql" \
-    "${rollback_dir}/deploy/worker-runner/chitti-worker-runner.service"
+    "${rollback_dir}/deploy/worker-runner/chitti-worker-runner.service" \
+    "${rollback_dir}/deploy/google-sync/chitti-google-sync.service"
   fresh_clone=1
 fi
 
@@ -208,6 +216,10 @@ if [[ ! -x "${RUNNER_PYTHON}" ]]; then
 fi
 "${RUNNER_PYTHON}" -m pip install --quiet --disable-pip-version-check \
   "asyncpg==0.30.0" \
+  "cryptography==44.0.2" \
+  "google-api-python-client==2.169.0" \
+  "google-auth==2.38.0" \
+  "google-auth-oauthlib==1.2.1" \
   "httpx==0.28.1" \
   "pydantic-settings==2.8.1" \
   "SQLAlchemy[asyncio]==2.0.39"
@@ -267,6 +279,69 @@ else
   unset runner_password
   trap - EXIT
 fi
+
+sync_role_exists="$(
+  docker compose exec -T postgres psql -X -qAt \
+    -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+    -c "SELECT 1 FROM pg_roles WHERE rolname = 'chitti_google_sync'"
+)"
+if [[ "${sync_role_exists}" == "1" ]]; then
+  if [[ ! -s "${GOOGLE_SYNC_ENV}" ]]; then
+    echo "Google sync role exists but ${GOOGLE_SYNC_ENV} is missing; refusing to rotate credentials." >&2
+    exit 1
+  fi
+else
+  sync_password="$(openssl rand -hex 32)"
+  sync_env_tmp="$(mktemp /etc/chitti/google-sync.env.XXXXXX)"
+  trap 'rm -f "${sync_env_tmp:-}"' EXIT
+  printf 'DATABASE_URL=postgresql+asyncpg://chitti_google_sync:%s@127.0.0.1:5432/%s\nGOOGLE_CREDENTIALS_KEY=%s\n' \
+    "${sync_password}" "${POSTGRES_DB}" "${GOOGLE_CREDENTIALS_KEY:-}" >"${sync_env_tmp}"
+  chmod 0600 "${sync_env_tmp}"
+  docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
+    -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+    -c "CREATE ROLE chitti_google_sync LOGIN PASSWORD '${sync_password}'" >/dev/null
+  install -o root -g root -m 0600 "${sync_env_tmp}" "${GOOGLE_SYNC_ENV}"
+  rm -f "${sync_env_tmp}"
+  unset sync_password
+  trap - EXIT
+fi
+docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
+  -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+  -c "GRANT CONNECT ON DATABASE ${POSTGRES_DB} TO chitti_google_sync; GRANT USAGE ON SCHEMA public TO chitti_google_sync;" >/dev/null
+
+POSTGRES_USER="${POSTGRES_USER}" \
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD}" \
+POSTGRES_DB="${POSTGRES_DB}" \
+POSTGRES_PORT="${POSTGRES_PORT:-5432}" \
+PYTHONPATH="${INSTALL_DIR}/app" "${RUNNER_PYTHON}" - <<'PY'
+import asyncio
+import os
+from urllib.parse import quote
+import asyncpg
+from chitti.google_sync_access import reconcile_sync_privileges
+
+async def main():
+    user = quote(os.environ["POSTGRES_USER"], safe="")
+    password = quote(os.environ["POSTGRES_PASSWORD"], safe="")
+    database = quote(os.environ["POSTGRES_DB"], safe="")
+    port = os.environ["POSTGRES_PORT"]
+    conn = await asyncpg.connect(
+        f"postgresql://{user}:{password}@127.0.0.1:{port}/{database}"
+    )
+    try:
+        await reconcile_sync_privileges(conn)
+    finally:
+        await conn.close()
+
+asyncio.run(main())
+PY
+
+install -o root -g root -m 0644 \
+  "${GOOGLE_SYNC_UNIT_SOURCE}" \
+  "/etc/systemd/system/${GOOGLE_SYNC_UNIT}"
+systemctl daemon-reload
+systemctl enable "${GOOGLE_SYNC_UNIT}"
+systemctl restart "${GOOGLE_SYNC_UNIT}"
 
 POSTGRES_USER="${POSTGRES_USER}" \
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD}" \
@@ -415,6 +490,9 @@ BEGIN
     'worker_runs', 'worker_run_events', 'worker_operations',
     'worker_artifacts', 'worker_model_calls', 'worker_image_jobs', 'export_manifests',
     'promotion_approvals', 'previews'
+    , 'google_provider_accounts', 'google_oauth_credentials',
+    'google_sync_state', 'google_gmail_messages', 'google_calendar_events',
+    'google_account_audit'
   ] LOOP
     IF to_regclass('public.' || required_table) IS NULL THEN
       RAISE EXCEPTION 'missing required table %', required_table;
@@ -441,6 +519,7 @@ BEGIN
     'reject_promotion_approval_mutation_trigger',
     'reject_preview_mutation_trigger',
     'chat_transcript_entries_immutable'
+    , 'reject_google_account_audit_mutation_trigger'
   ] LOOP
     IF NOT EXISTS (
       SELECT 1 FROM pg_trigger

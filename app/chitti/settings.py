@@ -24,9 +24,14 @@ class Settings(BaseSettings):
     preview_ttl_hours: int = 72
     preview_max_bytes: int = 200 * 1024 * 1024
     preview_max_count: int = 4
-    runpod_api_key: str = ""
-    runpod_endpoint_id: str = ""
-    runpod_gpu_rate_usd: float = 0.34
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_oauth_redirect_uri: str = "https://chitti.local/google/callback"
+    google_credentials_key: str = ""
+    google_sync_interval_seconds: int = 300
+    google_recent_mail_days: int = 30
+    google_initial_mail_limit: int = 100
+    google_calendar_window_days: int = 30
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
