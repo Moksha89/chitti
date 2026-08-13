@@ -407,6 +407,18 @@ async def reconcile_runner_privileges(
     grantee: str = "chitti_runner",
     source_texts: list[str] | None = None,
 ) -> None:
+    can_reconcile = await conn.fetchval(
+        "SELECT EXISTS ("
+        "SELECT 1 FROM information_schema.role_table_grants "
+        "WHERE grantee = current_user AND table_schema = 'public' "
+        "AND is_grantable = 'YES'"
+        ")"
+    )
+    if not can_reconcile:
+        raise SystemExit(
+            "runner privilege reconciliation requires a database role "
+            "that can grant and revoke privileges; current_user cannot"
+        )
     tables = {
         str(row["table_name"])
         for row in await conn.fetch(
