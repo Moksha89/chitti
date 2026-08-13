@@ -1,0 +1,19 @@
+Bitstream Charter
+Courier 10 Pitch
+FreeMono
+FreeSans
+FreeSerif
+IPAGothic
+IPAPGothic
+Liberation Mono
+Liberation Sans
+Liberation Sans Narrow
+Liberation Serif
+Loma
+Noto Color Emoji
+Unifont
+Unifont CSUR
+Unifont Upper
+WenQuanYi Zen Hei
+WenQuanYi Zen Hei Mono
+WenQuanYi Zen Hei Sharp

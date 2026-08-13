@@ -23,6 +23,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .auth import AuthManager, Session
+from .brand_profiles import (
+    available_font_families,
+    get_brand_profile,
+    save_brand_profile,
+)
 from .briefings import compose_briefing
 from .db import Database
 from .diff_parser import parse_diff as _parse_diff
@@ -33,7 +38,11 @@ from .memory import (
     normalize_namespace,
 )
 from .namespaces import SHARED_NAMESPACE
-from .notifications import acknowledge_notification, notifications_after, recent_notifications
+from .notifications import (
+    acknowledge_notification,
+    notifications_after,
+    recent_notifications,
+)
 from .plans import (
     PlanManager,
     approve_revision,
@@ -360,6 +369,7 @@ async def dashboard_context(
         transcript = await recent_entries(db_session, namespace)
         reminders = await recent_reminders(database, namespace)
         notifications = await recent_notifications(database, namespace)
+        brand_profile = await get_brand_profile(db_session, namespace)
         runner_health = await recent_runner_health(database)
         for plan in plans:
             approval_result = await db_session.execute(
@@ -423,11 +433,15 @@ async def dashboard_context(
         "notifications": notifications,
         "runner_health": runner_health,
         "briefing": briefing,
+        "brand_profile": brand_profile,
+        "available_fonts": available_font_families(),
+        "brand_error": request.query_params.get("brand_error"),
     }
 
 
 def humanize_belief_key(value: str) -> str:
-    return re.sub(r"[_\.]+", " ", value).strip().capitalize()
+    spaced = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", value)
+    return re.sub(r"[^a-zA-Z0-9]+", " ", spaced).strip().capitalize()
 
 
 def project_from_brief(
@@ -696,6 +710,41 @@ async def cancel_dashboard_reminder(
     namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
     await cancel_reminder(request.app.state.database, namespace, reminder_id)
     return RedirectResponse(f"/?namespace={namespace}", status_code=303)
+
+
+@app.post("/brand-profile")
+async def save_brand_profile_route(request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
+
+    def split_lines(key: str) -> list[str]:
+        return str(form.get(key, "")).splitlines()
+
+    try:
+        async with request.app.state.database.sessions() as db_session:
+            await save_brand_profile(
+                db_session,
+                namespace,
+                brand_colors=split_lines("brand_colors"),
+                typography=str(form.get("typography", "")),
+                poster_formats=split_lines("poster_formats"),
+                audience=str(form.get("audience", "")),
+                voice=str(form.get("voice", "")),
+                do_not_use=split_lines("do_not_use"),
+                actor=session.username or "owner",
+            )
+            await db_session.commit()
+    except ValueError as exc:
+        return RedirectResponse(
+            f"/?namespace={quote(namespace, safe='')}&brand_error={quote(str(exc), safe='')}",
+            status_code=303,
+        )
+    return RedirectResponse(f"/?namespace={quote(namespace, safe='')}", status_code=303)
 
 
 @app.post("/notifications/{notification_id}/acknowledge")
