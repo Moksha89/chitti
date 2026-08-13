@@ -17,7 +17,14 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .brand_profiles import BrandProfile, available_font_families, get_brand_profile
-from .image_generation import ImageRequestRefused, generate_manifest_images
+from .image_generation import (
+    ImageBudgetExceeded,
+    ImageManifestRefused,
+    ImageProviderFailure,
+    ImageProviderUnavailable,
+    generate_manifest_images,
+    verify_export_assets,
+)
 from .job_types import (
     WEBSITE_POLICY,
     JobTypePolicy,
@@ -1371,7 +1378,17 @@ class DockerSandboxDispatcher:
                     detail = await generate_manifest_images(
                         self.database, run_id, workspace, limits
                     )
-                except ImageRequestRefused as exc:
+                except ImageManifestRefused as exc:
+                    await self._operation(
+                        run_id, operation, operation_index + 1, "failed", "",
+                        str(exc)[:2000], 1, started,
+                    )
+                    raise
+                except (
+                    ImageBudgetExceeded,
+                    ImageProviderFailure,
+                    ImageProviderUnavailable,
+                ) as exc:
                     await self._operation(
                         run_id, operation, operation_index + 1, "failed", "",
                         str(exc)[:2000], 1, started,
@@ -1392,6 +1409,8 @@ class DockerSandboxDispatcher:
                 return detail, 0, operation_index
             op_name, command, network = MODEL_COMMANDS[name]
             operation = FixedOperation(task_id, op_name, command, network=network)
+            if name == "poster-export":
+                await verify_export_assets(self.database, run_id, workspace)
             result, stdout, stderr = await self._run_container(
                 run_id,
                 self._docker_command(

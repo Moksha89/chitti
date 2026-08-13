@@ -63,3 +63,12 @@ def test_undeclared_relative_raster_asset_is_refused() -> None:
             {"freesans"},
             assets={"generated/stadium.png"},
         )
+
+
+def test_undeclared_svg_image_href_is_refused() -> None:
+    with pytest.raises(SystemExit, match="remote URL or runtime fetch"):
+        MODULE.validate_poster_source(
+            '<svg><image href="generated/unknown.png"/></svg>',
+            {"freesans"},
+            assets={"generated/stadium.png"},
+        )

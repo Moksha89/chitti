@@ -35,7 +35,6 @@ def upgrade() -> None:
         sa.Column("status", sa.String(32), nullable=False),
         sa.Column("cache_hit", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.ForeignKeyConstraint(["run_id"], ["worker_runs.id"]),
-        sa.UniqueConstraint("cache_digest", name="worker_image_jobs_cache_digest_uq"),
     )
     op.create_index("worker_image_jobs_run_id_idx", "worker_image_jobs", ["run_id"])
     op.execute(
