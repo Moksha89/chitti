@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from typing import cast
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -318,6 +319,35 @@ class MemoryStore:
         )
         return [dict(row._mapping) for row in result]
 
+    @staticmethod
+    def group_conflicts(
+        conflicts: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        grouped: dict[tuple[str, int], dict[str, object]] = {}
+        for conflict in conflicts:
+            key = (
+                str(conflict["decision_key"]),
+                int(str(conflict["existing_decision_id"])),
+            )
+            group = grouped.setdefault(
+                key,
+                {
+                    "id": int(str(conflict["id"])),
+                    "decision_key": conflict["decision_key"],
+                    "existing_decision_id": int(str(conflict["existing_decision_id"])),
+                    "existing_value": conflict["existing_value"],
+                    "recurrence_count": 0,
+                    "proposals": [],
+                },
+            )
+            group["recurrence_count"] = max(
+                int(str(group["recurrence_count"])),
+                int(str(conflict["recurrence_count"])),
+            )
+            proposals = cast(list[dict[str, object]], group["proposals"])
+            proposals.append(conflict)
+        return list(grouped.values())
+
     async def resolve_conflict(
         self,
         session: AsyncSession,
@@ -379,6 +409,23 @@ class MemoryStore:
             ),
             {"new_id": new_id, "id": conflict_id, "actor": actor},
         )
+        if choice == "existing":
+            await session.execute(
+                text(
+                    "UPDATE memory_conflicts SET resolution_decision_id = :new_id, "
+                    "closed_at = now(), closure_reason = 'declined', "
+                    "resolution_actor = :actor, resolved_at = now() "
+                    "WHERE existing_decision_id = :old_id AND id <> :id "
+                    "AND resolution_decision_id IS NULL AND closed_at IS NULL"
+                ),
+                {
+                    "new_id": new_id,
+                    "old_id": conflict["existing_decision_id"],
+                    "id": conflict_id,
+                    "actor": actor,
+                },
+            )
+            return new_id
         siblings = await session.execute(
             text(
                 "SELECT id, proposed_value, latest_proposed_value, "

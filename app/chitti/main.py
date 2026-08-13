@@ -44,7 +44,7 @@ from .plans import (
 from .previews import manifest_from_json, safe_preview_file
 from .project_state import ProjectState
 from .provider import FakeProvider, LiteLLMProvider
-from .reminders import create_reminder, recent_reminders
+from .reminders import cancel_reminder, create_reminder, recent_reminders
 from .run_context import RunContextError, build_run_evidence
 from .run_status import TERMINAL_RUN_STATUSES
 from .runner_health import recent_runner_health
@@ -355,7 +355,7 @@ async def dashboard_context(
     )
     async with database.sessions() as db_session:
         decisions = await memory.decisions(db_session, namespace)
-        conflicts = await memory.conflicts(db_session, namespace)
+        conflicts = memory.group_conflicts(await memory.conflicts(db_session, namespace))
         plans = await latest_revisions(db_session, namespace)
         transcript = await recent_entries(db_session, namespace)
         reminders = await recent_reminders(database, namespace)
@@ -377,7 +377,8 @@ async def dashboard_context(
     for conflict in conflicts:
         conflict["display_key"] = humanize_belief_key(str(conflict["decision_key"]))
         conflict["display_existing"] = str(conflict["existing_value"])
-        conflict["display_proposed"] = str(conflict["proposed_value"])
+        for proposal in cast(list[dict[str, object]], conflict["proposals"]):
+            proposal["display_proposed"] = str(proposal["proposed_value"])
     now = datetime.now(ZoneInfo(request.app.state.settings.display_timezone))
     display_zone = ZoneInfo(request.app.state.settings.display_timezone)
     for reminder in reminders:
@@ -679,6 +680,21 @@ async def create_dashboard_reminder(request: Request) -> RedirectResponse:
         local_due.astimezone(UTC),
         recurrence,
     )
+    return RedirectResponse(f"/?namespace={namespace}", status_code=303)
+
+
+@app.post("/reminders/{reminder_id}/cancel")
+async def cancel_dashboard_reminder(
+    reminder_id: int, request: Request
+) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
+    await cancel_reminder(request.app.state.database, namespace, reminder_id)
     return RedirectResponse(f"/?namespace={namespace}", status_code=303)
 
 

@@ -358,6 +358,97 @@ async def test_resolution_reconciles_open_sibling_conflicts_without_deleting(sto
         )
 
 
+async def test_grouped_conflicts_keep_all_proposals_and_resolution_paths(store) -> None:
+    engine, memory = store
+    async with engine.begin() as session:
+        await memory.append_decision(
+            session,
+            ExtractedMemory(
+                "worker_caps", "Keep worker caps at $0.75.", None, None, "user_stated"
+            ),
+            "general",
+        )
+        proposals = await memory.record_memories(
+            session,
+            [
+                ExtractedMemory(
+                    "worker_caps", "Cap worker cost at $1.", None, None, "user_stated"
+                ),
+                ExtractedMemory(
+                    "worker_caps",
+                    "Cap worker cost at $2.",
+                    None,
+                    None,
+                    "user_stated",
+                ),
+            ],
+            "general",
+        )
+        groups = memory.group_conflicts(await memory.conflicts(session, "general"))
+        assert len(groups) == 1
+        assert {item["id"] for item in groups[0]["proposals"]} == {
+            item.conflict_id for item in proposals
+        }
+        new_id = await memory.resolve_conflict(
+            session, proposals[0].conflict_id, "proposed", "akirah"
+        )
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT id, existing_decision_id, resolution_decision_id, "
+                    "closed_at, closure_reason FROM memory_conflicts "
+                    "WHERE id IN (:first, :second) ORDER BY id"
+                ),
+                {"first": proposals[0].conflict_id, "second": proposals[1].conflict_id},
+            )
+        ).mappings().all()
+        assert rows[0]["resolution_decision_id"] == new_id
+        assert rows[0]["closure_reason"] == "owner"
+        assert rows[1]["existing_decision_id"] == new_id
+        assert rows[1]["closed_at"] is None
+
+
+async def test_keep_current_declines_grouped_proposals_attributably(store) -> None:
+    engine, memory = store
+    async with engine.begin() as session:
+        await memory.append_decision(
+            session,
+            ExtractedMemory(
+                "reporting_style", "Concise", None, None, "user_stated"
+            ),
+            "general",
+        )
+        proposals = await memory.record_memories(
+            session,
+            [
+                ExtractedMemory(
+                    "reporting_style", "Detailed", None, None, "user_stated"
+                ),
+                ExtractedMemory(
+                    "reporting_style", "Structured", None, None, "user_stated"
+                ),
+            ],
+            "general",
+        )
+        new_id = await memory.resolve_conflict(
+            session, proposals[0].conflict_id, "existing", "akirah"
+        )
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT resolution_decision_id, closure_reason, resolution_actor "
+                    "FROM memory_conflicts WHERE id IN (:first, :second) ORDER BY id"
+                ),
+                {"first": proposals[0].conflict_id, "second": proposals[1].conflict_id},
+            )
+        ).mappings().all()
+        assert rows[0]["resolution_decision_id"] == new_id
+        assert rows[0]["closure_reason"] == "owner"
+        assert rows[1]["resolution_decision_id"] == new_id
+        assert rows[1]["closure_reason"] == "declined"
+        assert rows[1]["resolution_actor"] == "akirah"
+
+
 async def test_conflict_repair_groups_by_equivalent_proposal_without_deleting(store) -> None:
     engine, _ = store
     env = {
