@@ -39,6 +39,22 @@ def upgrade() -> None:
         "memory_conflicts",
         sa.Column("resolved_at", sa.DateTime(timezone=True), nullable=True),
     )
+    op.add_column(
+        "memory_conflicts",
+        sa.Column("latest_proposed_value", sa.Text(), nullable=True),
+    )
+    op.add_column(
+        "memory_conflicts",
+        sa.Column("latest_proposed_rationale", sa.Text(), nullable=True),
+    )
+    op.add_column(
+        "memory_conflicts",
+        sa.Column("latest_proposed_project", sa.String(255), nullable=True),
+    )
+    op.add_column(
+        "memory_conflicts",
+        sa.Column("latest_proposed_source", sa.String(32), nullable=True),
+    )
     op.create_foreign_key(
         "memory_conflicts_superseded_by_fk",
         "memory_conflicts",
@@ -59,8 +75,41 @@ def upgrade() -> None:
     op.execute(
         """
         UPDATE memory_conflicts
-        SET last_seen_at = created_at
-        WHERE last_seen_at IS NULL
+        SET last_seen_at = COALESCE(last_seen_at, created_at),
+            latest_proposed_value = COALESCE(latest_proposed_value, proposed_value),
+            latest_proposed_rationale = COALESCE(latest_proposed_rationale, proposed_rationale),
+            latest_proposed_project = COALESCE(latest_proposed_project, proposed_project),
+            latest_proposed_source = COALESCE(latest_proposed_source, proposed_source)
+        """
+    )
+    op.execute(
+        """
+        WITH ranked AS (
+            SELECT DISTINCT ON (namespace, decision_key)
+                   id AS canonical_id, namespace, decision_key
+            FROM memory_conflicts
+            WHERE resolution_decision_id IS NULL AND closed_at IS NULL
+            ORDER BY namespace, decision_key, id
+        ),
+        latest AS (
+            SELECT DISTINCT ON (namespace, decision_key)
+                   namespace, decision_key, latest_proposed_value,
+                   latest_proposed_rationale, latest_proposed_project,
+                   latest_proposed_source
+            FROM memory_conflicts
+            WHERE resolution_decision_id IS NULL AND closed_at IS NULL
+            ORDER BY namespace, decision_key, id DESC
+        )
+        UPDATE memory_conflicts canonical
+        SET latest_proposed_value = latest.latest_proposed_value,
+            latest_proposed_rationale = latest.latest_proposed_rationale,
+            latest_proposed_project = latest.latest_proposed_project,
+            latest_proposed_source = latest.latest_proposed_source
+        FROM ranked
+        JOIN latest
+          ON latest.namespace = ranked.namespace
+         AND latest.decision_key = ranked.decision_key
+        WHERE canonical.id = ranked.canonical_id
         """
     )
     op.execute(
@@ -115,3 +164,7 @@ def downgrade() -> None:
     op.drop_column("memory_conflicts", "closed_at")
     op.drop_column("memory_conflicts", "last_seen_at")
     op.drop_column("memory_conflicts", "recurrence_count")
+    op.drop_column("memory_conflicts", "latest_proposed_source")
+    op.drop_column("memory_conflicts", "latest_proposed_project")
+    op.drop_column("memory_conflicts", "latest_proposed_rationale")
+    op.drop_column("memory_conflicts", "latest_proposed_value")

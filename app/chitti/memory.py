@@ -77,13 +77,7 @@ def equivalent_proposal(existing: str, proposed: str) -> bool:
     proposed_numbers = {token for token in proposed_tokens if any(char.isdigit() for char in token)}
     if existing_numbers != proposed_numbers:
         return False
-    intersection = existing_tokens & proposed_tokens
-    union = existing_tokens | proposed_tokens
-    return (
-        existing_tokens <= proposed_tokens
-        or proposed_tokens <= existing_tokens
-        or len(intersection) / len(union) >= 0.8
-    )
+    return existing_tokens == proposed_tokens
 
 
 def normalize_key(value: str) -> str:
@@ -220,15 +214,24 @@ class MemoryStore:
                         await session.execute(
                             text(
                                 "UPDATE memory_conflicts SET recurrence_count = recurrence_count + 1, "
-                                "last_seen_at = now() WHERE id = :id"
+                                "last_seen_at = now(), latest_proposed_value = :value, "
+                                "latest_proposed_rationale = :rationale, "
+                                "latest_proposed_project = :project, "
+                                "latest_proposed_source = :source WHERE id = :id"
                             ),
-                            {"id": open_conflict["id"]},
+                            {
+                                "id": open_conflict["id"],
+                                "value": memory.value,
+                                "rationale": memory.rationale,
+                                "project": memory.project,
+                                "source": memory.source,
+                            },
                         )
                         conflicts.append(
                             Conflict(
                                 existing_key,
                                 str(match["decision"]),
-                                str(open_conflict["proposed_value"]),
+                                memory.value,
                                 int(str(match["id"])),
                                 int(str(open_conflict["id"])),
                             )
@@ -260,9 +263,11 @@ class MemoryStore:
                         text(
                             "INSERT INTO memory_conflicts "
                             "(decision_key, existing_decision_id, proposed_value, proposed_rationale, "
-                            "proposed_project, proposed_source, namespace, last_seen_at) "
+                            "proposed_project, proposed_source, namespace, last_seen_at, "
+                            "latest_proposed_value, latest_proposed_rationale, "
+                            "latest_proposed_project, latest_proposed_source) "
                             "VALUES (:key, :existing_id, :value, :rationale, :project, :source, "
-                            ":namespace, now()) RETURNING id"
+                            ":namespace, now(), :value, :rationale, :project, :source) RETURNING id"
                         ),
                         {
                             "key": existing_key,
@@ -326,7 +331,10 @@ class MemoryStore:
         result = await session.execute(
             text(
                 "SELECT c.id, c.decision_key, c.existing_decision_id, d.decision AS existing_value, "
-                "c.proposed_value, c.proposed_rationale, c.proposed_project, c.proposed_source, "
+                "COALESCE(c.latest_proposed_value, c.proposed_value) AS proposed_value, "
+                "COALESCE(c.latest_proposed_rationale, c.proposed_rationale) AS proposed_rationale, "
+                "COALESCE(c.latest_proposed_project, c.proposed_project) AS proposed_project, "
+                "COALESCE(c.latest_proposed_source, c.proposed_source) AS proposed_source, "
                 "c.recurrence_count, c.closed_at, c.closure_reason, c.resolution_actor, c.resolved_at "
                 "FROM memory_conflicts c JOIN decisions d ON d.id = c.existing_decision_id "
                 "LEFT JOIN decision_forgets f ON f.decision_id = d.id "
@@ -347,8 +355,12 @@ class MemoryStore:
     ) -> int:
         result = await session.execute(
             text(
-                "SELECT decision_key, existing_decision_id, proposed_value, proposed_rationale, "
-                "proposed_project, proposed_source FROM memory_conflicts "
+                "SELECT decision_key, existing_decision_id, "
+                "COALESCE(latest_proposed_value, proposed_value) AS proposed_value, "
+                "COALESCE(latest_proposed_rationale, proposed_rationale) AS proposed_rationale, "
+                "COALESCE(latest_proposed_project, proposed_project) AS proposed_project, "
+                "COALESCE(latest_proposed_source, proposed_source) AS proposed_source "
+                "FROM memory_conflicts "
                 "WHERE id = :id AND resolution_decision_id IS NULL AND closed_at IS NULL"
             ),
             {"id": conflict_id},

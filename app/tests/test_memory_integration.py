@@ -154,6 +154,19 @@ async def test_equivalent_conflict_recurrence_updates_one_open_row(store) -> Non
         ).mappings().one()
         assert row["count"] == 1
         assert row["recurrence_count"] == 2
+        visible = await memory.conflicts(session, "general")
+        assert visible[0]["proposed_value"] == (
+            "Worker caps are $0.75 per run and 300,000 model tokens."
+        )
+        latest = (
+            await session.execute(
+                text(
+                    "SELECT latest_proposed_value FROM memory_conflicts "
+                    "WHERE decision_key = 'worker_caps' AND closed_at IS NULL"
+                )
+            )
+        ).scalar_one()
+        assert latest == "Worker caps are $0.75 per run and 300,000 model tokens."
 
 
 async def test_different_conflict_supersedes_previous_open_row(store) -> None:
@@ -274,6 +287,15 @@ async def test_conflict_backfill_keeps_one_historical_row_per_key_without_deleti
         assert rows[0]["closed_at"] is None
         assert rows[0]["proposed_value"] == "Plain CSS modules"
         assert rows[1]["closure_reason"] == "deduplicated"
+        latest = (
+            await session.execute(
+                text(
+                    "SELECT latest_proposed_value FROM memory_conflicts "
+                    "WHERE decision_key = 'styling_framework' AND closed_at IS NULL"
+                )
+            )
+        ).scalar_one()
+        assert latest == "Next.js and Three.js"
 
 
 async def test_memory_namespaces_isolate_business_data_and_share_general_data(store) -> None:

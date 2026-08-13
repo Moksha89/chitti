@@ -38,6 +38,14 @@ def test_equivalent_proposal_accepts_conservative_restatement() -> None:
         "Worker caps are $0.75 per run and 300,000 model tokens.",
     )
     assert not equivalent_proposal("Tailwind CSS", "Plain CSS modules on every project.")
+    assert not equivalent_proposal(
+        "Do not use webgl-fluid.",
+        "Do not use webgl-fluid, Drei Environment presets, or Drei Text in generated 3D websites.",
+    )
+    assert not equivalent_proposal(
+        "The completion gate requires successful install, build, test, and export.",
+        "The completion gate requires successful install, build, test, and export with phone and desktop screenshots.",
+    )
 
 
 class SubjectEmbedder:
