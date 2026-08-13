@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .brand_profiles import get_brand_profile
 from .job_types import (
     WEBSITE_JOB,
     config_json,
@@ -210,8 +211,6 @@ class PlanManager:
         job_type = normalize_job_type(job_type)
         normalized_config = poster_config(job_config) if job_type == "poster" else {}
         if job_type == "poster":
-            from .brand_profiles import get_brand_profile
-
             async with self.database.sessions() as session:
                 if await get_brand_profile(session, namespace) is None:
                     raise ValueError(
@@ -278,8 +277,6 @@ class PlanManager:
                 beliefs = await self.memory.active_beliefs(session, str(job["namespace"]))
                 profile = None
                 if str(job["job_type"]) == "poster":
-                    from .brand_profiles import get_brand_profile
-
                     profile = await get_brand_profile(session, str(job["namespace"]))
             raw = await self.provider.plan(
                 str(job["brief"]),

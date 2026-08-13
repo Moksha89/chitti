@@ -2,7 +2,8 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol
+from datetime import datetime
+from typing import Any, Protocol, cast
 
 import httpx
 
@@ -27,6 +28,18 @@ class GatewayMisconfigurationError(GatewayValidationError):
 
 class GatewayTransientError(GatewayValidationError):
     """The gateway could not be checked due to a temporary failure."""
+
+
+class PlannerBrandProfile(Protocol):
+    namespace: str
+    brand_colors: tuple[str, ...]
+    typography: str
+    poster_formats: tuple[str, ...]
+    audience: str
+    voice: str
+    do_not_use: tuple[str, ...]
+    updated_by: str
+    updated_at: datetime
 
 
 class ModelTransportError(RuntimeError):
@@ -294,10 +307,24 @@ class LiteLLMProvider:
         ) or "(none)"
         feedback = f"\nREJECTION FEEDBACK:\n{rejection}" if rejection else ""
         format_text = json.dumps(job_config or {}, default=str)
-        profile_text = json.dumps(
-            getattr(brand_profile, "__dict__", brand_profile or {}),
-            default=str,
-        )
+        if brand_profile is None:
+            profile_data: dict[str, object] = {}
+        elif hasattr(brand_profile, "namespace"):
+            profile = cast(PlannerBrandProfile, brand_profile)
+            profile_data = {
+                "namespace": profile.namespace,
+                "brand_colors": list(profile.brand_colors),
+                "typography": profile.typography,
+                "poster_formats": list(profile.poster_formats),
+                "audience": profile.audience,
+                "voice": profile.voice,
+                "do_not_use": list(profile.do_not_use),
+                "updated_by": profile.updated_by,
+                "updated_at": profile.updated_at,
+            }
+        else:
+            raise TypeError("planner brand profile must expose its known fields")
+        profile_text = json.dumps(profile_data, default=str)
         work_guidance = (
             "Plan one offline poster artifact bound to the supplied brand profile. "
             "Tasks must cover artifact authoring, poster-export, and capture_screenshot; "

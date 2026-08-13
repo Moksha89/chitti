@@ -2415,8 +2415,8 @@ class WorkerRunManager:
         policy = policy_for(job_type)
         async with self.database.sessions() as session:
             revision = await approved_revision(session, revision_id, namespace)
-            revision_job_type = str(getattr(revision, "job_type", "website"))
-            revision_job_config = getattr(revision, "job_config", {})
+            revision_job_type = revision.job_type
+            revision_job_config = revision.job_config
             if policy.name != revision_job_type:
                 raise ValueError(
                     "run job type does not match approved plan revision: "
