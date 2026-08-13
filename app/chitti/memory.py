@@ -379,6 +379,34 @@ class MemoryStore:
             ),
             {"new_id": new_id, "id": conflict_id, "actor": actor},
         )
+        siblings = await session.execute(
+            text(
+                "SELECT id, proposed_value, latest_proposed_value, "
+                "COALESCE(latest_proposed_value, proposed_value) AS effective_value "
+                "FROM memory_conflicts "
+                "WHERE existing_decision_id = :old_id "
+                "AND id <> :id AND resolution_decision_id IS NULL AND closed_at IS NULL"
+            ),
+            {"old_id": conflict["existing_decision_id"], "id": conflict_id},
+        )
+        for sibling in siblings.mappings():
+            if equivalent_proposal(str(sibling["effective_value"]), replacement.value):
+                await session.execute(
+                    text(
+                        "UPDATE memory_conflicts SET resolution_decision_id = :new_id, "
+                        "closed_at = now(), closure_reason = 'owner_reconciled', "
+                        "resolution_actor = :actor, resolved_at = now() WHERE id = :id"
+                    ),
+                    {"new_id": new_id, "id": sibling["id"], "actor": actor},
+                )
+            else:
+                await session.execute(
+                    text(
+                        "UPDATE memory_conflicts SET existing_decision_id = :new_id "
+                        "WHERE id = :id"
+                    ),
+                    {"new_id": new_id, "id": sibling["id"]},
+                )
         return new_id
 
     async def forget_decision(self, session: AsyncSession, decision_id: int) -> None:
