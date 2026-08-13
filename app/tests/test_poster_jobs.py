@@ -18,6 +18,7 @@ from chitti.worker import (
     WorkerRunManager,
     _model_system_prompt,
     _reviewer_system_prompt,
+    _validate_screenshot_request,
 )
 
 
@@ -66,13 +67,30 @@ def test_poster_dimensions_and_scale_are_bounded() -> None:
 
 
 def test_poster_prompts_require_brand_and_honest_visual_review() -> None:
-    prompt = _model_system_prompt(POSTER_POLICY, {"typography": "FreeSans"})
+    prompt = _model_system_prompt(
+        POSTER_POLICY,
+        {"typography": "FreeSans"},
+        {"artifact": "trial-poster.html", "width": 1080, "height": 1350, "scale": 1},
+    )
     review = _reviewer_system_prompt(POSTER_POLICY)
     assert "do not invent" in prompt
     for family in available_font_families():
         assert family in prompt
     assert "url(#gradient)" in prompt
+    assert "trial-poster.html" in prompt
+    assert "width 1080" in prompt
+    assert "height 1350" in prompt
+    assert "device scale 1" in prompt
+    assert "does not need a route argument" in prompt
+    assert "do not raise the scale" in prompt
     assert "visual quality was not assessed" in review
+
+
+def test_poster_capture_ignores_route_but_keeps_scale_ceiling() -> None:
+    config = {"artifact": "trial-poster.html", "width": 1080, "height": 1350, "scale": 1}
+    _validate_screenshot_request(POSTER_POLICY, "not-a-route", 1080, 1350, 1, config)
+    with pytest.raises(ValueError, match="poster screenshot exceeds approved capture"):
+        _validate_screenshot_request(POSTER_POLICY, "not-a-route", 1080, 1350, 2, config)
 
 
 @pytest.mark.asyncio

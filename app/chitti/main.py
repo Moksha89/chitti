@@ -26,6 +26,7 @@ from .auth import AuthManager, Session
 from .brand_profiles import (
     available_font_families,
     get_brand_profile,
+    remove_brand_profile,
     save_brand_profile,
 )
 from .briefings import compose_briefing
@@ -747,6 +748,23 @@ async def save_brand_profile_route(request: Request) -> RedirectResponse:
             f"/?namespace={quote(namespace, safe='')}&brand_error={quote(str(exc), safe='')}",
             status_code=303,
         )
+    return RedirectResponse(f"/?namespace={quote(namespace, safe='')}", status_code=303)
+
+
+@app.post("/brand-profile/remove")
+async def remove_brand_profile_route(request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
+    async with request.app.state.database.sessions() as db_session:
+        await remove_brand_profile(
+            db_session, namespace, actor=session.username or "owner"
+        )
+        await db_session.commit()
     return RedirectResponse(f"/?namespace={quote(namespace, safe='')}", status_code=303)
 
 

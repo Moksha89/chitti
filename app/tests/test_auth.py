@@ -165,6 +165,20 @@ def test_result_approval_requires_session_and_csrf(tmp_path) -> None:
     assert client.post("/runs/1/approve-result").status_code == 403
 
 
+def test_brand_profile_removal_requires_session_and_csrf(tmp_path) -> None:
+    auth, _ = make_auth(tmp_path)
+    auth.must_change_password = False
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/brand-profile/remove", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login?next=%2Fbrand-profile%2Fremove"
+
+    token, _ = auth.create_session("akirah")
+    client.cookies.set("chitti_session", token)
+    assert client.post("/brand-profile/remove").status_code == 403
+
+
 def test_unauthenticated_api_routes_keep_generic_401(tmp_path) -> None:
     make_auth(tmp_path)
     client = TestClient(app, base_url="https://testserver")
