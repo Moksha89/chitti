@@ -1251,6 +1251,18 @@ class DockerSandboxDispatcher:
             if not route_value.startswith("/"):
                 raise ValueError("invalid screenshot route or width")
             if policy.is_poster:
+                approved = poster_config(job_config)
+                if (
+                    width > int(cast(int, approved["width"]))
+                    or height > int(cast(int, approved["height"]))
+                    or scale > int(cast(int, approved["scale"]))
+                ):
+                    raise ValueError(
+                        "poster screenshot exceeds approved capture: "
+                        f"requested {width}x{height} at scale {scale}, "
+                        f"approved {approved['width']}x{approved['height']} "
+                        f"at scale {approved['scale']}"
+                    )
                 requested = poster_config(
                     {**job_config, "width": width, "height": height, "scale": scale}
                 )
