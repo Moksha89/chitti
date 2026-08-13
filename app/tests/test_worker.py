@@ -156,7 +156,7 @@ def test_static_capture_serves_produced_export_without_model_server(tmp_path) ->
     assert served["process"].poll() is not None
 
 
-def _poster_capture_factory(layout_errors):
+def _poster_capture_factory(layout_errors, scripts=None):
     class Page:
         def on(self, *_args) -> None:
             pass
@@ -173,7 +173,9 @@ def _poster_capture_factory(layout_errors):
         def inner_text(self) -> str:
             return "poster"
 
-        def evaluate(self, _script):
+        def evaluate(self, script):
+            if scripts is not None:
+                scripts.append(script)
             return layout_errors
 
         def screenshot(self, path, **_kwargs) -> None:
@@ -248,6 +250,24 @@ def test_poster_capture_accepts_fitting_content(tmp_path) -> None:
     )
 
     assert (tmp_path / "artifacts" / "poster.png").exists()
+
+
+def test_poster_capture_uses_named_poster_layout_script(tmp_path) -> None:
+    module = _capture_module()
+    scripts = []
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "poster.html").write_text("<html><body>poster</body></html>")
+    (tmp_path / "artifacts").mkdir()
+
+    module.capture(
+        tmp_path,
+        playwright_factory=_poster_capture_factory([], scripts),
+        width=1080,
+        height=1350,
+        artifact="poster.html",
+    )
+
+    assert scripts == [module.POSTER_LAYOUT_SCRIPT]
 
 
 @pytest.mark.parametrize(

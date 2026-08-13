@@ -6,6 +6,112 @@ import time
 from pathlib import Path
 
 
+POSTER_LAYOUT_SCRIPT = """() => {
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
+  const tolerance = 1;
+  const candidates = new Set([
+    document.documentElement,
+    document.body,
+    ...document.querySelectorAll(
+      "canvas, [data-poster-root], [data-poster-canvas], "
+        + "#poster, .poster, #poster-root, .poster-root, "
+        + "#poster-canvas, .poster-canvas, #canvas, .canvas"
+    ),
+  ]);
+  for (const element of document.querySelectorAll("*")) {
+    if ((element.innerText || "").trim()) candidates.add(element);
+  }
+  const bounds = {
+    left: 0,
+    top: 0,
+    right: viewportWidth,
+    bottom: viewportHeight,
+  };
+  for (const element of candidates) {
+    const rect = element.getBoundingClientRect();
+    if (!rect.width && !rect.height) continue;
+    bounds.left = Math.min(bounds.left, rect.left);
+    bounds.top = Math.min(bounds.top, rect.top);
+    bounds.right = Math.max(bounds.right, rect.right);
+    bounds.bottom = Math.max(bounds.bottom, rect.bottom);
+  }
+  const horizontal = Math.max(
+    0,
+    bounds.left < -tolerance
+      ? -bounds.left
+      : bounds.right - viewportWidth > tolerance
+        ? bounds.right - viewportWidth
+        : 0,
+  );
+  const vertical = Math.max(
+    0,
+    bounds.top < -tolerance
+      ? -bounds.top
+      : bounds.bottom - viewportHeight > tolerance
+        ? bounds.bottom - viewportHeight
+        : 0,
+  );
+  const errors = [];
+  if (horizontal > tolerance) {
+    const amount = Math.round(horizontal * 100) / 100;
+    errors.push({
+      kind: "poster-overflow",
+      axis: "horizontal",
+      overflow: amount,
+      message: `poster overflow: horizontal by ${amount} CSS pixels`,
+    });
+  }
+  if (vertical > tolerance) {
+    const amount = Math.round(vertical * 100) / 100;
+    errors.push({
+      kind: "poster-overflow",
+      axis: "vertical",
+      message: `poster overflow: vertical by ${amount} CSS pixels`,
+      overflow: amount,
+    });
+  }
+  return errors;
+}"""
+
+WEBSITE_LAYOUT_SCRIPT = """() => {
+  const errors = [];
+  const viewport = document.documentElement.clientWidth;
+  if (document.documentElement.scrollWidth > viewport + 1) {
+    errors.push({
+      kind: "document-overflow",
+      scrollWidth: document.documentElement.scrollWidth,
+      viewportWidth: viewport,
+    });
+  }
+  for (const element of document.querySelectorAll(
+    "h1,h2,h3,h4,p,button,a,li,span"
+  )) {
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    const text = (element.innerText || "").trim();
+    if (!text || style.visibility === "hidden") continue;
+    if (
+      element.scrollWidth > element.clientWidth + 1 ||
+      rect.left < -1 ||
+      rect.right > viewport + 1
+    ) {
+      errors.push({
+        kind: "text-overflow",
+        tag: element.tagName.toLowerCase(),
+        text: text.slice(0, 160),
+        left: Math.round(rect.left),
+        right: Math.round(rect.right),
+        elementWidth: Math.round(rect.width),
+        scrollWidth: element.scrollWidth,
+        clientWidth: element.clientWidth,
+      });
+    }
+  }
+  return errors.slice(0, 50);
+}"""
+
+
 def _serve_export(workspace: Path) -> subprocess.Popen[bytes]:
     export = workspace / "out"
     if not export.is_dir():
@@ -104,100 +210,12 @@ def capture(
                                     "text": body_text[:2000],
                                 }
                             )
-                        layout_errors = page.evaluate(
-                            """() => {
-                              const viewportWidth = window.innerWidth;
-                              const viewportHeight = window.innerHeight;
-                              const tolerance = 1;
-                              const bounds = {
-                                left: 0,
-                                top: 0,
-                                right: viewportWidth,
-                                bottom: viewportHeight,
-                              };
-                              for (const element of document.querySelectorAll("*")) {
-                                const rect = element.getBoundingClientRect();
-                                if (!rect.width && !rect.height) continue;
-                                bounds.left = Math.min(bounds.left, rect.left);
-                                bounds.top = Math.min(bounds.top, rect.top);
-                                bounds.right = Math.max(bounds.right, rect.right);
-                                bounds.bottom = Math.max(bounds.bottom, rect.bottom);
-                              }
-                              const horizontal = Math.max(
-                                0,
-                                bounds.left < -tolerance
-                                  ? -bounds.left
-                                  : bounds.right - viewportWidth > tolerance
-                                    ? bounds.right - viewportWidth
-                                    : 0,
-                              );
-                              const vertical = Math.max(
-                                0,
-                                bounds.top < -tolerance
-                                  ? -bounds.top
-                                  : bounds.bottom - viewportHeight > tolerance
-                                    ? bounds.bottom - viewportHeight
-                                    : 0,
-                              );
-                              const errors = [];
-                              if (horizontal > tolerance) {
-                                const amount = Math.round(horizontal * 100) / 100;
-                                errors.push({
-                                  kind: "poster-overflow",
-                                  axis: "horizontal",
-                                  overflow: amount,
-                                  message: `poster overflow: horizontal by ${amount} CSS pixels`,
-                                });
-                              }
-                              if (vertical > tolerance) {
-                                const amount = Math.round(vertical * 100) / 100;
-                                errors.push({
-                                  kind: "poster-overflow",
-                                  axis: "vertical",
-                                  message: `poster overflow: vertical by ${amount} CSS pixels`,
-                                  overflow: amount,
-                                });
-                              }
-                              return errors;
-                            }"""
+                        layout_script = (
+                            POSTER_LAYOUT_SCRIPT
                             if artifact is not None
-                            else """() => {
-                              const errors = [];
-                              const viewport = document.documentElement.clientWidth;
-                              if (document.documentElement.scrollWidth > viewport + 1) {
-                                errors.push({
-                                  kind: "document-overflow",
-                                  scrollWidth: document.documentElement.scrollWidth,
-                                  viewportWidth: viewport,
-                                });
-                              }
-                              for (const element of document.querySelectorAll(
-                                "h1,h2,h3,h4,p,button,a,li,span"
-                              )) {
-                                const rect = element.getBoundingClientRect();
-                                const style = getComputedStyle(element);
-                                const text = (element.innerText || "").trim();
-                                if (!text || style.visibility === "hidden") continue;
-                                if (
-                                  element.scrollWidth > element.clientWidth + 1 ||
-                                  rect.left < -1 ||
-                                  rect.right > viewport + 1
-                                ) {
-                                  errors.push({
-                                    kind: "text-overflow",
-                                    tag: element.tagName.toLowerCase(),
-                                    text: text.slice(0, 160),
-                                    left: Math.round(rect.left),
-                                    right: Math.round(rect.right),
-                                    elementWidth: Math.round(rect.width),
-                                    scrollWidth: element.scrollWidth,
-                                    clientWidth: element.clientWidth,
-                                  });
-                                }
-                              }
-                              return errors.slice(0, 50);
-                            }"""
+                            else WEBSITE_LAYOUT_SCRIPT
                         )
+                        layout_errors = page.evaluate(layout_script)
                         browser_errors.extend(
                             {
                                 "kind": "layout",
