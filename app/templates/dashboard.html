@@ -54,4 +54,12 @@
   updatePosterOptions();
 })();
 </script>
+{% if brand_profile %}
+<form method="post" action="/brand-profile/remove">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="namespace" value="{{ namespace }}">
+  <button class="forget-button" type="submit">Remove brand profile</button>
+  <span class="panel-meta">The removal is recorded in profile history.</span>
+</form>
+{% endif %}
 {% endblock %}

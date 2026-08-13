@@ -180,3 +180,53 @@ async def save_brand_profile(
         },
     )
     return _profile_from_row(result.mappings().one())
+
+
+async def remove_brand_profile(
+    session: AsyncSession, namespace: str, *, actor: str
+) -> bool:
+    namespace = normalize_namespace(namespace)
+    result = await session.execute(
+        application_only_sql(
+            text(
+                "SELECT namespace, brand_colors, typography, poster_formats, "
+                "audience, voice, do_not_use, updated_by, updated_at "
+                "FROM brand_profiles WHERE namespace = :namespace"
+            )
+        ),
+        {"namespace": namespace},
+    )
+    row = result.mappings().one_or_none()
+    if row is None:
+        return False
+    profile = _profile_from_row(row)
+    snapshot = json.dumps(
+        {
+            "action": "removed",
+            "brand_colors": list(profile.brand_colors),
+            "typography": profile.typography,
+            "poster_formats": list(profile.poster_formats),
+            "audience": profile.audience,
+            "voice": profile.voice,
+            "do_not_use": list(profile.do_not_use),
+            "updated_by": profile.updated_by,
+            "updated_at": profile.updated_at.isoformat(),
+        }
+    )
+    await session.execute(
+        application_only_sql(
+            text(
+                "INSERT INTO brand_profile_history "
+                "(namespace, profile, changed_by) VALUES "
+                "(:namespace, CAST(:profile AS jsonb), :actor)"
+            )
+        ),
+        {"namespace": namespace, "profile": snapshot, "actor": actor},
+    )
+    await session.execute(
+        application_only_sql(
+            text("DELETE FROM brand_profiles WHERE namespace = :namespace")
+        ),
+        {"namespace": namespace},
+    )
+    return True

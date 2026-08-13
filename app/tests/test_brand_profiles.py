@@ -10,6 +10,7 @@ from testcontainers.postgres import PostgresContainer
 from chitti.brand_profiles import (
     available_font_families,
     get_brand_profile,
+    remove_brand_profile,
     save_brand_profile,
     validate_font_family,
 )
@@ -85,6 +86,26 @@ async def test_shared_profile_is_visible_like_shared_memory(database) -> None:
         profile = await get_brand_profile(session, "vsports")
         assert profile is not None
         assert profile.namespace == "general"
+
+
+@pytest.mark.asyncio
+async def test_removing_profile_preserves_attributable_history(database) -> None:
+    font = available_font_families()[0]
+    async with database.begin() as session:
+        await save_brand_profile(session, "general", actor="owner", **profile_values(font))
+        assert await remove_brand_profile(session, "general", actor="owner") is True
+        assert await get_brand_profile(session, "general") is None
+        history = await session.execute(
+            text(
+                "SELECT profile->>'action' AS action, profile->>'voice' AS voice, "
+                "changed_by FROM brand_profile_history "
+                "WHERE namespace = 'general' ORDER BY id"
+            )
+        )
+        rows = history.mappings().all()
+        assert rows[-1]["action"] == "removed"
+        assert rows[-1]["voice"] == "Warm, direct, and confident."
+        assert rows[-1]["changed_by"] == "owner"
 
 
 def test_typography_must_be_present_in_the_offline_manifest() -> None:

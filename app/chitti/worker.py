@@ -618,7 +618,7 @@ class DockerSandboxDispatcher:
                 )),
             )
             beliefs = [dict(row._mapping) for row in result]
-        stable = _model_system_prompt(policy, brand_profile)
+        stable = _model_system_prompt(policy, brand_profile, job_config)
         spent = 0.0
         spent_tokens = 0
         calls = 0
@@ -1298,21 +1298,10 @@ class DockerSandboxDispatcher:
             width = int(cast(int, arguments.get("width", 390)))
             height = int(cast(int, arguments.get("height", 900)))
             scale = int(cast(int, arguments.get("scale", 1)))
-            if not route_value.startswith("/"):
-                raise ValueError("invalid screenshot route or width")
+            _validate_screenshot_request(
+                policy, route_value, width, height, scale, job_config
+            )
             if policy.is_poster:
-                approved = poster_config(job_config)
-                if (
-                    width > int(cast(int, approved["width"]))
-                    or height > int(cast(int, approved["height"]))
-                    or scale > int(cast(int, approved["scale"]))
-                ):
-                    raise ValueError(
-                        "poster screenshot exceeds approved capture: "
-                        f"requested {width}x{height} at scale {scale}, "
-                        f"approved {approved['width']}x{approved['height']} "
-                        f"at scale {approved['scale']}"
-                    )
                 requested = poster_config(
                     {**job_config, "width": width, "height": height, "scale": scale}
                 )
@@ -1326,8 +1315,6 @@ class DockerSandboxDispatcher:
                     + "--poster"
                 )
             else:
-                if width not in {390, 1440} or height != 900 or scale != 1:
-                    raise ValueError("website screenshots only support 390x900 and 1440x900")
                 capture_command = "python3 /opt/next_screenshot.py"
             operation = FixedOperation(
                 task_id, "capture-screenshot", ("sh", "-c", capture_command)
@@ -2867,13 +2854,65 @@ def _message_units(messages: list[dict[str, object]]) -> list[list[dict[str, obj
     return units
 
 
+def _validate_screenshot_request(
+    policy: JobTypePolicy,
+    route: str,
+    width: int,
+    height: int,
+    scale: int,
+    job_config: dict[str, object],
+) -> None:
+    if policy.is_poster:
+        _validate_poster_screenshot_request(width, height, scale, job_config)
+        return
+    if not route.startswith("/"):
+        raise ValueError(f"invalid screenshot route: {route}")
+    if width not in {390, 1440}:
+        raise ValueError(
+            f"invalid screenshot width: {width}; "
+            "website screenshots only support 390 or 1440"
+        )
+    if height != 900:
+        raise ValueError(
+            f"invalid screenshot height: {height}; "
+            "website screenshots require height 900"
+        )
+    if scale != 1:
+        raise ValueError(
+            f"invalid screenshot scale: {scale}; "
+            "website screenshots require scale 1"
+        )
+
+
+def _validate_poster_screenshot_request(
+    width: int,
+    height: int,
+    scale: int,
+    job_config: dict[str, object],
+) -> None:
+    approved = poster_config(job_config)
+    if (
+        width > int(cast(int, approved["width"]))
+        or height > int(cast(int, approved["height"]))
+        or scale > int(cast(int, approved["scale"]))
+    ):
+        raise ValueError(
+            "poster screenshot exceeds approved capture: "
+            f"requested {width}x{height} at scale {scale}, "
+            f"approved {approved['width']}x{approved['height']} "
+            f"at scale {approved['scale']}"
+        )
+
+
 def _model_system_prompt(
     policy: JobTypePolicy = WEBSITE_POLICY,
     profile: object | None = None,
+    job_config: dict[str, object] | None = None,
 ) -> str:
     if policy.is_poster:
         profile_data = getattr(profile, "__dict__", {})
         manifest = "\n".join(available_font_families()) or "(empty)"
+        approved = poster_config(job_config or {})
         return (
             "You are producing one offline poster artifact, not a website. "
             "Write only HTML, CSS, and SVG; do not use npm, package.json, lockfiles, "
@@ -2888,8 +2927,12 @@ def _model_system_prompt(
             "authoritative and must be reflected exactly; do not invent colours, voice, "
             "audience, or typography. Create the declared artifact under out/ and an "
             "out/index.html entry that renders it for the cage capture. Run "
-            "poster-export, then capture_screenshot with the declared dimensions and "
-            "device scale. The reviewer can inspect source facts and dimensions, not "
+            "poster-export, then capture_screenshot using exactly the approved poster "
+            f"artifact {approved['artifact']} at width {approved['width']}, height "
+            f"{approved['height']}, and device scale {approved['scale']}. These "
+            "capture numbers are binding; do not raise the scale. A poster capture "
+            "does not need a route argument. The reviewer can inspect source facts "
+            "and dimensions, not "
             "visual quality, which requires owner approval.\n"
             f"BRAND PROFILE:\n{json.dumps(profile_data, default=str)}"
         )
