@@ -12,5 +12,6 @@ COPY app/chitti ./chitti
 COPY alembic /app/alembic
 COPY profile /app/profile
 COPY projects /app/projects
+COPY sandbox/available_fonts.txt /app/sandbox/available_fonts.txt
 COPY app/templates /app/templates
 CMD ["uvicorn", "chitti.main:app", "--host", "0.0.0.0", "--port", "8000"]

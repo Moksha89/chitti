@@ -10,5 +10,11 @@ RUN groupadd --gid 65532 worker && useradd --uid 65532 --gid 65532 --create-home
 COPY screenshot.py /opt/screenshot.py
 COPY next_screenshot.py /opt/next_screenshot.py
 COPY fixture /opt/fixture
+COPY available_fonts.txt /opt/available_fonts.txt
+
+RUN set -eu; while IFS= read -r family; do \
+      test -z "$family" || fc-match --format='%{family}\n' "$family" | tr ',' '\n' | grep -Fqx "$family"; \
+    done < /opt/available_fonts.txt
+
 USER 65532:65532
 WORKDIR /workspace
