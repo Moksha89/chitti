@@ -1,19 +1,17 @@
 from __future__ import annotations
 
+import ast
 import re
 from importlib import import_module
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
-RUNNER_ACCESS_MODULES = (
-    "chitti.runner",
-    "chitti.worker",
-    "chitti.reminders",
-    "chitti.runner_health",
-)
+RUNNER_ENTRYPOINT = "chitti.runner"
 RUNNER_ACCESS_EXCLUSIONS = {
     # These helpers also serve the application process, but the runner never
     # calls their application-only mutation paths.
+    ("brand_profiles", "INSERT"),
     ("worker_runs", "INSERT"),
     ("reminders", "INSERT"),
     ("reminders", "UPDATE"),
@@ -64,6 +62,79 @@ def required_privileges(
     return privileges
 
 
+def _imported_local_modules(module_name: str, source: str) -> set[str]:
+    tree = ast.parse(source)
+    package = module_name.rpartition(".")[0]
+    prefix = module_name.split(".", 1)[0]
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(
+                alias.name
+                for alias in node.names
+                if alias.name == prefix or alias.name.startswith(f"{prefix}.")
+            )
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = package.split(".")
+                if node.level > len(base) + 1:
+                    continue
+                base = base[: len(base) + 1 - node.level]
+                module = ".".join(base + ([node.module] if node.module else []))
+            else:
+                module = node.module or ""
+            if not module or not (
+                module == prefix or module.startswith(f"{prefix}.")
+            ):
+                continue
+            imported.add(module)
+            if node.module is None:
+                imported.update(
+                    f"{module}.{alias.name}"
+                    for alias in node.names
+                    if alias.name != "*"
+                )
+    return imported
+
+
+def runner_source_texts(entrypoint: str = RUNNER_ENTRYPOINT) -> list[str]:
+    """Read every local Python module reachable from the runner entrypoint."""
+    pending = [entrypoint]
+    visited: set[str] = set()
+    sources: list[str] = []
+    while pending:
+        module_name = pending.pop()
+        if module_name in visited:
+            continue
+        visited.add(module_name)
+        try:
+            module = import_module(module_name)
+        except Exception as exc:
+            raise SystemExit(
+                f"runner privilege source is not importable: {module_name}"
+            ) from exc
+        module_file = getattr(module, "__file__", None)
+        if not module_file:
+            raise SystemExit(f"runner privilege source has no file: {module_name}")
+        try:
+            source = Path(module_file).resolve().read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(
+                f"runner privilege source cannot be read: {module_name}"
+            ) from exc
+        if not source.strip():
+            raise SystemExit(f"runner privilege source is empty: {module_name}")
+        sources.append(source)
+        for imported_name in _imported_local_modules(module_name, source):
+            try:
+                spec = find_spec(imported_name)
+            except (ImportError, ModuleNotFoundError, ValueError):
+                continue
+            if spec is not None and spec.origin and spec.origin.endswith(".py"):
+                pending.append(imported_name)
+    return sources
+
+
 async def owned_sequences(conn: Any, table: str) -> list[str]:
     try:
         columns = await conn.fetch(
@@ -104,36 +175,13 @@ async def assert_runner_privileges(
             "WHERE table_schema = 'public'"
         )
     }
-    loaded_runtime_sources = source_texts is None
-    if loaded_runtime_sources:
-        source_texts = []
-        for module_name in RUNNER_ACCESS_MODULES:
-            try:
-                module = import_module(module_name)
-            except Exception as exc:
-                raise SystemExit(
-                    f"runner privilege source is not importable: {module_name}"
-                ) from exc
-            module_file = getattr(module, "__file__", None)
-            if not module_file:
-                raise SystemExit(
-                    f"runner privilege source has no file: {module_name}"
-                )
-            try:
-                source = Path(module_file).resolve().read_text(encoding="utf-8")
-            except OSError as exc:
-                raise SystemExit(
-                    f"runner privilege source cannot be read: {module_name}"
-                ) from exc
-            if not source.strip():
-                raise SystemExit(f"runner privilege source is empty: {module_name}")
-            source_texts.append(source)
-    assert source_texts is not None
-    if loaded_runtime_sources and len(source_texts) != len(RUNNER_ACCESS_MODULES):
-        raise SystemExit("runner privilege source derivation is incomplete")
+    if source_texts is None:
+        source_texts = runner_source_texts()
+    if not source_texts:
+        raise SystemExit("runner privilege source derivation produced no sources")
     required = required_privileges(source_texts, tables)
-    if len(required) < len(source_texts):
-        raise SystemExit("runner privilege source derivation found too few tables")
+    if not required:
+        raise SystemExit("runner privilege derivation produced no table expectations")
     for table, privileges in required.items():
         for privilege in privileges:
             allowed = await conn.fetchval(
@@ -164,3 +212,12 @@ async def assert_runner_privileges(
                 "runner unexpectedly has sequence usage on "
                 f"{worker_runs_sequence}"
             )
+    if "brand_profiles" in tables:
+        for privilege in ("INSERT", "UPDATE", "DELETE"):
+            if await conn.fetchval(
+                "SELECT has_table_privilege(current_user, 'brand_profiles', $1)",
+                privilege,
+            ):
+                raise SystemExit(
+                    f"runner unexpectedly has {privilege} on brand_profiles"
+                )

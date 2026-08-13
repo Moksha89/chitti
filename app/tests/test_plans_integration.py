@@ -1094,3 +1094,52 @@ async def test_runner_privilege_assertion_handles_non_id_primary_key(database):
         await admin.execute(f'DROP OWNED BY "{role}"')
         await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
         await admin.close()
+
+
+async def test_runner_brand_profile_access_is_read_only(database):
+    database_url = database.url.render_as_string(hide_password=False).replace(
+        "postgresql+asyncpg://", "postgresql://"
+    )
+    parsed = urlsplit(database_url)
+    admin = await asyncpg.connect(database_url)
+    role = f"runner_brand_{uuid.uuid4().hex[:12]}"
+    password = uuid.uuid4().hex
+    try:
+        await admin.execute(f'CREATE ROLE "{role}" LOGIN PASSWORD \'{password}\'')
+        await admin.execute(
+            f'GRANT CONNECT ON DATABASE "{parsed.path.lstrip("/")}" TO "{role}"'
+        )
+        await admin.execute(f'GRANT USAGE ON SCHEMA public TO "{role}"')
+        await admin.execute(
+            f'GRANT SELECT, INSERT ON brand_profiles TO "{role}"'
+        )
+        runner_database_url = urlunsplit(
+            (
+                parsed.scheme,
+                f"{role}:{password}@{parsed.hostname}:{parsed.port}",
+                parsed.path,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+        connection = await asyncpg.connect(runner_database_url)
+        try:
+            with pytest.raises(
+                SystemExit, match="runner unexpectedly has INSERT on brand_profiles"
+            ):
+                await assert_runner_privileges(
+                    connection,
+                    ["SELECT namespace FROM brand_profiles"],
+                )
+            await admin.execute(f'REVOKE INSERT ON brand_profiles FROM "{role}"')
+            await assert_runner_privileges(connection, ["SELECT namespace FROM brand_profiles"])
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await connection.execute(
+                    "DELETE FROM brand_profiles WHERE namespace = 'general'"
+                )
+        finally:
+            await connection.close()
+    finally:
+        await admin.execute(f'DROP OWNED BY "{role}"')
+        await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
+        await admin.close()
