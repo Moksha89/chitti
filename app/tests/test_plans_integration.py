@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.postgres import PostgresContainer
 
 from chitti.briefings import compose_briefing
+from chitti.db import Database
 from chitti.main import record_promotion_approval
 from chitti.notifications import (
     acknowledge_notification,
@@ -54,6 +55,7 @@ from chitti.runner_health import (
     record_runner_health_failure,
     record_runner_health_success,
 )
+from chitti.settings import Settings
 from chitti.transcripts import append_entry, recent_entries
 from chitti.worker import (
     MAX_CAPTURE_ARTIFACTS_PER_RUN,
@@ -1183,6 +1185,52 @@ async def test_runner_brand_profile_access_is_read_only(database):
         finally:
             await connection.close()
     finally:
+        await admin.execute(f'DROP OWNED BY "{role}"')
+        await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
+        await admin.close()
+
+
+async def test_runner_health_upsert_requires_update_privilege(database):
+    database_url = database.url.render_as_string(hide_password=False).replace(
+        "postgresql+asyncpg://", "postgresql://"
+    )
+    parsed = urlsplit(database_url)
+    admin = await asyncpg.connect(database_url)
+    role = f"runner_health_{uuid.uuid4().hex[:12]}"
+    password = uuid.uuid4().hex
+    component = f"test_{uuid.uuid4().hex[:8]}"
+    try:
+        await admin.execute(f'CREATE ROLE "{role}" LOGIN PASSWORD \'{password}\'')
+        await admin.execute(
+            f'GRANT CONNECT ON DATABASE "{parsed.path.lstrip("/")}" TO "{role}"'
+        )
+        await admin.execute(f'GRANT USAGE ON SCHEMA public TO "{role}"')
+        await admin.execute(
+            f"INSERT INTO runner_health "
+            f"(component, status, detail, first_failed_at, last_failed_at, "
+            f"consecutive_failures, resolved_at, last_succeeded_at) "
+            f"VALUES ('{component}', 'failed', 'seed', now(), now(), 1, NULL, NULL)"
+        )
+        await admin.execute(f'GRANT INSERT, SELECT ON runner_health TO "{role}"')
+        role_url = urlunsplit(
+            (
+                "postgresql+asyncpg",
+                f"{role}:{password}@{parsed.hostname}:{parsed.port}",
+                parsed.path,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+        role_database = Database(Settings(database_url=role_url))
+        try:
+            with pytest.raises(DBAPIError):
+                await record_runner_health_success(role_database, component)
+            await admin.execute(f'GRANT UPDATE ON runner_health TO "{role}"')
+            await record_runner_health_success(role_database, component)
+        finally:
+            await role_database.close()
+    finally:
+        await admin.execute(f"DELETE FROM runner_health WHERE component = '{component}'")
         await admin.execute(f'DROP OWNED BY "{role}"')
         await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
         await admin.close()

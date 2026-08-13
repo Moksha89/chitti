@@ -174,6 +174,39 @@ def test_runner_access_rejects_sensitive_read_before_granting() -> None:
         )
 
 
+def test_runner_access_accounts_for_upsert_and_returning_privileges() -> None:
+    assert required_privileges(
+        [
+            (
+                "INSERT INTO runner_health (component) VALUES ('sweep') "
+                "ON CONFLICT (component) DO UPDATE SET status = EXCLUDED.status "
+                "RETURNING component"
+            )
+        ],
+        {"runner_health"},
+    ) == {"runner_health": {"INSERT", "SELECT", "UPDATE"}}
+
+
+def test_runner_access_accounts_for_unaliased_for_update() -> None:
+    assert required_privileges(
+        ["SELECT id FROM worker_runs FOR UPDATE"],
+        {"worker_runs"},
+    ) == {"worker_runs": {"SELECT", "UPDATE"}}
+
+
+def test_runner_access_accounts_for_delete_using() -> None:
+    assert required_privileges(
+        [
+            "DELETE FROM worker_artifacts USING worker_operations "
+            "WHERE worker_artifacts.operation_id = worker_operations.id"
+        ],
+        {"worker_artifacts", "worker_operations"},
+    ) == {
+        "worker_artifacts": {"DELETE"},
+        "worker_operations": {"SELECT"},
+    }
+
+
 def test_runner_access_fails_when_required_grant_is_missing() -> None:
     class Connection:
         async def fetch(self, _query):

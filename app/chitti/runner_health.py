@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy import text
 
 from .db import Database
+from .runner_access import runner_sql
 
 
 async def record_runner_health_failure(
@@ -10,7 +11,7 @@ async def record_runner_health_failure(
 ) -> None:
     async with database.sessions() as session:
         await session.execute(
-            text(
+            runner_sql(text(
                 "INSERT INTO runner_health "
                 "(component, status, detail, first_failed_at, last_failed_at, "
                 "consecutive_failures, resolved_at) "
@@ -20,7 +21,7 @@ async def record_runner_health_failure(
                 "last_failed_at = EXCLUDED.last_failed_at, "
                 "consecutive_failures = runner_health.consecutive_failures + 1, "
                 "resolved_at = NULL"
-            ),
+            )),
             {"component": component, "detail": detail[:2000]},
         )
         await session.commit()
@@ -33,7 +34,7 @@ async def clear_runner_health(database: Database, component: str) -> None:
 async def record_runner_health_success(database: Database, component: str) -> None:
     async with database.sessions() as session:
         await session.execute(
-            text(
+            runner_sql(text(
                 "INSERT INTO runner_health "
                 "(component, status, detail, first_failed_at, last_failed_at, "
                 "consecutive_failures, resolved_at, last_succeeded_at) "
@@ -43,7 +44,7 @@ async def record_runner_health_success(database: Database, component: str) -> No
                 "status = 'healthy', detail = 'reminder sweep completed', "
                 "consecutive_failures = 0, resolved_at = now(), "
                 "last_succeeded_at = now()"
-            ),
+            )),
             {"component": component},
         )
         await session.commit()

@@ -13,9 +13,24 @@ _TABLE_REFERENCE = re.compile(
     re.IGNORECASE,
 )
 _FOR_UPDATE = re.compile(r"\bFOR\s+UPDATE\s+OF\s+([a-z_][a-z0-9_]*)", re.IGNORECASE)
+_FOR_UPDATE_TABLE = re.compile(
+    r"\bFROM\s+([a-z_][a-z0-9_]*)(?:\s+[a-z_][a-z0-9_]*)?\s+FOR\s+UPDATE\b",
+    re.IGNORECASE,
+)
 _TABLE_ALIAS = re.compile(
     r"\bFROM\s+([a-z_][a-z0-9_]*)\s+([a-z_][a-z0-9_]*)", re.IGNORECASE
 )
+_WRITE_TARGET = re.compile(
+    r"\b(?:INSERT\s+INTO|(?<!DO )UPDATE|DELETE\s+FROM)\s+"
+    r"([a-z_][a-z0-9_]*)\b",
+    re.IGNORECASE,
+)
+_DELETE_USING = re.compile(
+    r"\bDELETE\s+FROM\s+[a-z_][a-z0-9_]*\s+USING\s+"
+    r"([a-z_][a-z0-9_]*)",
+    re.IGNORECASE,
+)
+_RETURNING = re.compile(r"\bRETURNING\b", re.IGNORECASE)
 _WRITE_PRIVILEGES = frozenset({"INSERT", "UPDATE", "DELETE"})
 SENSITIVE_RUNNER_TABLES = frozenset(
     {
@@ -96,6 +111,23 @@ def _scan_privileges(
             known_tables is None or table in known_tables
         ):
             privileges.setdefault(table, set()).add("UPDATE")
+    for match in _FOR_UPDATE_TABLE.finditer(source):
+        privileges.setdefault(match.group(1).lower(), set()).add("UPDATE")
+    write_targets = list(_WRITE_TARGET.finditer(source))
+    for index, match in enumerate(write_targets):
+        end = (
+            write_targets[index + 1].start()
+            if index + 1 < len(write_targets)
+            else len(source)
+        )
+        statement = source[match.start() : end]
+        table = match.group(1).lower()
+        if _RETURNING.search(statement):
+            privileges.setdefault(table, set()).add("SELECT")
+        if re.search(r"\bON\s+CONFLICT\b[\s\S]*?\bDO\s+UPDATE\b", statement, re.I):
+            privileges.setdefault(table, set()).add("UPDATE")
+    for match in _DELETE_USING.finditer(source):
+        privileges.setdefault(match.group(1).lower(), set()).add("SELECT")
     return privileges
 
 
