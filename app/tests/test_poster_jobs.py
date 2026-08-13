@@ -96,7 +96,17 @@ async def test_poster_job_config_persists_only_declared_configuration(monkeypatc
 
 
 async def _approved_revision(*_args, **_kwargs) -> SimpleNamespace:
-    return SimpleNamespace(id=7, namespace="pj-digi")
+    return SimpleNamespace(
+        id=7,
+        namespace="pj-digi",
+        job_type="poster",
+        job_config={
+            "artifact": "campaign/poster.svg",
+            "width": 1200,
+            "height": 628,
+            "scale": 2,
+        },
+    )
 
 
 async def _missing_profile(*_args, **_kwargs):

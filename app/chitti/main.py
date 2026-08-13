@@ -32,6 +32,7 @@ from .briefings import compose_briefing
 from .db import Database
 from .diff_parser import parse_diff as _parse_diff
 from .embedding import FakeEmbedder, get_embedder
+from .job_types import normalize_job_type, poster_config, poster_config_within_ceiling
 from .memory import (
     MemoryStore,
     namespace_options,
@@ -84,6 +85,8 @@ class ChatRequest(BaseModel):
     plan_requested: bool = False
     history: list[dict[str, str]] = Field(default_factory=list)
     run_id: int | None = None
+    job_type: str = "website"
+    poster_config: dict[str, object] | None = None
 
 
 def build_service(settings: Settings) -> ChittiService:
@@ -1291,13 +1294,36 @@ async def start_run(revision_id: int, request: Request) -> RedirectResponse:
     form = await request.form()
     require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
     namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
-    job_type = str(form.get("job_type", "website"))
-    job_config = {
-        "artifact": str(form.get("poster_artifact", "poster.html")),
-        "width": str(form.get("poster_width", "1080")),
-        "height": str(form.get("poster_height", "1350")),
-        "scale": str(form.get("poster_scale", "1")),
-    }
+    async with request.app.state.database.sessions() as db_session:
+        revision = await revision_by_id(db_session, revision_id, namespace)
+    if revision is None:
+        raise HTTPException(status_code=404, detail="plan revision not found")
+    try:
+        job_type = normalize_job_type(str(form.get("job_type", revision.job_type)))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if job_type != revision.job_type:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "run job type does not match approved plan revision: "
+                f"submitted {job_type}, approved {revision.job_type}"
+            ),
+        )
+    if job_type == "poster":
+        approved = revision.job_config or poster_config(None)
+        raw_config = {
+            "artifact": str(form.get("poster_artifact", approved["artifact"])),
+            "width": str(form.get("poster_width", approved["width"])),
+            "height": str(form.get("poster_height", approved["height"])),
+            "scale": str(form.get("poster_scale", approved["scale"])),
+        }
+        try:
+            job_config = poster_config_within_ceiling(raw_config, approved)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        job_config = {}
     manager: WorkerRunManager = request.app.state.worker_manager
     try:
         run_id = await manager.enqueue(
@@ -1460,6 +1486,8 @@ async def reject_plan(revision_id: int, request: Request) -> RedirectResponse:
         revision_id,
         reason,
         revision.namespace,
+        revision.job_type,
+        revision.job_config,
     )
     return RedirectResponse("/", status_code=303)
 
@@ -1533,9 +1561,22 @@ async def chat(payload: ChatRequest, request: Request) -> dict[str, object]:
     reply = result.reply
     if plan_project:
         manager: PlanManager = request.app.state.plan_manager
-        plan_job_id = await manager.enqueue(
-            plan_project, payload.message, namespace=namespace
-        )
+        try:
+            job_type = normalize_job_type(payload.job_type)
+            job_config = (
+                poster_config(payload.poster_config)
+                if job_type == "poster"
+                else {}
+            )
+            plan_job_id = await manager.enqueue(
+                plan_project,
+                payload.message,
+                namespace=namespace,
+                job_type=job_type,
+                job_config=job_config,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         reply += (
             "\n\nI created a plan draft for "
             f"{plan_project}. It is waiting for your approval; nothing will execute."
