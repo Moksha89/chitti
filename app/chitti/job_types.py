@@ -75,3 +75,36 @@ def poster_config(value: object) -> dict[str, object]:
 
 def config_json(value: object) -> str:
     return json.dumps(poster_config(value), separators=(",", ":"))
+
+
+def poster_config_within_ceiling(
+    requested: object,
+    approved: object,
+) -> dict[str, object]:
+    requested_config = poster_config(requested)
+    approved_config = poster_config(approved)
+    requested_width = int(str(requested_config["width"]))
+    requested_height = int(str(requested_config["height"]))
+    requested_scale = int(str(requested_config["scale"]))
+    approved_width = int(str(approved_config["width"]))
+    approved_height = int(str(approved_config["height"]))
+    approved_scale = int(str(approved_config["scale"]))
+    if requested_config["artifact"] != approved_config["artifact"]:
+        raise ValueError(
+            "poster artifact does not match approved plan: "
+            f"requested {requested_config['artifact']}, "
+            f"approved {approved_config['artifact']}"
+        )
+    if (
+        requested_width > approved_width
+        or requested_height > approved_height
+        or requested_scale > approved_scale
+    ):
+        raise ValueError(
+            "poster format exceeds approved plan: "
+            f"requested {requested_width}x{requested_height} "
+            f"at scale {requested_scale}, "
+            f"approved {approved_width}x{approved_height} "
+            f"at scale {approved_scale}"
+        )
+    return requested_config

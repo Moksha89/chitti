@@ -13,6 +13,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .job_types import (
+    WEBSITE_JOB,
+    config_json,
+    normalize_job_type,
+    poster_config,
+)
 from .memory import normalize_namespace
 from .namespaces import SHARED_NAMESPACE
 from .runner_access import application_only_sql, runner_sql
@@ -100,6 +106,8 @@ class PlanRevision:
     created_at: datetime
     parent_revision_id: int | None
     namespace: str = SHARED_NAMESPACE
+    job_type: str = WEBSITE_JOB
+    job_config: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -125,8 +133,12 @@ async def create_revision(
     document: PlanDocument,
     parent_revision_id: int | None = None,
     namespace: str = SHARED_NAMESPACE,
+    job_type: str = WEBSITE_JOB,
+    job_config: object | None = None,
 ) -> int:
     namespace = normalize_namespace(namespace)
+    job_type = normalize_job_type(job_type)
+    normalized_config = poster_config(job_config) if job_type == "poster" else {}
     content = document.model_dump(mode="json")
     digest = plan_hash(document)
     revision_result = await session.execute(
@@ -140,9 +152,11 @@ async def create_revision(
     result = await session.execute(
         application_only_sql(text(
             "INSERT INTO plan_revisions "
-            "(project, namespace, brief, revision, content, content_hash, parent_revision_id) "
+            "(project, namespace, brief, revision, content, content_hash, parent_revision_id, "
+            "job_type, job_config) "
             "VALUES (:project, :namespace, :brief, :revision, CAST(:content AS jsonb), "
-            ":content_hash, :parent_revision_id) RETURNING id"
+            ":content_hash, :parent_revision_id, :job_type, CAST(:job_config AS jsonb)) "
+            "RETURNING id"
         )),
         {
             "project": project,
@@ -152,6 +166,8 @@ async def create_revision(
             "content": json.dumps(content),
             "content_hash": digest,
             "parent_revision_id": parent_revision_id,
+            "job_type": job_type,
+            "job_config": config_json(normalized_config),
         },
     )
     revision_id = int(result.scalar_one())
@@ -187,14 +203,28 @@ class PlanManager:
         parent_revision_id: int | None = None,
         rejection: str | None = None,
         namespace: str = SHARED_NAMESPACE,
+        job_type: str = WEBSITE_JOB,
+        job_config: object | None = None,
     ) -> int:
         namespace = normalize_namespace(namespace)
+        job_type = normalize_job_type(job_type)
+        normalized_config = poster_config(job_config) if job_type == "poster" else {}
+        if job_type == "poster":
+            from .brand_profiles import get_brand_profile
+
+            async with self.database.sessions() as session:
+                if await get_brand_profile(session, namespace) is None:
+                    raise ValueError(
+                        "poster plan refused: namespace "
+                        f"'{namespace}' has no brand profile yet"
+                    )
         async with self.database.sessions() as session:
             result = await session.execute(
                 application_only_sql(text(
                     "INSERT INTO plan_jobs "
-                    "(project, namespace, brief, parent_revision_id, rejection) "
-                    "VALUES (:project, :namespace, :brief, :parent, :rejection) RETURNING id"
+                    "(project, namespace, brief, parent_revision_id, rejection, job_type, job_config) "
+                    "VALUES (:project, :namespace, :brief, :parent, :rejection, "
+                    ":job_type, CAST(:job_config AS jsonb)) RETURNING id"
                 )),
                 {
                     "project": project,
@@ -202,6 +232,8 @@ class PlanManager:
                     "brief": brief,
                     "parent": parent_revision_id,
                     "rejection": rejection,
+                    "job_type": job_type,
+                    "job_config": config_json(normalized_config),
                 },
             )
             job_id = int(result.scalar_one())
@@ -227,7 +259,8 @@ class PlanManager:
             job = (
                 await session.execute(
                     application_only_sql(text(
-                        "SELECT project, namespace, brief, parent_revision_id, rejection "
+                        "SELECT project, namespace, brief, parent_revision_id, rejection, "
+                        "job_type, job_config "
                         "FROM plan_jobs WHERE id = :id"
                     )),
                     {"id": job_id},
@@ -243,11 +276,19 @@ class PlanManager:
         try:
             async with self.database.sessions() as session:
                 beliefs = await self.memory.active_beliefs(session, str(job["namespace"]))
+                profile = None
+                if str(job["job_type"]) == "poster":
+                    from .brand_profiles import get_brand_profile
+
+                    profile = await get_brand_profile(session, str(job["namespace"]))
             raw = await self.provider.plan(
                 str(job["brief"]),
                 str(job["project"]),
                 beliefs,
                 str(job["rejection"]) if job["rejection"] else None,
+                str(job["job_type"]),
+                job["job_config"],
+                profile,
             )
             match = re.search(r"\{[\s\S]*\}", raw)
             if not match:
@@ -261,6 +302,8 @@ class PlanManager:
                     document,
                     int(job["parent_revision_id"]) if job["parent_revision_id"] else None,
                     str(job["namespace"]),
+                    str(job["job_type"]),
+                    job["job_config"],
                 )
                 await session.execute(
                 application_only_sql(text("UPDATE plan_jobs SET status = 'complete', revision_id = :revision WHERE id = :id")),
@@ -279,7 +322,8 @@ class PlanManager:
         async with self.database.sessions() as session:
             result = await session.execute(
                 application_only_sql(text(
-                    "SELECT id, project, namespace, brief, status, error, revision_id, created_at "
+                    "SELECT id, project, namespace, brief, status, error, revision_id, "
+                    "job_type, job_config, created_at "
                     "FROM plan_jobs WHERE id = :id"
                 )),
                 {"id": job_id},
@@ -295,7 +339,7 @@ async def latest_revisions(
     result = await session.execute(
         application_only_sql(text(
             "SELECT DISTINCT ON (project) id, project, namespace, revision, content, "
-            "content_hash, created_at, parent_revision_id FROM plan_revisions "
+            "content_hash, created_at, parent_revision_id, job_type, job_config FROM plan_revisions "
             "WHERE namespace IN (:namespace, :shared) "
             "ORDER BY project, namespace = :namespace DESC, revision DESC"
         )),
@@ -329,7 +373,7 @@ async def revision_by_id(
     result = await session.execute(
         runner_sql(text(
             "SELECT id, project, namespace, brief, revision, content, content_hash, "
-            "created_at, parent_revision_id FROM plan_revisions "
+            "created_at, parent_revision_id, job_type, job_config FROM plan_revisions "
             "WHERE id = :id AND namespace IN (:namespace, :shared)"
         )),
         {"id": revision_id, "namespace": namespace, "shared": SHARED_NAMESPACE},
@@ -347,6 +391,8 @@ async def revision_by_id(
         content_hash=str(row["content_hash"]),
         created_at=row["created_at"],
         parent_revision_id=int(row["parent_revision_id"]) if row["parent_revision_id"] else None,
+        job_type=normalize_job_type(row["job_type"]),
+        job_config=dict(row["job_config"]) if isinstance(row["job_config"], dict) else json.loads(str(row["job_config"])),
     )
 
 

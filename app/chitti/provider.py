@@ -69,7 +69,14 @@ class ModelProvider(Protocol):
     async def chat(self, system: str, messages: list[dict[str, object]], role: str) -> str: ...
 
     async def plan(
-        self, brief: str, project: str, beliefs: list[dict[str, object]], rejection: str | None = None
+        self,
+        brief: str,
+        project: str,
+        beliefs: list[dict[str, object]],
+        rejection: str | None = None,
+        job_type: str = "website",
+        job_config: object | None = None,
+        brand_profile: object | None = None,
     ) -> str: ...
 
     async def extract_memories(
@@ -273,12 +280,33 @@ class LiteLLMProvider:
         return await self._completion([{"role": "system", "content": system}, *messages], role)
 
     async def plan(
-        self, brief: str, project: str, beliefs: list[dict[str, object]], rejection: str | None = None
+        self,
+        brief: str,
+        project: str,
+        beliefs: list[dict[str, object]],
+        rejection: str | None = None,
+        job_type: str = "website",
+        job_config: object | None = None,
+        brand_profile: object | None = None,
     ) -> str:
         memory = "\n".join(
             f"- {item['decision_key']}: {item['decision']}" for item in beliefs
         ) or "(none)"
         feedback = f"\nREJECTION FEEDBACK:\n{rejection}" if rejection else ""
+        format_text = json.dumps(job_config or {}, default=str)
+        profile_text = json.dumps(
+            getattr(brand_profile, "__dict__", brand_profile or {}),
+            default=str,
+        )
+        work_guidance = (
+            "Plan one offline poster artifact bound to the supplied brand profile. "
+            "Tasks must cover artifact authoring, poster-export, and capture_screenshot; "
+            "do not plan npm, framework, website build, or website test work."
+            if job_type == "poster"
+            else
+            "Plan the requested website delivery using the appropriate implementation, "
+            "build, test, and export tasks."
+        )
         prompt = (
             "Create a delivery plan as strict JSON with exactly these top-level keys: "
             "title, summary, tasks, memory_decisions. Each task must have id, title, "
@@ -286,7 +314,11 @@ class LiteLLMProvider:
             "Tasks must be ordered and independently testable. memory_decisions must list "
             "which supplied beliefs influenced the plan, with decision_key and influence. "
             "Do not include markdown or extra keys.\n"
-            f"PROJECT: {project}\nBRIEF: {brief}\nACTIVE BELIEFS:\n{memory}{feedback}"
+            f"PROJECT: {project}\nJOB TYPE: {job_type}\n"
+            f"APPROVED FORMAT: {format_text}\n"
+            f"NAMESPACE BRAND PROFILE: {profile_text}\n"
+            f"WORK TYPE GUIDANCE: {work_guidance}\n"
+            f"BRIEF: {brief}\nACTIVE BELIEFS:\n{memory}{feedback}"
         )
         return await self._completion(
             [
@@ -351,8 +383,16 @@ class FakeProvider:
         return f"[fake:{role}] I heard you: {latest}"
 
     async def plan(
-        self, brief: str, project: str, beliefs: list[dict[str, object]], rejection: str | None = None
+        self,
+        brief: str,
+        project: str,
+        beliefs: list[dict[str, object]],
+        rejection: str | None = None,
+        job_type: str = "website",
+        job_config: object | None = None,
+        brand_profile: object | None = None,
     ) -> str:
+        poster = job_type == "poster"
         return json.dumps(
             {
                 "title": f"{project}: {brief[:80]}",
@@ -367,15 +407,31 @@ class FakeProvider:
                 "tasks": [
                     {
                         "id": "brief",
-                        "title": "Turn the brief into an implementation checklist",
-                        "description": brief,
+                        "title": (
+                            "Author the offline poster artifact"
+                            if poster
+                            else "Turn the brief into an implementation checklist"
+                        ),
+                        "description": (
+                            f"Create the approved poster artifact: {json.dumps(job_config)}"
+                            if poster
+                            else brief
+                        ),
                         "dependencies": [],
                         "done_condition": "The checklist is explicit, ordered, and testable.",
                     },
                     {
                         "id": "review",
-                        "title": "Review the proposed delivery plan",
-                        "description": "Confirm scope, constraints, and acceptance criteria.",
+                        "title": (
+                            "Export and capture the poster"
+                            if poster
+                            else "Review the proposed delivery plan"
+                        ),
+                        "description": (
+                            "Run poster-export and capture_screenshot using the approved format."
+                            if poster
+                            else "Confirm scope, constraints, and acceptance criteria."
+                        ),
                         "dependencies": ["brief"],
                         "done_condition": "The owner has approved the exact plan revision.",
                     },

@@ -23,6 +23,7 @@ from .job_types import (
     config_json,
     policy_for,
     poster_config,
+    poster_config_within_ceiling,
 )
 from .memory import normalize_namespace
 from .model_tools import model_tool_names, model_tool_schemas
@@ -2412,9 +2413,23 @@ class WorkerRunManager:
         chosen = limits or WorkerLimits()
         namespace = normalize_namespace(namespace)
         policy = policy_for(job_type)
-        normalized_config = poster_config(job_config) if policy.is_poster else {}
         async with self.database.sessions() as session:
             revision = await approved_revision(session, revision_id, namespace)
+            revision_job_type = str(getattr(revision, "job_type", "website"))
+            revision_job_config = getattr(revision, "job_config", {})
+            if policy.name != revision_job_type:
+                raise ValueError(
+                    "run job type does not match approved plan revision: "
+                    f"submitted {policy.name}, approved {revision_job_type}"
+                )
+            normalized_config = (
+                poster_config_within_ceiling(
+                    job_config if job_config is not None else revision_job_config,
+                    revision_job_config,
+                )
+                if policy.is_poster
+                else {}
+            )
             if policy.is_poster:
                 profile = await get_brand_profile(session, revision.namespace)
                 if profile is None:

@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import os
 import shutil
@@ -17,9 +18,12 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.postgres import PostgresContainer
 
+from chitti.brand_profiles import save_brand_profile
 from chitti.briefings import compose_briefing
 from chitti.db import Database
+from chitti.embedding import FakeEmbedder
 from chitti.main import record_promotion_approval
+from chitti.memory import MemoryStore
 from chitti.notifications import (
     acknowledge_notification,
     notifications_after,
@@ -27,6 +31,7 @@ from chitti.notifications import (
 )
 from chitti.plans import (
     PlanDocument,
+    PlanManager,
     PlanTask,
     approve_revision,
     create_revision,
@@ -156,6 +161,72 @@ async def test_plan_project_keeps_namespace_as_a_separate_scope(database) -> Non
         assert revision.project == "animated-3d"
         assert revision.namespace == "pj-digi"
         assert hidden is None
+
+
+async def test_poster_planning_requires_brand_profile_and_generates_poster_revision(
+    database,
+) -> None:
+    manager = PlanManager(_DatabaseAdapter(database), FakeProvider(), MemoryStore(FakeEmbedder()))
+    with pytest.raises(ValueError, match="namespace 'general' has no brand profile"):
+        await manager.enqueue(
+            "trial-poster",
+            "Create a trial poster.",
+            namespace="general",
+            job_type="poster",
+            job_config={"artifact": "poster.html", "width": 1080, "height": 1350, "scale": 1},
+        )
+    async with database.begin() as session:
+        await save_brand_profile(
+            session,
+            "general",
+            brand_colors=["#111111"],
+            typography="FreeSans",
+            poster_formats=["1080x1350 trial"],
+            audience="trial audience",
+            voice="trial voice",
+            do_not_use=["real brands"],
+            actor="owner",
+        )
+    job_id = await manager.enqueue(
+        "trial-poster",
+        "Create a trial poster.",
+        namespace="general",
+        job_type="poster",
+        job_config={"artifact": "poster.html", "width": 1080, "height": 1350, "scale": 1},
+    )
+    await asyncio.gather(*manager._jobs)
+    async with database.begin() as session:
+        job = await manager.job(job_id)
+        revision = await revision_by_id(session, int(job["revision_id"]))
+    assert job["job_type"] == "poster"
+    assert revision is not None
+    assert revision.job_type == "poster"
+    assert revision.job_config == {
+        "artifact": "poster.html",
+        "width": 1080,
+        "height": 1350,
+        "scale": 1,
+    }
+    assert {task.id for task in revision.document.tasks} == {"brief", "review"}
+    assert "poster" in revision.document.tasks[0].title.lower()
+
+
+async def test_plan_revision_job_type_is_required_by_worker_run(database) -> None:
+    async with database.begin() as session:
+        revision_id = await create_revision(
+            session,
+            "poster-project",
+            "Create a poster.",
+            document(),
+            job_type="poster",
+            job_config={"artifact": "poster.html", "width": 1080, "height": 1350, "scale": 1},
+        )
+        await approve_revision(session, revision_id)
+    with pytest.raises(ValueError, match="does not match approved plan revision"):
+        await WorkerRunManager(_DatabaseAdapter(database)).enqueue(
+            revision_id,
+            job_type="website",
+        )
 
 
 async def test_run_evidence_is_namespace_scoped_and_failure_first(database) -> None:
