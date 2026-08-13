@@ -1,7 +1,9 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from chitti.job_types import POSTER_POLICY
 from chitti.provider import ModelCompletion, ModelToolCall
 from chitti.worker import (
     DockerSandboxDispatcher,
@@ -563,3 +565,64 @@ async def test_model_write_budget_and_command_allowlist(tmp_path: Path) -> None:
             {"name": "build", "args": ["--unsafe"]},
             tmp_path, limits, "coder",
         )
+
+
+@pytest.mark.asyncio
+async def test_poster_capture_enforces_approved_dimensions_and_scale(tmp_path: Path) -> None:
+    dispatcher = object.__new__(DockerSandboxDispatcher)
+    limits = WorkerLimits()
+    approved = {"artifact": "poster.html", "width": 1080, "height": 1350, "scale": 1}
+    container_calls: list[object] = []
+
+    async def run_container(*args, **kwargs):
+        container_calls.append(args[1])
+        return SimpleNamespace(returncode=0), "captured", ""
+
+    async def record_operation(*args, **kwargs):
+        return None
+
+    async def capture_artifacts(*args, **kwargs):
+        return None
+
+    dispatcher._docker_command = lambda *args, **kwargs: ("capture",)
+    dispatcher._run_container = run_container
+    dispatcher._operation = record_operation
+    dispatcher._capture_workspace_artifacts = capture_artifacts
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"requested 1080x1350 at scale 2, "
+            r"approved 1080x1350 at scale 1"
+        ),
+    ):
+        await dispatcher._execute_model_tool(
+            1,
+            "task",
+            0,
+            "capture_screenshot",
+            {"route": "/", "width": 1080, "height": 1350, "scale": 2},
+            tmp_path,
+            limits,
+            "coder",
+            policy=POSTER_POLICY,
+            job_config=approved,
+        )
+
+    assert container_calls == []
+
+    result = await dispatcher._execute_model_tool(
+        1,
+        "task",
+        0,
+        "capture_screenshot",
+        {"route": "/", "width": 1080, "height": 1350, "scale": 1},
+        tmp_path,
+        limits,
+        "coder",
+        policy=POSTER_POLICY,
+        job_config=approved,
+    )
+
+    assert result == ("captured", 0, 1)
+    assert len(container_calls) == 1
