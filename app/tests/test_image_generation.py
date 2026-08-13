@@ -240,7 +240,7 @@ def test_verification_refusal_is_recorded_as_operation_failure(monkeypatch, tmp_
     from unittest.mock import AsyncMock
 
     dispatcher = object.__new__(DockerSandboxDispatcher)
-    dispatcher.database = None
+    dispatcher.database = object()
     dispatcher._operation = AsyncMock()
 
     async def reject(*_args):

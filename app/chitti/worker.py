@@ -1215,7 +1215,7 @@ class DockerSandboxDispatcher:
             verify_operation = FixedOperation(
                 "runner",
                 "poster-export-assets",
-                ("sh", "-c", "verify generated export assets"),
+                (),
             )
             await self._verify_poster_assets(
                 run_id, workspace, verify_operation, operation_index + 1
@@ -1245,7 +1245,7 @@ class DockerSandboxDispatcher:
                 verify_operation = FixedOperation(
                     "runner",
                     "poster-preview-assets",
-                    ("sh", "-c", "verify generated preview assets"),
+                    (),
                 )
                 await self._verify_poster_assets(
                     run_id, workspace, verify_operation, 0
@@ -2581,8 +2581,6 @@ class DockerSandboxDispatcher:
         operation_index: int,
         stdout: str = "",
     ) -> None:
-        if not hasattr(self, "database"):
-            return
         try:
             await verify_export_assets(self.database, run_id, workspace)
         except ImageManifestRefused as exc:
