@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from .db import Database
+from .namespaces import SHARED_NAMESPACE
 from .reminders import next_due
 
 
@@ -72,9 +73,11 @@ async def compose_briefing(
             text(
                 "SELECT COUNT(*) FROM memory_conflicts c "
                 "JOIN decisions d ON d.id = c.existing_decision_id "
-                "WHERE d.namespace = :namespace AND c.resolution_decision_id IS NULL"
+                "WHERE c.namespace IN (:namespace, :shared) "
+                "AND d.namespace IN (:namespace, :shared) "
+                "AND c.resolution_decision_id IS NULL AND c.closed_at IS NULL"
             ),
-            {"namespace": namespace},
+            {"namespace": namespace, "shared": SHARED_NAMESPACE},
         )
         conflicts = int(conflicts_result.scalar_one())
         previews_result = await session.execute(

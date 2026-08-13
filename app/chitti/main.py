@@ -1006,7 +1006,7 @@ async def resolve_conflict(conflict_id: int, request: Request) -> RedirectRespon
     )
     async with database.sessions() as db_session:
         try:
-            await memory.resolve_conflict(db_session, conflict_id, choice)
+            await memory.resolve_conflict(db_session, conflict_id, choice, session.username)
             await db_session.commit()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -11,6 +11,30 @@ from .namespaces import MEMORY_NAMESPACES, SHARED_NAMESPACE
 from .provider import ExtractedMemory
 
 logger = logging.getLogger(__name__)
+_PROPOSAL_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "in",
+        "is",
+        "keep",
+        "must",
+        "of",
+        "on",
+        "per",
+        "the",
+        "to",
+        "use",
+        "with",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -31,6 +55,35 @@ class Recall:
 
 def normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def _proposal_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", normalize(value))
+        if token not in _PROPOSAL_STOP_WORDS
+    }
+
+
+def equivalent_proposal(existing: str, proposed: str) -> bool:
+    """Conservatively recognize restatements without semantic classification."""
+    if normalize(existing) == normalize(proposed):
+        return True
+    existing_tokens = _proposal_tokens(existing)
+    proposed_tokens = _proposal_tokens(proposed)
+    if not existing_tokens or not proposed_tokens:
+        return False
+    existing_numbers = {token for token in existing_tokens if any(char.isdigit() for char in token)}
+    proposed_numbers = {token for token in proposed_tokens if any(char.isdigit() for char in token)}
+    if existing_numbers != proposed_numbers:
+        return False
+    intersection = existing_tokens & proposed_tokens
+    union = existing_tokens | proposed_tokens
+    return (
+        existing_tokens <= proposed_tokens
+        or proposed_tokens <= existing_tokens
+        or len(intersection) / len(union) >= 0.8
+    )
 
 
 def normalize_key(value: str) -> str:
@@ -151,33 +204,94 @@ class MemoryStore:
                 continue
             if match:
                 existing_key = str(match["decision_key"])
-                result = await session.execute(
+                open_conflicts = await session.execute(
                     text(
-                        "INSERT INTO memory_conflicts "
-                        "(decision_key, existing_decision_id, proposed_value, proposed_rationale, "
-                        "proposed_project, proposed_source, namespace) "
-                        "VALUES (:key, :existing_id, :value, :rationale, :project, :source, :namespace) "
-                        "RETURNING id"
+                        "SELECT id, proposed_value FROM memory_conflicts "
+                        "WHERE namespace = :namespace AND decision_key = :key "
+                        "AND resolution_decision_id IS NULL AND closed_at IS NULL "
+                        "ORDER BY id DESC"
                     ),
-                    {
-                        "key": existing_key,
-                        "existing_id": match["id"],
-                        "value": memory.value,
-                        "rationale": memory.rationale,
-                        "project": memory.project,
-                        "source": memory.source,
-                        "namespace": namespace,
-                    },
+                    {"namespace": namespace, "key": existing_key},
                 )
-                conflicts.append(
-                    Conflict(
-                        existing_key,
-                        str(match["decision"]),
-                        memory.value,
-                        int(str(match["id"])),
-                        int(result.scalar_one()),
+                for open_conflict in open_conflicts.mappings():
+                    if equivalent_proposal(
+                        str(open_conflict["proposed_value"]), memory.value
+                    ):
+                        await session.execute(
+                            text(
+                                "UPDATE memory_conflicts SET recurrence_count = recurrence_count + 1, "
+                                "last_seen_at = now() WHERE id = :id"
+                            ),
+                            {"id": open_conflict["id"]},
+                        )
+                        conflicts.append(
+                            Conflict(
+                                existing_key,
+                                str(match["decision"]),
+                                str(open_conflict["proposed_value"]),
+                                int(str(match["id"])),
+                                int(str(open_conflict["id"])),
+                            )
+                        )
+                        break
+                else:
+                    prior_ids = [
+                        int(str(row["id"]))
+                        for row in (
+                            await session.execute(
+                            text(
+                                "SELECT id FROM memory_conflicts "
+                                "WHERE namespace = :namespace AND decision_key = :key "
+                                "AND resolution_decision_id IS NULL AND closed_at IS NULL"
+                            ),
+                            {"namespace": namespace, "key": existing_key},
+                            )
+                        ).mappings()
+                    ]
+                    for prior_id in prior_ids:
+                        await session.execute(
+                            text(
+                                "UPDATE memory_conflicts SET closed_at = now(), "
+                                "closure_reason = 'superseded' WHERE id = :id"
+                            ),
+                            {"id": prior_id},
+                        )
+                    result = await session.execute(
+                        text(
+                            "INSERT INTO memory_conflicts "
+                            "(decision_key, existing_decision_id, proposed_value, proposed_rationale, "
+                            "proposed_project, proposed_source, namespace, last_seen_at) "
+                            "VALUES (:key, :existing_id, :value, :rationale, :project, :source, "
+                            ":namespace, now()) RETURNING id"
+                        ),
+                        {
+                            "key": existing_key,
+                            "existing_id": match["id"],
+                            "value": memory.value,
+                            "rationale": memory.rationale,
+                            "project": memory.project,
+                            "source": memory.source,
+                            "namespace": namespace,
+                        },
                     )
-                )
+                    new_conflict_id = int(result.scalar_one())
+                    for prior_id in prior_ids:
+                        await session.execute(
+                            text(
+                                "UPDATE memory_conflicts SET superseded_by_conflict_id = :new_id "
+                                "WHERE id = :id"
+                            ),
+                            {"id": prior_id, "new_id": new_conflict_id},
+                        )
+                    conflicts.append(
+                        Conflict(
+                            existing_key,
+                            str(match["decision"]),
+                            memory.value,
+                            int(str(match["id"])),
+                            new_conflict_id,
+                        )
+                    )
             else:
                 canonical = ExtractedMemory(
                     normalize_key(memory.key),
@@ -212,10 +326,12 @@ class MemoryStore:
         result = await session.execute(
             text(
                 "SELECT c.id, c.decision_key, c.existing_decision_id, d.decision AS existing_value, "
-                "c.proposed_value, c.proposed_rationale, c.proposed_project, c.proposed_source "
+                "c.proposed_value, c.proposed_rationale, c.proposed_project, c.proposed_source, "
+                "c.recurrence_count, c.closed_at, c.closure_reason, c.resolution_actor, c.resolved_at "
                 "FROM memory_conflicts c JOIN decisions d ON d.id = c.existing_decision_id "
                 "LEFT JOIN decision_forgets f ON f.decision_id = d.id "
-                "WHERE c.resolution_decision_id IS NULL AND f.id IS NULL "
+                "WHERE c.resolution_decision_id IS NULL AND c.closed_at IS NULL AND f.id IS NULL "
+                "AND c.namespace IN (:namespace, :shared) "
                 "AND d.namespace IN (:namespace, :shared) ORDER BY c.id DESC"
             ),
             {"namespace": namespace, "shared": SHARED_NAMESPACE},
@@ -223,13 +339,17 @@ class MemoryStore:
         return [dict(row._mapping) for row in result]
 
     async def resolve_conflict(
-        self, session: AsyncSession, conflict_id: int, choice: str
+        self,
+        session: AsyncSession,
+        conflict_id: int,
+        choice: str,
+        actor: str | None = None,
     ) -> int:
         result = await session.execute(
             text(
                 "SELECT decision_key, existing_decision_id, proposed_value, proposed_rationale, "
                 "proposed_project, proposed_source FROM memory_conflicts "
-                "WHERE id = :id AND resolution_decision_id IS NULL"
+                "WHERE id = :id AND resolution_decision_id IS NULL AND closed_at IS NULL"
             ),
             {"id": conflict_id},
         )
@@ -268,8 +388,12 @@ class MemoryStore:
             {"new_id": new_id, "old_id": conflict["existing_decision_id"]},
         )
         await session.execute(
-            text("UPDATE memory_conflicts SET resolution_decision_id = :new_id WHERE id = :id"),
-            {"new_id": new_id, "id": conflict_id},
+            text(
+                "UPDATE memory_conflicts SET resolution_decision_id = :new_id, "
+                "closed_at = now(), closure_reason = 'owner', "
+                "resolution_actor = :actor, resolved_at = now() WHERE id = :id"
+            ),
+            {"new_id": new_id, "id": conflict_id, "actor": actor},
         )
         return new_id
 
