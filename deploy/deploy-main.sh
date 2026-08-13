@@ -28,6 +28,7 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
       "Would install and enable ${RUNNER_UNIT}" \
       "Would restart ${RUNNER_UNIT} and verify its loaded-code identity" \
       "Would create or verify the runner-only database role" \
+      "Would derive, reconcile, print, and assert runner table privileges" \
       "Would verify schema, privileges, and container network boundaries"
   else
     printf '%s\n' \
@@ -39,6 +40,7 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
       "Would install and enable ${RUNNER_UNIT}" \
       "Would restart ${RUNNER_UNIT} and verify its loaded-code identity" \
       "Would create or verify the runner-only database role" \
+      "Would derive, reconcile, print, and assert runner table privileges" \
       "Would verify schema, privileges, and container network boundaries"
   fi
   echo "${DEPLOY_COMPLETION_MARKER}"
@@ -265,6 +267,36 @@ else
   unset runner_password
   trap - EXIT
 fi
+
+RUNNER_ENV="${RUNNER_ENV}" PYTHONPATH="${INSTALL_DIR}/app" "${RUNNER_PYTHON}" - <<'PY'
+import asyncio
+import os
+from pathlib import Path
+
+import asyncpg
+
+from chitti.runner_access import reconcile_runner_privileges
+
+
+def database_url() -> str:
+    for line in Path(os.environ["RUNNER_ENV"]).read_text().splitlines():
+        if line.startswith("DATABASE_URL="):
+            return line.partition("=")[2].replace(
+                "postgresql+asyncpg://", "postgresql://", 1
+            )
+    raise SystemExit("runner database URL is missing")
+
+
+async def main() -> None:
+    conn = await asyncpg.connect(database_url())
+    try:
+        await reconcile_runner_privileges(conn)
+    finally:
+        await conn.close()
+
+
+asyncio.run(main())
+PY
 
 install -o root -g root -m 0644 \
   "${RUNNER_UNIT_SOURCE}" \

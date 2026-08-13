@@ -42,7 +42,7 @@ from .provider import (
     ModelToolCall,
     ModelTransportError,
 )
-from .runner_access import application_only_sql
+from .runner_access import application_only_sql, runner_sql
 
 MAX_CAPTURE_ARTIFACTS_PER_RUN = 32
 LIVE_OUTPUT_FLUSH_BYTES = 16 * 1024
@@ -2252,12 +2252,12 @@ class DockerSandboxDispatcher:
     ) -> None:
         async with self.database.sessions() as session:
             await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO plan_task_events "
                     "(revision_id, task_id, event_type, status, detail) "
                     "SELECT revision_id, :task_id, 'worker', :status, :detail "
                     "FROM worker_runs WHERE id = :run_id"
-                ),
+                )),
                 {
                     "run_id": run_id, "task_id": task_id,
                     "status": status, "detail": detail,

@@ -48,7 +48,7 @@ from chitti.runner import (
     reconcile_cancelled_run,
     reconcile_interrupted_runs,
 )
-from chitti.runner_access import assert_runner_privileges
+from chitti.runner_access import assert_runner_privileges, reconcile_runner_privileges
 from chitti.runner_health import (
     recent_runner_health,
     record_runner_health_failure,
@@ -1113,6 +1113,7 @@ async def test_runner_brand_profile_access_is_read_only(database):
         await admin.execute(
             f'GRANT SELECT ON decisions, brand_profiles TO "{role}"'
         )
+        await reconcile_runner_privileges(admin, role)
         runner_database_url = urlunsplit(
             (
                 parsed.scheme,

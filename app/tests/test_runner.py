@@ -11,6 +11,7 @@ from chitti.provider import GatewayMisconfigurationError, GatewayTransientError
 from chitti.reminders import next_due
 from chitti.runner_access import (
     assert_runner_privileges,
+    derived_grants,
     owned_sequences,
     required_privileges,
     runner_source_texts,
@@ -129,6 +130,22 @@ def test_runner_access_follows_newly_imported_module(tmp_path, monkeypatch) -> N
     assert required_privileges(sources, {"newly_imported_table"}) == {
         "newly_imported_table": {"SELECT"}
     }
+
+
+def test_runner_access_rejects_derived_application_only_write() -> None:
+    with pytest.raises(
+        SystemExit, match="would widen application-only writes on decisions"
+    ):
+        derived_grants(
+            [
+                (
+                    "application_only_sql(text(\"INSERT INTO decisions "
+                    "(decision) VALUES ('app-only')\"))"
+                ),
+                "INSERT INTO decisions (decision) VALUES ('unclassified')",
+            ],
+            {"decisions"},
+        )
 
 
 def test_runner_access_fails_when_required_grant_is_missing() -> None:
