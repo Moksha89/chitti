@@ -65,19 +65,15 @@ def _proposal_tokens(value: str) -> set[str]:
     }
 
 
+def proposal_fingerprint(value: str) -> str:
+    return " ".join(sorted(_proposal_tokens(value)))
+
+
 def equivalent_proposal(existing: str, proposed: str) -> bool:
     """Conservatively recognize restatements without semantic classification."""
     if normalize(existing) == normalize(proposed):
         return True
-    existing_tokens = _proposal_tokens(existing)
-    proposed_tokens = _proposal_tokens(proposed)
-    if not existing_tokens or not proposed_tokens:
-        return False
-    existing_numbers = {token for token in existing_tokens if any(char.isdigit() for char in token)}
-    proposed_numbers = {token for token in proposed_tokens if any(char.isdigit() for char in token)}
-    if existing_numbers != proposed_numbers:
-        return False
-    return existing_tokens == proposed_tokens
+    return proposal_fingerprint(existing) == proposal_fingerprint(proposed)
 
 
 def normalize_key(value: str) -> str:
@@ -200,17 +196,20 @@ class MemoryStore:
                 existing_key = str(match["decision_key"])
                 open_conflicts = await session.execute(
                     text(
-                        "SELECT id, proposed_value FROM memory_conflicts "
+                        "SELECT id, proposed_value, proposal_fingerprint FROM memory_conflicts "
                         "WHERE namespace = :namespace AND decision_key = :key "
                         "AND resolution_decision_id IS NULL AND closed_at IS NULL "
+                        "AND proposal_fingerprint = :fingerprint "
                         "ORDER BY id DESC"
                     ),
-                    {"namespace": namespace, "key": existing_key},
+                    {
+                        "namespace": namespace,
+                        "key": existing_key,
+                        "fingerprint": proposal_fingerprint(memory.value),
+                    },
                 )
                 for open_conflict in open_conflicts.mappings():
-                    if equivalent_proposal(
-                        str(open_conflict["proposed_value"]), memory.value
-                    ):
+                    if equivalent_proposal(str(open_conflict["proposed_value"]), memory.value):
                         await session.execute(
                             text(
                                 "UPDATE memory_conflicts SET recurrence_count = recurrence_count + 1, "
@@ -238,36 +237,16 @@ class MemoryStore:
                         )
                         break
                 else:
-                    prior_ids = [
-                        int(str(row["id"]))
-                        for row in (
-                            await session.execute(
-                            text(
-                                "SELECT id FROM memory_conflicts "
-                                "WHERE namespace = :namespace AND decision_key = :key "
-                                "AND resolution_decision_id IS NULL AND closed_at IS NULL"
-                            ),
-                            {"namespace": namespace, "key": existing_key},
-                            )
-                        ).mappings()
-                    ]
-                    for prior_id in prior_ids:
-                        await session.execute(
-                            text(
-                                "UPDATE memory_conflicts SET closed_at = now(), "
-                                "closure_reason = 'superseded' WHERE id = :id"
-                            ),
-                            {"id": prior_id},
-                        )
                     result = await session.execute(
                         text(
                             "INSERT INTO memory_conflicts "
                             "(decision_key, existing_decision_id, proposed_value, proposed_rationale, "
                             "proposed_project, proposed_source, namespace, last_seen_at, "
                             "latest_proposed_value, latest_proposed_rationale, "
-                            "latest_proposed_project, latest_proposed_source) "
+                            "latest_proposed_project, latest_proposed_source, proposal_fingerprint) "
                             "VALUES (:key, :existing_id, :value, :rationale, :project, :source, "
-                            ":namespace, now(), :value, :rationale, :project, :source) RETURNING id"
+                            ":namespace, now(), :value, :rationale, :project, :source, :fingerprint) "
+                            "RETURNING id"
                         ),
                         {
                             "key": existing_key,
@@ -277,17 +256,10 @@ class MemoryStore:
                             "project": memory.project,
                             "source": memory.source,
                             "namespace": namespace,
+                            "fingerprint": proposal_fingerprint(memory.value),
                         },
                     )
                     new_conflict_id = int(result.scalar_one())
-                    for prior_id in prior_ids:
-                        await session.execute(
-                            text(
-                                "UPDATE memory_conflicts SET superseded_by_conflict_id = :new_id "
-                                "WHERE id = :id"
-                            ),
-                            {"id": prior_id, "new_id": new_conflict_id},
-                        )
                     conflicts.append(
                         Conflict(
                             existing_key,
@@ -407,6 +379,34 @@ class MemoryStore:
             ),
             {"new_id": new_id, "id": conflict_id, "actor": actor},
         )
+        siblings = await session.execute(
+            text(
+                "SELECT id, proposed_value, latest_proposed_value, "
+                "COALESCE(latest_proposed_value, proposed_value) AS effective_value "
+                "FROM memory_conflicts "
+                "WHERE existing_decision_id = :old_id "
+                "AND id <> :id AND resolution_decision_id IS NULL AND closed_at IS NULL"
+            ),
+            {"old_id": conflict["existing_decision_id"], "id": conflict_id},
+        )
+        for sibling in siblings.mappings():
+            if equivalent_proposal(str(sibling["effective_value"]), replacement.value):
+                await session.execute(
+                    text(
+                        "UPDATE memory_conflicts SET resolution_decision_id = :new_id, "
+                        "closed_at = now(), closure_reason = 'owner_reconciled', "
+                        "resolution_actor = :actor, resolved_at = now() WHERE id = :id"
+                    ),
+                    {"new_id": new_id, "id": sibling["id"], "actor": actor},
+                )
+            else:
+                await session.execute(
+                    text(
+                        "UPDATE memory_conflicts SET existing_decision_id = :new_id "
+                        "WHERE id = :id"
+                    ),
+                    {"new_id": new_id, "id": sibling["id"]},
+                )
         return new_id
 
     async def forget_decision(self, session: AsyncSession, decision_id: int) -> None:

@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.postgres import PostgresContainer
 
 from chitti.embedding import FakeEmbedder
-from chitti.memory import MemoryStore
+from chitti.memory import MemoryStore, proposal_fingerprint
 from chitti.provider import ExtractedMemory
 
 pytestmark = pytest.mark.skipif(
@@ -169,7 +169,7 @@ async def test_equivalent_conflict_recurrence_updates_one_open_row(store) -> Non
         assert latest == "Worker caps are $0.75 per run and 300,000 model tokens."
 
 
-async def test_different_conflict_supersedes_previous_open_row(store) -> None:
+async def test_different_conflicts_under_one_key_stay_open(store) -> None:
     engine, memory = store
     async with engine.begin() as session:
         await memory.append_decision(
@@ -196,9 +196,10 @@ async def test_different_conflict_supersedes_previous_open_row(store) -> None:
                 )
             )
         ).mappings().all()
-        assert rows[0]["closure_reason"] == "superseded"
-        assert rows[0]["superseded_by_conflict_id"] == second[0].conflict_id
-        assert rows[1]["closed_at"] is None
+        assert [row["proposed_value"] for row in rows] == ["CSS modules", "Vanilla CSS"]
+        assert all(row["closed_at"] is None for row in rows)
+        assert all(row["closure_reason"] is None for row in rows)
+        assert all(row["superseded_by_conflict_id"] is None for row in rows)
 
 
 async def test_resolution_records_actor_and_namespace_conflicts_are_private(store) -> None:
@@ -231,7 +232,133 @@ async def test_resolution_records_actor_and_namespace_conflicts_are_private(stor
         assert row["closure_reason"] == "owner"
 
 
-async def test_conflict_backfill_keeps_one_historical_row_per_key_without_deleting(store) -> None:
+async def test_resolution_reconciles_open_sibling_conflicts_without_deleting(store) -> None:
+    engine, memory = store
+    async with engine.begin() as session:
+        await memory.append_decision(
+            session,
+            ExtractedMemory(
+                "worker_caps",
+                "Keep worker caps at $0.75 and 300,000 model tokens per run.",
+                None,
+                None,
+                "user_stated",
+            ),
+            "general",
+        )
+        agreeing = await memory.record_memories(
+            session,
+            [
+                ExtractedMemory(
+                    "worker_caps",
+                    "Keep worker caps at $0.75 and 300,000 model tokens.",
+                    None,
+                    None,
+                    "user_stated",
+                )
+            ],
+            "general",
+        )
+        disagreeing = await memory.record_memories(
+            session,
+            [
+                ExtractedMemory(
+                    "worker_caps",
+                    "Cap worker cost at $1.00 per run and 400,000 model tokens per run.",
+                    None,
+                    None,
+                    "user_stated",
+                )
+            ],
+            "general",
+        )
+        decision_id = (
+            await session.execute(
+                text(
+                    "SELECT id FROM decisions WHERE decision_key = 'worker_caps' "
+                    "AND superseded_by IS NULL ORDER BY id LIMIT 1"
+                )
+            )
+        ).scalar_one()
+        await session.execute(text("DROP INDEX memory_conflicts_one_open_per_proposal"))
+        duplicate = (
+            await session.execute(
+                text(
+                    "INSERT INTO memory_conflicts "
+                    "(decision_key, existing_decision_id, proposed_value, proposed_source, "
+                    "namespace, last_seen_at, latest_proposed_value, proposal_fingerprint) "
+                    "VALUES ('worker_caps', :decision_id, :value, 'user_stated', 'general', "
+                    "now(), :value, :fingerprint) RETURNING id"
+                ),
+                {
+                    "decision_id": decision_id,
+                    "value": "Keep worker caps at $0.75 and 300,000 model tokens.",
+                    "fingerprint": proposal_fingerprint(
+                        "Keep worker caps at $0.75 and 300,000 model tokens."
+                    ),
+                },
+            )
+        ).scalar_one()
+        await memory.append_decision(
+            session,
+            ExtractedMemory("style", "Tailwind CSS", None, None, "user_stated"),
+            "general",
+        )
+        unrelated = await memory.record_memories(
+            session,
+            [ExtractedMemory("style", "CSS modules", None, None, "user_stated")],
+            "general",
+        )
+        before = (
+            await session.execute(text("SELECT COUNT(*) FROM memory_conflicts"))
+        ).scalar_one()
+        new_id = await memory.resolve_conflict(
+            session, agreeing[0].conflict_id, "proposed", "akirah"
+        )
+        after = (
+            await session.execute(text("SELECT COUNT(*) FROM memory_conflicts"))
+        ).scalar_one()
+        assert after == before
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT id, existing_decision_id, resolution_decision_id, "
+                    "closed_at, closure_reason FROM memory_conflicts "
+                    "WHERE id IN (:agreeing, :duplicate, :disagreeing, :unrelated) ORDER BY id"
+                ),
+                {
+                    "agreeing": agreeing[0].conflict_id,
+                    "duplicate": duplicate,
+                    "disagreeing": disagreeing[0].conflict_id,
+                    "unrelated": unrelated[0].conflict_id,
+                },
+            )
+        ).mappings().all()
+        by_id = {row["id"]: row for row in rows}
+        selected = by_id[agreeing[0].conflict_id]
+        reconciled = by_id[duplicate]
+        remaining = by_id[disagreeing[0].conflict_id]
+        untouched = by_id[unrelated[0].conflict_id]
+        assert selected["resolution_decision_id"] == new_id
+        assert selected["closure_reason"] == "owner"
+        assert selected["closed_at"] is not None
+        assert reconciled["resolution_decision_id"] == new_id
+        assert reconciled["closure_reason"] == "owner_reconciled"
+        assert reconciled["closed_at"] is not None
+        assert remaining["existing_decision_id"] == new_id
+        assert remaining["closed_at"] is None
+        assert remaining["closure_reason"] is None
+        assert untouched["existing_decision_id"] != new_id
+        visible = await memory.conflicts(session, "general")
+        remaining = next(
+            row for row in visible if row["id"] == disagreeing[0].conflict_id
+        )
+        assert remaining["existing_value"] == (
+            "Keep worker caps at $0.75 and 300,000 model tokens."
+        )
+
+
+async def test_conflict_repair_groups_by_equivalent_proposal_without_deleting(store) -> None:
     engine, _ = store
     env = {
         **os.environ,
@@ -255,7 +382,11 @@ async def test_conflict_backfill_keeps_one_historical_row_per_key_without_deleti
             )
         )
         decision_id = decision.scalar_one()
-        for value in ("Plain CSS modules", "Next.js and Three.js"):
+        for value in (
+            "The user writes plain CSS modules for styling on every project and has moved off Tailwind completely.",
+            "Use Next.js App Router with React Three Fiber, Drei, and Three.js for generated websites.",
+            "Use Next.js App Router with React Three Fiber, Drei, and Three.js for generated websites.",
+        ):
             await session.execute(
                 text(
                     "INSERT INTO memory_conflicts "
@@ -276,7 +407,8 @@ async def test_conflict_backfill_keeps_one_historical_row_per_key_without_deleti
         rows = (
             await session.execute(
                 text(
-                    "SELECT proposed_value, closed_at, closure_reason "
+                    "SELECT id, proposed_value, latest_proposed_value, closed_at, "
+                    "closure_reason, superseded_by_conflict_id "
                     "FROM memory_conflicts WHERE decision_key = 'styling_framework' "
                     "ORDER BY id"
                 )
@@ -284,18 +416,24 @@ async def test_conflict_backfill_keeps_one_historical_row_per_key_without_deleti
         ).mappings().all()
         after = await session.execute(text("SELECT COUNT(*) FROM memory_conflicts"))
         assert after.scalar_one() == before_count
+        assert len(rows) == 3
         assert rows[0]["closed_at"] is None
-        assert rows[0]["proposed_value"] == "Plain CSS modules"
-        assert rows[1]["closure_reason"] == "deduplicated"
+        assert rows[0]["proposed_value"].startswith("The user writes plain CSS")
+        assert rows[0]["latest_proposed_value"].startswith("The user writes plain CSS")
+        assert rows[1]["closed_at"] is None
+        assert rows[1]["latest_proposed_value"].startswith("Use Next.js")
+        assert rows[2]["closure_reason"] == "deduplicated"
+        assert rows[2]["superseded_by_conflict_id"] == rows[1]["id"]
         latest = (
             await session.execute(
                 text(
                     "SELECT latest_proposed_value FROM memory_conflicts "
-                    "WHERE decision_key = 'styling_framework' AND closed_at IS NULL"
-                )
+                    "WHERE id = :id"
+                ),
+                {"id": rows[0]["id"]},
             )
         ).scalar_one()
-        assert latest == "Next.js and Three.js"
+        assert latest.startswith("The user writes plain CSS")
 
 
 async def test_memory_namespaces_isolate_business_data_and_share_general_data(store) -> None:
