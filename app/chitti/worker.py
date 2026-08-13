@@ -42,6 +42,7 @@ from .provider import (
     ModelToolCall,
     ModelTransportError,
 )
+from .runner_access import application_only_sql
 
 MAX_CAPTURE_ARTIFACTS_PER_RUN = 32
 LIVE_OUTPUT_FLUSH_BYTES = 16 * 1024
@@ -2413,12 +2414,12 @@ class WorkerRunManager:
                         "do-not-use rules first."
                     )
             result = await session.execute(
-                text(
-                    "INSERT INTO worker_runs "
+                        application_only_sql(text(
+                            "INSERT INTO worker_runs "
                     "(revision_id, limits, workspace_id, job_type, job_config) "
                     "VALUES (:revision_id, CAST(:limits AS json), :workspace_id, "
                     ":job_type, CAST(:job_config AS json)) RETURNING id"
-                ),
+                        )),
                 {
                     "revision_id": revision.id,
                     "limits": json.dumps(chosen.as_json()),

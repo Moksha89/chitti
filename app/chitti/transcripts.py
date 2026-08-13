@@ -4,6 +4,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .memory import normalize_namespace
+from .runner_access import application_only_sql
 
 
 async def append_entry(
@@ -12,10 +13,10 @@ async def append_entry(
     if role not in {"user", "assistant"}:
         raise ValueError("invalid transcript role")
     await session.execute(
-        text(
+        application_only_sql(text(
             "INSERT INTO chat_transcript_entries (namespace, role, content) "
             "VALUES (:namespace, :role, :content)"
-        ),
+        )),
         {
             "namespace": normalize_namespace(namespace),
             "role": role,

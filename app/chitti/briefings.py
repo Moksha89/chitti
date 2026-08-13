@@ -10,6 +10,7 @@ from sqlalchemy import text
 from .db import Database
 from .namespaces import SHARED_NAMESPACE
 from .reminders import next_due
+from .runner_access import application_only_sql
 
 
 def _format_section(title: str, values: list[str]) -> str:
@@ -127,14 +128,14 @@ async def compose_briefing(
             content = "Nothing needs your attention today."
         refresh_today = local_date == datetime.now(UTC).astimezone(zone).date()
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "INSERT INTO daily_briefings (namespace, local_date, generated_at, content) "
                 "VALUES (:namespace, :local_date, :generated_at, :content) "
                 "ON CONFLICT (namespace, local_date) DO UPDATE SET "
                 "generated_at = EXCLUDED.generated_at, content = EXCLUDED.content "
                 "WHERE :refresh_today "
                 "RETURNING content, generated_at"
-            ),
+            )),
             {
                 "namespace": namespace,
                 "local_date": local_date,
