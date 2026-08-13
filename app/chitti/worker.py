@@ -16,7 +16,7 @@ from typing import IO, TYPE_CHECKING, Protocol, cast
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .brand_profiles import get_brand_profile
+from .brand_profiles import BrandProfile, get_brand_profile
 from .job_types import (
     WEBSITE_POLICY,
     JobTypePolicy,
@@ -473,10 +473,19 @@ class DockerSandboxDispatcher:
             job_config = (
                 poster_config(run_row["job_config"]) if policy.is_poster else {}
             )
+            brand_profile = None
+            if policy.is_poster:
+                async with self.database.sessions() as session:
+                    brand_profile = await get_brand_profile(session, revision.namespace)
+                if brand_profile is None:
+                    raise RuntimeError(
+                        "poster run refused during dispatch: no brand profile is "
+                        "recorded for this namespace"
+                    )
             await self._mount_workspace(workspace, limits)
             if self.model_provider is not None:
                 await self._dispatch_model_one(
-                    revision, run_id, limits, workspace, policy, job_config
+                    revision, run_id, limits, workspace, policy, job_config, brand_profile
                 )
                 return
             for index, operation in enumerate(
@@ -492,7 +501,7 @@ class DockerSandboxDispatcher:
                 await self._task_event(run_id, operation.task_id, "running", operation.name)
                 started = datetime.now(UTC)
                 command = self._docker_command(
-                    operation, workspace, run_id, limits, job_config
+                    operation, workspace, run_id, limits, job_config, brand_profile
                 )
                 try:
                     result, stdout, stderr = await self._run_container(
@@ -539,6 +548,7 @@ class DockerSandboxDispatcher:
         workspace: Path,
         policy: JobTypePolicy,
         job_config: dict[str, object],
+        brand_profile: BrandProfile | None,
     ) -> None:
         assert self.model_provider is not None
         started = time.monotonic()
@@ -585,20 +595,7 @@ class DockerSandboxDispatcher:
                 )
             )
             beliefs = [dict(row._mapping) for row in result]
-        profile = None
-        if policy.is_poster:
-            async with self.database.sessions() as session:
-                profile = await get_brand_profile(session, revision.namespace)
-            if profile is None:
-                raise RuntimeError(
-                    "poster run refused: no brand profile is recorded for this namespace"
-                )
-            job_config = {
-                **job_config,
-                "_colors": "|".join(profile.brand_colors),
-                "_font": profile.typography,
-            }
-        stable = _model_system_prompt(policy, profile)
+        stable = _model_system_prompt(policy, brand_profile)
         spent = 0.0
         spent_tokens = 0
         calls = 0
@@ -857,7 +854,7 @@ class DockerSandboxDispatcher:
                                         await self._execute_model_tool(
                                             run_id, task.id, operation_index, tool,
                                             arguments, workspace, limits, route,
-                                            policy, job_config,
+                                            policy, job_config, brand_profile,
                                         )
                                     )
                                     self._raise_if_cancelled(run_id)
@@ -1042,7 +1039,7 @@ class DockerSandboxDispatcher:
                     )
                     result_text, written, operation_index = await self._execute_model_tool(
                         run_id, task.id, operation_index, tool, arguments,
-                        workspace, limits, route, policy, job_config,
+                        workspace, limits, route, policy, job_config, brand_profile,
                     )
                     self._raise_if_cancelled(run_id)
                     writes += written
@@ -1221,6 +1218,7 @@ class DockerSandboxDispatcher:
         arguments: dict[str, object], workspace: Path, limits: WorkerLimits, route: str,
         policy: JobTypePolicy = WEBSITE_POLICY,
         job_config: dict[str, object] | None = None,
+        brand_profile: BrandProfile | None = None,
     ) -> tuple[str, int, int]:
         job_config = job_config or {}
         if tool == "list_files":
@@ -1273,7 +1271,9 @@ class DockerSandboxDispatcher:
             )
             result, stdout, stderr = await self._run_container(
                 run_id,
-                self._docker_command(operation, workspace, run_id, limits, job_config),
+                self._docker_command(
+                    operation, workspace, run_id, limits, job_config, brand_profile
+                ),
                 limits,
                 operation_index=operation_index + 1,
             )
@@ -1300,7 +1300,9 @@ class DockerSandboxDispatcher:
             operation = FixedOperation(task_id, op_name, command, network=network)
             result, stdout, stderr = await self._run_container(
                 run_id,
-                self._docker_command(operation, workspace, run_id, limits, job_config),
+                self._docker_command(
+                    operation, workspace, run_id, limits, job_config, brand_profile
+                ),
                 limits,
                 operation_index=operation_index + 1,
             )
@@ -2203,6 +2205,7 @@ class DockerSandboxDispatcher:
         self, operation: FixedOperation, workspace: Path,
         run_id: int, limits: WorkerLimits,
         job_config: dict[str, object] | None = None,
+        brand_profile: BrandProfile | None = None,
     ) -> list[str]:
         command = [
             "docker", "run", "--name", f"chitti-worker-{run_id}",
@@ -2217,10 +2220,11 @@ class DockerSandboxDispatcher:
         if job_config and "artifact" in job_config:
             image_index = command.index(self.image)
             env = ["--env", f"CHITTI_POSTER_ARTIFACT={job_config['artifact']}"]
-            if "_colors" in job_config:
-                env.extend(["--env", f"CHITTI_POSTER_COLORS={job_config['_colors']}"])
-            if "_font" in job_config:
-                env.extend(["--env", f"CHITTI_POSTER_FONT={job_config['_font']}"])
+            if brand_profile is not None:
+                env.extend(
+                    ["--env", f"CHITTI_POSTER_COLORS={'|'.join(brand_profile.brand_colors)}"]
+                )
+                env.extend(["--env", f"CHITTI_POSTER_FONT={brand_profile.typography}"])
             command[image_index:image_index] = env
         return command
 
@@ -2398,6 +2402,16 @@ class WorkerRunManager:
         normalized_config = poster_config(job_config) if policy.is_poster else {}
         async with self.database.sessions() as session:
             revision = await approved_revision(session, revision_id, namespace)
+            if policy.is_poster:
+                profile = await get_brand_profile(session, revision.namespace)
+                if profile is None:
+                    raise ValueError(
+                        "poster run not started: namespace "
+                        f"'{revision.namespace}' has no brand profile yet. "
+                        "Open Brand profile for this namespace and save its "
+                        "colours, typography, formats, audience, voice, and "
+                        "do-not-use rules first."
+                    )
             result = await session.execute(
                 text(
                     "INSERT INTO worker_runs "

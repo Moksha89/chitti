@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
 import pytest
 
 from chitti.job_types import (
@@ -9,7 +13,33 @@ from chitti.job_types import (
     policy_for,
     poster_config,
 )
-from chitti.worker import _model_system_prompt, _reviewer_system_prompt
+from chitti.worker import WorkerRunManager, _model_system_prompt, _reviewer_system_prompt
+
+
+class _Result:
+    def scalar_one(self) -> int:
+        return 42
+
+
+class _Session:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def execute(self, statement, params=None):
+        self.calls.append({"statement": str(statement), "params": params or {}})
+        return _Result()
+
+    async def commit(self) -> None:
+        pass
+
+
+class _Database:
+    def __init__(self) -> None:
+        self.session = _Session()
+
+    @asynccontextmanager
+    async def sessions(self):
+        yield self.session
 
 
 def test_existing_runs_default_to_website_policy() -> None:
@@ -35,3 +65,43 @@ def test_poster_prompts_require_brand_and_honest_visual_review() -> None:
     review = _reviewer_system_prompt(POSTER_POLICY)
     assert "do not invent" in prompt
     assert "visual quality was not assessed" in review
+
+
+@pytest.mark.asyncio
+async def test_poster_preflight_refuses_before_inserting_a_run(monkeypatch) -> None:
+    database = _Database()
+    monkeypatch.setattr("chitti.worker.approved_revision", _approved_revision)
+    monkeypatch.setattr("chitti.worker.get_brand_profile", _missing_profile)
+
+    with pytest.raises(ValueError, match="poster run not started"):
+        await WorkerRunManager(database).enqueue(7, job_type="poster")
+
+    assert database.session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_poster_job_config_persists_only_declared_configuration(monkeypatch) -> None:
+    database = _Database()
+    monkeypatch.setattr("chitti.worker.approved_revision", _approved_revision)
+    monkeypatch.setattr("chitti.worker.get_brand_profile", _present_profile)
+    declared = {"artifact": "campaign/poster.svg", "width": 1200, "height": 628, "scale": 2}
+
+    await WorkerRunManager(database).enqueue(
+        7, job_type="poster", job_config=declared
+    )
+
+    insert = database.session.calls[0]["params"]
+    assert json.loads(str(insert["job_config"])) == declared
+    assert all(not key.startswith("_") for key in json.loads(str(insert["job_config"])))
+
+
+async def _approved_revision(*_args, **_kwargs) -> SimpleNamespace:
+    return SimpleNamespace(id=7, namespace="pj-digi")
+
+
+async def _missing_profile(*_args, **_kwargs):
+    return None
+
+
+async def _present_profile(*_args, **_kwargs):
+    return object()
