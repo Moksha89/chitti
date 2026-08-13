@@ -211,6 +211,42 @@ async def test_poster_planning_requires_brand_profile_and_generates_poster_revis
     assert "poster" in revision.document.tasks[0].title.lower()
 
 
+async def test_planner_retries_once_after_plan_document_validation_error(
+    database, monkeypatch
+) -> None:
+    calls: list[str | None] = []
+    invalid = (
+        '{"title":"Trial","summary":"Trial poster","tasks":['
+        '{"id":1,"title":"Author","description":"Write it.",'
+        '"dependencies":[],"done_condition":"Written."}]}'
+    )
+    valid = (
+        '{"title":"Trial","summary":"Trial poster","tasks":['
+        '{"id":"T1","title":"Author","description":"Write it.",'
+        '"dependencies":[],"done_condition":"Written."}]}'
+    )
+
+    async def plan(_self, _brief, _project, _beliefs, rejection=None, *_args):
+        calls.append(rejection)
+        return invalid if len(calls) == 1 else valid
+
+    monkeypatch.setattr(FakeProvider, "plan", plan)
+    manager = PlanManager(
+        _DatabaseAdapter(database), FakeProvider(), MemoryStore(FakeEmbedder())
+    )
+    job_id = await manager.enqueue("retry-plan", "Create a website.")
+    await asyncio.gather(*manager._jobs)
+    job = await manager.job(job_id)
+    assert job is not None
+    assert job["status"] == "complete"
+    assert job["revision_id"] is not None
+    assert len(calls) == 2
+    assert calls[0] is None
+    assert calls[1] is not None
+    assert "validation" in calls[1]
+    assert "valid string" in calls[1]
+
+
 async def test_plan_revision_job_type_is_required_by_worker_run(database) -> None:
     async with database.begin() as session:
         revision_id = await create_revision(

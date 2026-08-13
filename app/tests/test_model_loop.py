@@ -29,6 +29,7 @@ from chitti.worker import (
     _remember_progress_ledger,
     _replace_model_progress_status,
     _reset_file_write_counter,
+    _reset_file_write_counters,
     _reviewer_diagnosis_messages,
     _source_path_invalidates_gates,
     _starter_context,
@@ -530,6 +531,34 @@ def test_successful_command_resets_write_stall_counter_but_capture_does_not() ->
     assert writes_without_command == 0
     assert _file_write_stall("app/page.js", 1, writes_without_command) is None
     assert _reset_file_write_counter("capture_screenshot", 3) == 3
+    assert _reset_file_write_counters(
+        "run_command",
+        {"name": "poster-export", "args": []},
+        3,
+        {"app/page.js": 3},
+    ) == (0, {})
+
+
+def test_refused_command_resets_file_write_stall_before_repair_write() -> None:
+    counts = {"out/poster.html": 3}
+    writes_without_command, counts = _reset_file_write_counters(
+        "run_command",
+        {"name": "poster-export", "args": []},
+        3,
+        counts,
+    )
+    counts["out/poster.html"] = counts.get("out/poster.html", 0) + 1
+    assert _file_write_stall(
+        "out/poster.html",
+        counts["out/poster.html"],
+        writes_without_command + 1,
+    ) is None
+    assert _reset_file_write_counters(
+        "run_command",
+        {"name": "poster-export", "args": ["unexpected"]},
+        3,
+        {"out/poster.html": 3},
+    ) == (3, {"out/poster.html": 3})
 
 
 def test_model_paths_reject_traversal_and_symlink_escape(tmp_path: Path) -> None:

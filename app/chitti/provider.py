@@ -337,7 +337,9 @@ class LiteLLMProvider:
         prompt = (
             "Create a delivery plan as strict JSON with exactly these top-level keys: "
             "title, summary, tasks, memory_decisions. Each task must have id, title, "
-            "description, dependencies, and done_condition. Dependencies are task ids. "
+            "description, dependencies, and done_condition. Task ids and dependency "
+            "ids must be JSON strings, for example id \"T1\" and dependencies [\"T1\"], "
+            "never numbers. Dependencies are task ids. "
             "Tasks must be ordered and independently testable. memory_decisions must list "
             "which supplied beliefs influenced the plan, with decision_key and influence. "
             "Do not include markdown or extra keys.\n"
