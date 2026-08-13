@@ -36,3 +36,12 @@ def test_same_document_fragment_url_is_allowed() -> None:
 def test_network_and_fetch_forms_are_refused(source: str) -> None:
     with pytest.raises(SystemExit, match="remote URL or runtime fetch"):
         MODULE.validate_poster_source(source, {"freesans"})
+
+
+def test_missing_colour_error_separates_declared_colours() -> None:
+    with pytest.raises(SystemExit, match="TRIAL TEAL, TRIAL GOLD"):
+        MODULE.validate_poster_source(
+            "body { color: TRIAL TEAL; }",
+            {"freesans"},
+            colors=("TRIAL TEAL", "TRIAL GOLD"),
+        )

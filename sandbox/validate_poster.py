@@ -36,7 +36,11 @@ def validate_poster_source(
                 )
     for color in colors:
         if color.casefold() not in source.casefold():
-            raise SystemExit(f"poster source omits declared brand colour: {color}")
+            declared = ", ".join(colors)
+            raise SystemExit(
+                "poster source omits declared brand colour: "
+                f"{color} (declared colours: {declared})"
+            )
     if font and font.casefold() not in source.casefold():
         raise SystemExit(f"poster source omits declared sandbox font: {font}")
 
