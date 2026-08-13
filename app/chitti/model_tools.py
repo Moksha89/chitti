@@ -64,6 +64,7 @@ MODEL_TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
                             "build",
                             "test",
                             "export",
+                            "poster-export",
                         ],
                     },
                     "args": {"type": "array", "items": {}},
@@ -77,12 +78,14 @@ MODEL_TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
         "type": "function",
         "function": {
             "name": "capture_screenshot",
-            "description": "Capture a phone or desktop page screenshot.",
+            "description": "Capture the declared website or poster format.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "route": {"type": "string"},
-                    "width": {"type": "integer", "enum": [390, 1440]},
+                    "width": {"type": "integer", "minimum": 1},
+                    "height": {"type": "integer", "minimum": 1},
+                    "scale": {"type": "integer", "minimum": 1, "maximum": 2},
                 },
                 "required": ["route", "width"],
                 "additionalProperties": False,

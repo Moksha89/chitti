@@ -1,4 +1,5 @@
 import json
+import argparse
 import subprocess
 import sys
 import time
@@ -32,7 +33,15 @@ def _serve_export(workspace: Path) -> subprocess.Popen[bytes]:
     )
 
 
-def capture(workspace: Path = Path("/workspace"), playwright_factory=None) -> None:
+def capture(
+    workspace: Path = Path("/workspace"),
+    playwright_factory=None,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    scale: int = 1,
+    artifact: str | None = None,
+) -> None:
     if playwright_factory is None:
         from playwright.sync_api import sync_playwright
 
@@ -43,11 +52,19 @@ def capture(workspace: Path = Path("/workspace"), playwright_factory=None) -> No
         browser_errors = []
         with playwright_factory() as playwright:
             browser = playwright.chromium.launch()
-            for width, name in ((390, "phone"), (1440, "desktop")):
-                page = browser.new_page(viewport={"width": width, "height": 900})
+            captures = (
+                [(width, height or 900, "poster")]
+                if width is not None
+                else [(390, 900, "phone"), (1440, 900, "desktop")]
+            )
+            for capture_width, capture_height, name in captures:
+                page = browser.new_page(
+                    viewport={"width": capture_width, "height": capture_height},
+                    device_scale_factor=scale,
+                )
                 page.on(
                     "console",
-                    lambda message, name=name, width=width: browser_errors.append(
+                    lambda message, name=name, width=capture_width: browser_errors.append(
                         {"kind": "console", "width": width, "name": name,
                          "type": message.type, "text": message.text}
                     )
@@ -55,14 +72,14 @@ def capture(workspace: Path = Path("/workspace"), playwright_factory=None) -> No
                 )
                 page.on(
                     "pageerror",
-                    lambda error, name=name, width=width: browser_errors.append(
+                    lambda error, name=name, width=capture_width: browser_errors.append(
                         {"kind": "pageerror", "width": width, "name": name,
                          "text": str(error)}
                     ),
                 )
                 page.on(
                     "requestfailed",
-                    lambda request, name=name, width=width: browser_errors.append(
+                    lambda request, name=name, width=capture_width: browser_errors.append(
                         {"kind": "requestfailed", "width": width, "name": name,
                          "url": request.url, "failure": request.failure}
                     )
@@ -82,7 +99,7 @@ def capture(workspace: Path = Path("/workspace"), playwright_factory=None) -> No
                             browser_errors.append(
                                 {
                                     "kind": "next-error-overlay",
-                                    "width": width,
+                                  "width": capture_width,
                                     "name": name,
                                     "text": body_text[:2000],
                                 }
@@ -128,7 +145,7 @@ def capture(workspace: Path = Path("/workspace"), playwright_factory=None) -> No
                         browser_errors.extend(
                             {
                                 "kind": "layout",
-                                "viewport_width": width,
+                                "viewport_width": capture_width,
                                 "name": name,
                                 **error,
                             }
@@ -139,7 +156,12 @@ def capture(workspace: Path = Path("/workspace"), playwright_factory=None) -> No
                         if time.monotonic() >= deadline:
                             raise
                         time.sleep(0.5)
-                page.screenshot(path=f"{workspace}/artifacts/{name}.png", full_page=True)
+                screenshot_path = (
+                    workspace / "artifacts" / f"{name}.png"
+                    if artifact is None
+                    else workspace / "artifacts" / "poster.png"
+                )
+                page.screenshot(path=str(screenshot_path), full_page=artifact is None)
                 page.close()
             browser.close()
         with (workspace / "artifacts/browser-errors.json").open("w", encoding="utf-8") as handle:
@@ -161,4 +183,15 @@ def capture(workspace: Path = Path("/workspace"), playwright_factory=None) -> No
 
 
 if __name__ == "__main__":
-    capture()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--width", type=int)
+    parser.add_argument("--height", type=int)
+    parser.add_argument("--scale", type=int, default=1)
+    parser.add_argument("--poster", action="store_true")
+    args = parser.parse_args()
+    capture(
+        width=args.width if args.poster else None,
+        height=args.height if args.poster else None,
+        scale=args.scale,
+        artifact="poster.png" if args.poster else None,
+    )

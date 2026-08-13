@@ -71,7 +71,7 @@ async def compose_briefing(
         approvals = [f"Run {row.id} is waiting for approval" for row in approvals_result]
         conflicts_result = await session.execute(
             text(
-                "SELECT COUNT(*) FROM memory_conflicts c "
+                "SELECT COUNT(DISTINCT c.existing_decision_id) FROM memory_conflicts c "
                 "JOIN decisions d ON d.id = c.existing_decision_id "
                 "WHERE c.namespace IN (:namespace, :shared) "
                 "AND d.namespace IN (:namespace, :shared) "

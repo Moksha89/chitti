@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git python3 pyt
 RUN groupadd --gid 65532 worker && useradd --uid 65532 --gid 65532 --create-home --shell /usr/sbin/nologin worker
 COPY screenshot.py /opt/screenshot.py
 COPY next_screenshot.py /opt/next_screenshot.py
+COPY validate_poster.py /opt/validate_poster.py
 COPY fixture /opt/fixture
 COPY available_fonts.txt /opt/available_fonts.txt
 

@@ -1291,9 +1291,22 @@ async def start_run(revision_id: int, request: Request) -> RedirectResponse:
     form = await request.form()
     require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
     namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
+    job_type = str(form.get("job_type", "website"))
+    job_config = {
+        "artifact": str(form.get("poster_artifact", "poster.html")),
+        "width": str(form.get("poster_width", "1080")),
+        "height": str(form.get("poster_height", "1350")),
+        "scale": str(form.get("poster_scale", "1")),
+    }
     manager: WorkerRunManager = request.app.state.worker_manager
     try:
-        run_id = await manager.enqueue(revision_id, WorkerLimits(), namespace)
+        run_id = await manager.enqueue(
+            revision_id,
+            WorkerLimits(),
+            namespace,
+            job_type,
+            job_config,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return RedirectResponse(

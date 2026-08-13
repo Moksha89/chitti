@@ -16,6 +16,14 @@ from typing import IO, TYPE_CHECKING, Protocol, cast
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .brand_profiles import get_brand_profile
+from .job_types import (
+    WEBSITE_POLICY,
+    JobTypePolicy,
+    config_json,
+    policy_for,
+    poster_config,
+)
 from .memory import normalize_namespace
 from .model_tools import model_tool_names, model_tool_schemas
 from .namespaces import SHARED_NAMESPACE
@@ -109,6 +117,7 @@ def _model_progress_context(
     completed_commands: set[str],
     inspected_paths: list[str],
     command_outcomes: list[str],
+    required_gates: tuple[str, ...] = REQUIRED_GATE_COMMANDS,
 ) -> str:
     remaining = max(0, MAX_TURNS_WITHOUT_WORKSPACE_CHANGE - nonproductive_turns)
     lines = [
@@ -128,9 +137,9 @@ def _model_progress_context(
             "The remaining allowance is short; another inspection-only turn "
             "without a workspace change will consume one of the turns above."
         )
-    lines.append(_gate_evidence_status(completed_commands))
+    lines.append(_gate_evidence_status(completed_commands, required_gates))
     if nonproductive_turns >= FINISH_HINT_AFTER_NONPRODUCTIVE_TURNS and _task_done_checks(
-        completed_commands
+        completed_commands, required_gates
     ):
         lines.append(
             "The done condition appears satisfiable from that evidence; the "
@@ -172,25 +181,33 @@ def _tool_counts_as_progress(tool: str, command: str | None = None) -> bool:
     return tool == "run_command" and command in MODEL_COMMANDS
 
 
-def _missing_gate_evidence(completed_commands: set[str]) -> list[str]:
-    return [name for name in REQUIRED_GATE_COMMANDS if name not in completed_commands]
+def _missing_gate_evidence(
+    completed_commands: set[str],
+    required_gates: tuple[str, ...] = REQUIRED_GATE_COMMANDS,
+) -> list[str]:
+    return [name for name in required_gates if name not in completed_commands]
 
 
-def _gate_evidence_status(completed_commands: set[str]) -> str:
-    missing = _missing_gate_evidence(completed_commands)
+def _gate_evidence_status(
+    completed_commands: set[str],
+    required_gates: tuple[str, ...] = REQUIRED_GATE_COMMANDS,
+) -> str:
+    missing = _missing_gate_evidence(completed_commands, required_gates)
     if missing:
         return "Current successful gate evidence is missing: " + ", ".join(missing) + "."
     return (
         "Current successful gate evidence is complete ("
-        + ", ".join(REQUIRED_GATE_COMMANDS)
+        + ", ".join(required_gates)
         + ")."
     )
 
 
 def _gate_refusal(
-    completed_commands: set[str], stale_reason: str | None
+    completed_commands: set[str],
+    stale_reason: str | None,
+    required_gates: tuple[str, ...] = REQUIRED_GATE_COMMANDS,
 ) -> str:
-    missing = _missing_gate_evidence(completed_commands)
+    missing = _missing_gate_evidence(completed_commands, required_gates)
     if not missing:
         raise GateEvidenceContradiction(
             "gate refusal requested with complete required gate evidence"
@@ -210,9 +227,10 @@ def _gate_refusal_progress(
     completed_commands: set[str],
     stale_reason: str | None,
     previous_missing: frozenset[str] | None,
+    required_gates: tuple[str, ...] = REQUIRED_GATE_COMMANDS,
 ) -> tuple[str, bool, frozenset[str]]:
-    missing = frozenset(_missing_gate_evidence(completed_commands))
-    refusal = _gate_refusal(completed_commands, stale_reason)
+    missing = frozenset(_missing_gate_evidence(completed_commands, required_gates))
+    refusal = _gate_refusal(completed_commands, stale_reason, required_gates)
     repeated = previous_missing == missing
     return refusal, not repeated, missing
 
@@ -360,6 +378,14 @@ MODEL_COMMANDS: dict[str, tuple[str, tuple[str, ...], str]] = {
         "none",
     ),
     "export": ("static-export", ("sh", "-c", "test -f out/index.html"), "none"),
+    "poster-export": (
+        "poster-export",
+        (
+            "python3",
+            "/opt/validate_poster.py",
+        ),
+        "none",
+    ),
 }
 
 
@@ -432,15 +458,30 @@ class DockerSandboxDispatcher:
         workspace = self.workspace_root / f"chitti-run-{run_id}"
         workspace.mkdir(parents=True, exist_ok=True)
         try:
-            await self._mount_workspace(workspace, limits)
             await self._event(run_id, "running", "run started")
             if self._is_cancelled(run_id):
                 await self._event(run_id, "cancelled", "cancelled before operation")
                 return
+            async with self.database.sessions() as session:
+                run_result = await session.execute(
+                    text("SELECT job_type, job_config FROM worker_runs WHERE id = :run_id"),
+                    {"run_id": run_id},
+                )
+                run_row = run_result.mappings().one()
+            job_type = str(run_row["job_type"])
+            policy = policy_for(job_type)
+            job_config = (
+                poster_config(run_row["job_config"]) if policy.is_poster else {}
+            )
+            await self._mount_workspace(workspace, limits)
             if self.model_provider is not None:
-                await self._dispatch_model_one(revision, run_id, limits, workspace)
+                await self._dispatch_model_one(
+                    revision, run_id, limits, workspace, policy, job_config
+                )
                 return
-            for index, operation in enumerate(fixed_operations(revision)):
+            for index, operation in enumerate(
+                fixed_operations(revision, policy, job_config)
+            ):
                 if self._is_cancelled(run_id):
                     await self._event(run_id, "cancelled", "cancelled before operation")
                     return
@@ -450,7 +491,9 @@ class DockerSandboxDispatcher:
                 )
                 await self._task_event(run_id, operation.task_id, "running", operation.name)
                 started = datetime.now(UTC)
-                command = self._docker_command(operation, workspace, run_id, limits)
+                command = self._docker_command(
+                    operation, workspace, run_id, limits, job_config
+                )
                 try:
                     result, stdout, stderr = await self._run_container(
                         run_id, command, limits, operation_index=index
@@ -489,7 +532,13 @@ class DockerSandboxDispatcher:
             await self._cleanup_workspace(workspace)
 
     async def _dispatch_model_one(
-        self, revision: PlanRevision, run_id: int, limits: WorkerLimits, workspace: Path
+        self,
+        revision: PlanRevision,
+        run_id: int,
+        limits: WorkerLimits,
+        workspace: Path,
+        policy: JobTypePolicy,
+        job_config: dict[str, object],
     ) -> None:
         assert self.model_provider is not None
         started = time.monotonic()
@@ -505,10 +554,15 @@ class DockerSandboxDispatcher:
             run_id, init, 0, "passed", _init_out, init_err,
             init_result.returncode, datetime.now(UTC),
         )
+        fixture_command = (
+            "mkdir -p /workspace/out /workspace/artifacts"
+            if policy.is_poster
+            else "cp -r /opt/fixture/. /workspace/ && mkdir -p /workspace/artifacts"
+        )
         fixture = FixedOperation(
             "runner",
             "write-fixture",
-            ("sh", "-c", "cp -r /opt/fixture/. /workspace/ && mkdir -p /workspace/artifacts"),
+            ("sh", "-c", fixture_command),
         )
         fixture_result, fixture_out, fixture_err = await self._run_container(
             run_id, self._docker_command(fixture, workspace, run_id, limits), limits,
@@ -531,7 +585,20 @@ class DockerSandboxDispatcher:
                 )
             )
             beliefs = [dict(row._mapping) for row in result]
-        stable = _model_system_prompt()
+        profile = None
+        if policy.is_poster:
+            async with self.database.sessions() as session:
+                profile = await get_brand_profile(session, revision.namespace)
+            if profile is None:
+                raise RuntimeError(
+                    "poster run refused: no brand profile is recorded for this namespace"
+                )
+            job_config = {
+                **job_config,
+                "_colors": "|".join(profile.brand_colors),
+                "_font": profile.typography,
+            }
+        stable = _model_system_prompt(policy, profile)
         spent = 0.0
         spent_tokens = 0
         calls = 0
@@ -654,6 +721,7 @@ class DockerSandboxDispatcher:
                         completed_commands,
                         inspected_paths,
                         command_outcomes,
+                        policy.required_gates,
                     ),
                 )
                 try:
@@ -746,7 +814,9 @@ class DockerSandboxDispatcher:
                             raise RunBudgetExceeded("model tool-call")
                         else:
                             tool_calls_used += 1
-                            if tool == "finish" and _task_done_checks(completed_commands):
+                            if tool == "finish" and _task_done_checks(
+                                completed_commands, policy.required_gates
+                            ):
                                 await self._event(
                                     run_id, "task_finished",
                                     str(arguments.get("summary", ""))[:2000],
@@ -770,6 +840,7 @@ class DockerSandboxDispatcher:
                                     completed_commands,
                                     gate_stale_reason,
                                     last_refused_missing_gates,
+                                    policy.required_gates,
                                 )
                                 batch_refusal_progress = refusal_progress
                                 batch_failure = result_text
@@ -786,6 +857,7 @@ class DockerSandboxDispatcher:
                                         await self._execute_model_tool(
                                             run_id, task.id, operation_index, tool,
                                             arguments, workspace, limits, route,
+                                            policy, job_config,
                                         )
                                     )
                                     self._raise_if_cancelled(run_id)
@@ -802,7 +874,7 @@ class DockerSandboxDispatcher:
                                                 "by sync-lockfile"
                                             )
                                             last_refused_missing_gates = None
-                                        elif not _missing_gate_evidence(completed_commands):
+                                        elif not _missing_gate_evidence(completed_commands, policy.required_gates):
                                             gate_stale_reason = None
                                         file_writes_without_command = (
                                             _reset_file_write_counter(
@@ -931,7 +1003,9 @@ class DockerSandboxDispatcher:
                 if tool_calls_used >= limits.model_tool_calls:
                     raise RunBudgetExceeded("model tool-call")
                 tool_calls_used += 1
-                if tool == "finish" and _task_done_checks(completed_commands):
+                if tool == "finish" and _task_done_checks(
+                    completed_commands, policy.required_gates
+                ):
                     await self._event(
                         run_id, "task_finished",
                         str(arguments.get("summary", ""))[:2000], task_id=task.id,
@@ -951,6 +1025,7 @@ class DockerSandboxDispatcher:
                         completed_commands,
                         gate_stale_reason,
                         last_refused_missing_gates,
+                        policy.required_gates,
                     )
                     await record_nonproductive(
                         result_text, workspace_changed=refusal_progress
@@ -967,7 +1042,7 @@ class DockerSandboxDispatcher:
                     )
                     result_text, written, operation_index = await self._execute_model_tool(
                         run_id, task.id, operation_index, tool, arguments,
-                        workspace, limits, route,
+                        workspace, limits, route, policy, job_config,
                     )
                     self._raise_if_cancelled(run_id)
                     writes += written
@@ -982,7 +1057,7 @@ class DockerSandboxDispatcher:
                                 "previous gate evidence was invalidated by sync-lockfile"
                             )
                             last_refused_missing_gates = None
-                        elif not _missing_gate_evidence(completed_commands):
+                        elif not _missing_gate_evidence(completed_commands, policy.required_gates):
                             gate_stale_reason = None
                         file_writes_without_command = _reset_file_write_counter(
                             tool, file_writes_without_command
@@ -1075,7 +1150,7 @@ class DockerSandboxDispatcher:
         )
         await self._capture_workspace_artifacts(run_id, workspace, limits)
         await self._review_run(
-            run_id, revision, limits, spent, spent_tokens, calls, workspace
+            run_id, revision, limits, spent, spent_tokens, calls, workspace, policy
         )
         await self._create_export_manifest(run_id, revision, workspace)
         await self._event(run_id, "passed", "model tasks and reviewer passed")
@@ -1144,7 +1219,10 @@ class DockerSandboxDispatcher:
     async def _execute_model_tool(
         self, run_id: int, task_id: str, operation_index: int, tool: str,
         arguments: dict[str, object], workspace: Path, limits: WorkerLimits, route: str,
+        policy: JobTypePolicy = WEBSITE_POLICY,
+        job_config: dict[str, object] | None = None,
     ) -> tuple[str, int, int]:
+        job_config = job_config or {}
         if tool == "list_files":
             path = _confined_path(workspace, str(arguments.get("path", ".")))
             return json.dumps(sorted(item.name for item in path.iterdir())[:200]), 0, operation_index
@@ -1169,11 +1247,34 @@ class DockerSandboxDispatcher:
         if tool == "capture_screenshot":
             route_value = str(arguments.get("route", "/"))
             width = int(cast(int, arguments.get("width", 390)))
-            if not route_value.startswith("/") or width not in {390, 1440}:
+            height = int(cast(int, arguments.get("height", 900)))
+            scale = int(cast(int, arguments.get("scale", 1)))
+            if not route_value.startswith("/"):
                 raise ValueError("invalid screenshot route or width")
-            operation = FixedOperation(task_id, "capture-screenshot", ("python3", "/opt/next_screenshot.py"))
+            if policy.is_poster:
+                requested = poster_config(
+                    {**job_config, "width": width, "height": height, "scale": scale}
+                )
+                capture_args = (
+                    f"--width {requested['width']} --height {requested['height']} "
+                    f"--scale {requested['scale']} "
+                )
+                capture_command = (
+                    "python3 /opt/next_screenshot.py "
+                    + capture_args
+                    + "--poster"
+                )
+            else:
+                if width not in {390, 1440} or height != 900 or scale != 1:
+                    raise ValueError("website screenshots only support 390x900 and 1440x900")
+                capture_command = "python3 /opt/next_screenshot.py"
+            operation = FixedOperation(
+                task_id, "capture-screenshot", ("sh", "-c", capture_command)
+            )
             result, stdout, stderr = await self._run_container(
-                run_id, self._docker_command(operation, workspace, run_id, limits), limits,
+                run_id,
+                self._docker_command(operation, workspace, run_id, limits, job_config),
+                limits,
                 operation_index=operation_index + 1,
             )
             operation_index += 1
@@ -1193,12 +1294,14 @@ class DockerSandboxDispatcher:
             name = str(arguments.get("name", ""))
             if arguments.get("args", []) not in ([], None):
                 raise ValueError("arbitrary command arguments are not allowed")
-            if name not in MODEL_COMMANDS:
+            if name not in policy.model_commands:
                 raise ValueError("unknown allowlisted command")
             op_name, command, network = MODEL_COMMANDS[name]
             operation = FixedOperation(task_id, op_name, command, network=network)
             result, stdout, stderr = await self._run_container(
-                run_id, self._docker_command(operation, workspace, run_id, limits), limits,
+                run_id,
+                self._docker_command(operation, workspace, run_id, limits, job_config),
+                limits,
                 operation_index=operation_index + 1,
             )
             operation_index += 1
@@ -1218,11 +1321,18 @@ class DockerSandboxDispatcher:
     async def _review_run(
         self, run_id: int, revision: PlanRevision, limits: WorkerLimits,
         spent: float, spent_tokens: int, calls: int, workspace: Path,
+        policy: JobTypePolicy = WEBSITE_POLICY,
     ) -> None:
         assert self.model_provider is not None
         evidence = await self._review_evidence(run_id, workspace)
+        if policy.is_poster:
+            async with self.database.sessions() as session:
+                profile = await get_brand_profile(session, revision.namespace)
+            evidence += "\nAUTHORITATIVE BRAND PROFILE:\n" + json.dumps(
+                getattr(profile, "__dict__", {}), default=str
+            )
         review_messages: list[dict[str, object]] = [
-            {"role": "system", "content": _reviewer_system_prompt()},
+            {"role": "system", "content": _reviewer_system_prompt(policy)},
             {
                 "role": "user",
                 "content": (
@@ -1231,7 +1341,9 @@ class DockerSandboxDispatcher:
                     "with verdict (pass or fail), findings (specific observations), "
                     "evidence_limitations, and summary. Do not claim to inspect "
                     "pixels or image contents; image dimensions and browser errors "
-                    "are the available screenshot facts.\n\n"
+                    "are the available screenshot facts. For a poster, explicitly "
+                    "state that visual quality was not assessed and that owner "
+                    "approval is required for visual quality.\n\n"
                     f"{evidence}"
                 ),
             },
@@ -1301,12 +1413,19 @@ class DockerSandboxDispatcher:
                     "npm-install",
                     "next-build",
                     "run-tests",
+                    "poster-export",
                     "capture-screenshot",
                     "git-diff",
                 }
             ][-20:]
         facts: list[dict[str, object]] = []
-        for name in ("phone.png", "desktop.png", "browser-errors.json", "workspace.diff"):
+        for name in (
+            "phone.png",
+            "desktop.png",
+            "poster.png",
+            "browser-errors.json",
+            "workspace.diff",
+        ):
             path = workspace / "artifacts" / name
             if not path.is_file():
                 continue
@@ -1323,6 +1442,16 @@ class DockerSandboxDispatcher:
                 if name == "browser-errors.json":
                     item["content"] = path.read_text(encoding="utf-8")[:8000]
             facts.append(item)
+        for source in sorted((workspace / "out").rglob("*")) if (workspace / "out").is_dir() else ():
+            if source.is_file() and source.suffix.lower() in {".html", ".css", ".svg"}:
+                facts.append(
+                    {
+                        "path": str(source.relative_to(workspace)),
+                        "source_excerpt": source.read_text(
+                            encoding="utf-8", errors="replace"
+                        )[:12000],
+                    }
+                )
         return json.dumps({"operations": rows, "artifacts": facts}, default=str)
 
     async def _record_model_call(
@@ -2073,8 +2202,9 @@ class DockerSandboxDispatcher:
     def _docker_command(
         self, operation: FixedOperation, workspace: Path,
         run_id: int, limits: WorkerLimits,
+        job_config: dict[str, object] | None = None,
     ) -> list[str]:
-        return [
+        command = [
             "docker", "run", "--name", f"chitti-worker-{run_id}",
             "--network", operation.network, "--cpus", str(limits.cpus),
             "--memory", limits.memory, "--pids-limit", str(limits.pids),
@@ -2084,6 +2214,15 @@ class DockerSandboxDispatcher:
             "--mount", f"type=bind,src={workspace},dst=/workspace",
             self.image, *operation.command,
         ]
+        if job_config and "artifact" in job_config:
+            image_index = command.index(self.image)
+            env = ["--env", f"CHITTI_POSTER_ARTIFACT={job_config['artifact']}"]
+            if "_colors" in job_config:
+                env.extend(["--env", f"CHITTI_POSTER_COLORS={job_config['_colors']}"])
+            if "_font" in job_config:
+                env.extend(["--env", f"CHITTI_POSTER_FONT={job_config['_font']}"])
+            command[image_index:image_index] = env
+        return command
 
     async def _event(
         self, run_id: int, status: str, detail: str,
@@ -2250,20 +2389,28 @@ class WorkerRunManager:
         revision_id: int,
         limits: WorkerLimits | None = None,
         namespace: str = SHARED_NAMESPACE,
+        job_type: str = "website",
+        job_config: object | None = None,
     ) -> int:
         chosen = limits or WorkerLimits()
         namespace = normalize_namespace(namespace)
+        policy = policy_for(job_type)
+        normalized_config = poster_config(job_config) if policy.is_poster else {}
         async with self.database.sessions() as session:
             revision = await approved_revision(session, revision_id, namespace)
             result = await session.execute(
                 text(
-                    "INSERT INTO worker_runs (revision_id, limits, workspace_id) "
-                    "VALUES (:revision_id, CAST(:limits AS json), :workspace_id) RETURNING id"
+                    "INSERT INTO worker_runs "
+                    "(revision_id, limits, workspace_id, job_type, job_config) "
+                    "VALUES (:revision_id, CAST(:limits AS json), :workspace_id, "
+                    ":job_type, CAST(:job_config AS json)) RETURNING id"
                 ),
                 {
                     "revision_id": revision.id,
                     "limits": json.dumps(chosen.as_json()),
                     "workspace_id": f"run-{revision.id}",
+                    "job_type": policy.name,
+                    "job_config": config_json(normalized_config),
                 },
             )
             run_id = int(result.scalar_one())
@@ -2295,7 +2442,8 @@ class WorkerRunManager:
         async with self.database.sessions() as session:
             run_result = await session.execute(
                 text(
-                    "SELECT r.id, r.revision_id, r.limits, r.workspace_id, r.created_at, "
+                    "SELECT r.id, r.revision_id, r.limits, r.workspace_id, r.job_type, "
+                    "r.job_config, r.created_at, "
                     "p.namespace "
                     "FROM worker_runs r JOIN plan_revisions p ON p.id = r.revision_id "
                     "WHERE r.id = :run_id"
@@ -2489,14 +2637,23 @@ def _tool_rejection_exchange(
     return exchange
 
 
-def _task_done_checks(completed_commands: set[str]) -> bool:
-    return not _missing_gate_evidence(completed_commands)
+def _task_done_checks(
+    completed_commands: set[str],
+    required_gates: tuple[str, ...] = REQUIRED_GATE_COMMANDS,
+) -> bool:
+    return not _missing_gate_evidence(completed_commands, required_gates)
 
 
 def _record_gate_command(evidence: set[str], command: str) -> None:
     if command == "sync-lockfile":
         evidence.clear()
-    elif command in {"build", "test", "export", "capture_screenshot"}:
+    elif command in {
+        "build",
+        "test",
+        "export",
+        "poster-export",
+        "capture_screenshot",
+    }:
         evidence.add(command)
 
 
@@ -2619,7 +2776,25 @@ def _message_units(messages: list[dict[str, object]]) -> list[list[dict[str, obj
     return units
 
 
-def _model_system_prompt() -> str:
+def _model_system_prompt(
+    policy: JobTypePolicy = WEBSITE_POLICY,
+    profile: object | None = None,
+) -> str:
+    if policy.is_poster:
+        profile_data = getattr(profile, "__dict__", {})
+        return (
+            "You are producing one offline poster artifact, not a website. "
+            "Write only HTML, CSS, and SVG; do not use npm, package.json, lockfiles, "
+            "JavaScript frameworks, remote URLs, runtime fetches, or external fonts. "
+            "Use only the supplied sandbox font manifest. The owner brand profile is "
+            "authoritative and must be reflected exactly; do not invent colours, voice, "
+            "audience, or typography. Create the declared artifact under out/ and an "
+            "out/index.html entry that renders it for the cage capture. Run "
+            "poster-export, then capture_screenshot with the declared dimensions and "
+            "device scale. The reviewer can inspect source facts and dimensions, not "
+            "visual quality, which requires owner approval.\n"
+            f"BRAND PROFILE:\n{json.dumps(profile_data, default=str)}"
+        )
     return (
         "Stable worker rules come first. Use the provided native function tools and "
         "return exactly one tool call per response; never emit shell commands. A JSON "
@@ -2724,7 +2899,14 @@ def _install_failure_detail(name: str, detail: str) -> str:
     return detail
 
 
-def _reviewer_system_prompt() -> str:
+def _reviewer_system_prompt(policy: JobTypePolicy = WEBSITE_POLICY) -> str:
+    poster_rule = (
+        " For poster jobs, judge artifact existence, declared dimensions, browser "
+        "and layout errors, and source-level brand colour/font facts only. State "
+        "plainly that visual quality was not assessed and requires owner approval."
+        if policy.is_poster
+        else ""
+    )
     return (
         "You are the reviewer route. Return one strict JSON object with exactly "
         'the fields {"verdict":"pass|fail","findings":[],"evidence_limitations":[],'
@@ -2734,12 +2916,57 @@ def _reviewer_system_prompt() -> str:
         "requires verdict fail. A failed attempt followed by a successful retry is "
         "a finding but not an unresolved failure. Do not claim to inspect screenshot "
         "pixels: the prompt only contains screenshot dimensions and browser evidence "
-        "facts. Do not write files or propose shell commands."
+        f"facts. Do not write files or propose shell commands.{poster_rule}"
     )
 
 
-def fixed_operations(revision: PlanRevision) -> tuple[FixedOperation, ...]:
+def fixed_operations(
+    revision: PlanRevision,
+    policy: JobTypePolicy = WEBSITE_POLICY,
+    job_config: dict[str, object] | None = None,
+) -> tuple[FixedOperation, ...]:
     first = revision.document.tasks[0]
+    if policy.is_poster:
+        config = poster_config(job_config)
+        return (
+            FixedOperation(first.id, "git-init", ("sh", "-c", "git init -q /workspace")),
+            FixedOperation(
+                first.id,
+                "write-fixture",
+                ("sh", "-c", "mkdir -p /workspace/out /workspace/artifacts"),
+            ),
+            FixedOperation(
+                first.id,
+                "poster-export",
+                (
+                    "sh",
+                    "-c",
+                    "test -f \"$CHITTI_POSTER_ARTIFACT\"",
+                ),
+            ),
+            FixedOperation(
+                first.id,
+                "browser-preview",
+                (
+                    "sh",
+                    "-c",
+                    "python3 /opt/next_screenshot.py "
+                    f"--width {config['width']} --height {config['height']} "
+                    f"--scale {config['scale']} --poster",
+                ),
+            ),
+            FixedOperation(
+                first.id,
+                "git-diff",
+                (
+                    "sh",
+                    "-c",
+                    "cd /workspace && git add -A -f -- . "
+                    "':(exclude)artifacts' && git diff --cached --no-ext-diff "
+                    "> artifacts/workspace.diff",
+                ),
+            ),
+        )
     return (
         FixedOperation(
             first.id,
