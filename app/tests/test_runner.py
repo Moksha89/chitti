@@ -11,6 +11,7 @@ from chitti.provider import GatewayMisconfigurationError, GatewayTransientError
 from chitti.reminders import next_due
 from chitti.runner_access import (
     assert_runner_privileges,
+    derived_grants,
     owned_sequences,
     required_privileges,
     runner_source_texts,
@@ -128,6 +129,81 @@ def test_runner_access_follows_newly_imported_module(tmp_path, monkeypatch) -> N
 
     assert required_privileges(sources, {"newly_imported_table"}) == {
         "newly_imported_table": {"SELECT"}
+    }
+
+
+def test_runner_access_rejects_derived_application_only_write() -> None:
+    with pytest.raises(
+        SystemExit, match="would widen application-only writes on decisions"
+    ):
+        derived_grants(
+            [
+                (
+                    "application_only_sql(text(\"INSERT INTO decisions "
+                    "(decision) VALUES ('app-only')\"))"
+                ),
+                "INSERT INTO decisions (decision) VALUES ('unclassified')",
+            ],
+            {"decisions"},
+        )
+
+
+def test_runner_access_masks_declared_sensitive_read() -> None:
+    assert derived_grants(
+        [
+            (
+                "application_only_sql(text(\"SELECT content FROM "
+                "chat_transcript_entries\"))"
+            ),
+            "SELECT id FROM decisions",
+        ],
+        {"chat_transcript_entries", "decisions"},
+    ) == {"decisions": {"SELECT"}}
+
+
+def test_runner_access_rejects_sensitive_read_before_granting() -> None:
+    with pytest.raises(
+        SystemExit, match="reached sensitive tables: chat_transcript_entries"
+    ):
+        derived_grants(
+            [
+                "SELECT content FROM chat_transcript_entries",
+                "SELECT id FROM decisions",
+            ],
+            {"chat_transcript_entries", "decisions"},
+        )
+
+
+def test_runner_access_accounts_for_upsert_and_returning_privileges() -> None:
+    assert required_privileges(
+        [
+            (
+                "INSERT INTO runner_health (component) VALUES ('sweep') "
+                "ON CONFLICT (component) DO UPDATE SET status = EXCLUDED.status "
+                "RETURNING component"
+            )
+        ],
+        {"runner_health"},
+    ) == {"runner_health": {"INSERT", "SELECT", "UPDATE"}}
+
+
+def test_runner_access_accounts_for_unaliased_for_update() -> None:
+    assert required_privileges(
+        ["SELECT id FROM worker_runs FOR UPDATE"],
+        {"worker_runs"},
+    ) == {"worker_runs": {"SELECT", "UPDATE"}}
+
+
+def test_runner_access_accounts_for_delete_using() -> None:
+    assert required_privileges(
+        [
+            "DELETE FROM worker_artifacts USING worker_operations "
+            "WHERE worker_artifacts.operation_id = worker_operations.id"
+        ],
+        {"worker_artifacts", "worker_operations"},
+    ) == {
+        "worker_artifacts": {"DELETE"},
+        "worker_operations": {"SELECT"},
     }
 
 

@@ -13,12 +13,47 @@ _TABLE_REFERENCE = re.compile(
     re.IGNORECASE,
 )
 _FOR_UPDATE = re.compile(r"\bFOR\s+UPDATE\s+OF\s+([a-z_][a-z0-9_]*)", re.IGNORECASE)
+_FOR_UPDATE_TABLE = re.compile(
+    r"\bFROM\s+([a-z_][a-z0-9_]*)(?:\s+[a-z_][a-z0-9_]*)?\s+FOR\s+UPDATE\b",
+    re.IGNORECASE,
+)
 _TABLE_ALIAS = re.compile(
     r"\bFROM\s+([a-z_][a-z0-9_]*)\s+([a-z_][a-z0-9_]*)", re.IGNORECASE
+)
+_WRITE_TARGET = re.compile(
+    r"\b(?:INSERT\s+INTO|(?<!DO )UPDATE|DELETE\s+FROM)\s+"
+    r"([a-z_][a-z0-9_]*)\b",
+    re.IGNORECASE,
+)
+_DELETE_USING = re.compile(
+    r"\bDELETE\s+FROM\s+[a-z_][a-z0-9_]*\s+USING\s+"
+    r"([a-z_][a-z0-9_]*)",
+    re.IGNORECASE,
+)
+_RETURNING = re.compile(r"\bRETURNING\b", re.IGNORECASE)
+_WRITE_PRIVILEGES = frozenset({"INSERT", "UPDATE", "DELETE"})
+SENSITIVE_RUNNER_TABLES = frozenset(
+    {
+        "auth_sessions",
+        "auth_users",
+        "chat_transcript_entries",
+        "credential_store",
+        "decision_embeddings",
+        "memory_chunks",
+        "memory_conflicts",
+        "memory_namespaces",
+        "provider_credentials",
+        "provider_keys",
+        "session_store",
+    }
 )
 
 
 def application_only_sql(statement: Any) -> Any:
+    return statement
+
+
+def runner_sql(statement: Any) -> Any:
     return statement
 
 
@@ -51,6 +86,113 @@ def _mask_application_only_sql(source: str) -> str:
     return "".join(masked)
 
 
+def _scan_privileges(
+    source: str, known_tables: set[str] | None = None
+) -> dict[str, set[str]]:
+    privileges: dict[str, set[str]] = {}
+    aliases: dict[str, str] = {}
+    for match in _TABLE_ALIAS.finditer(source):
+        aliases[match.group(2).lower()] = match.group(1).lower()
+    for match in _TABLE_REFERENCE.finditer(source):
+        verb, table = match.groups()
+        table = table.lower()
+        if known_tables is not None and table not in known_tables:
+            continue
+        privilege = "DELETE" if verb.upper().startswith("DELETE") else {
+            "FROM": "SELECT",
+            "JOIN": "SELECT",
+            "INTO": "INSERT",
+            "UPDATE": "UPDATE",
+        }[verb.upper()]
+        privileges.setdefault(table, set()).add(privilege)
+    for match in _FOR_UPDATE.finditer(source):
+        table = aliases.get(match.group(1).lower())
+        if table is not None and (
+            known_tables is None or table in known_tables
+        ):
+            privileges.setdefault(table, set()).add("UPDATE")
+    for match in _FOR_UPDATE_TABLE.finditer(source):
+        privileges.setdefault(match.group(1).lower(), set()).add("UPDATE")
+    write_targets = list(_WRITE_TARGET.finditer(source))
+    for index, match in enumerate(write_targets):
+        end = (
+            write_targets[index + 1].start()
+            if index + 1 < len(write_targets)
+            else len(source)
+        )
+        statement = source[match.start() : end]
+        table = match.group(1).lower()
+        if _RETURNING.search(statement):
+            privileges.setdefault(table, set()).add("SELECT")
+        if re.search(r"\bON\s+CONFLICT\b[\s\S]*?\bDO\s+UPDATE\b", statement, re.I):
+            privileges.setdefault(table, set()).add("UPDATE")
+    for match in _DELETE_USING.finditer(source):
+        privileges.setdefault(match.group(1).lower(), set()).add("SELECT")
+    return privileges
+
+
+def _declared_segments(source: str, marker: str) -> list[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    segments: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if (
+            isinstance(function, ast.Name)
+            and function.id == marker
+        ):
+            segment = ast.get_source_segment(source, node)
+            if segment is not None:
+                segments.append(segment)
+    return segments
+
+
+def _declared_privileges(
+    source_texts: list[str], marker: str, known_tables: set[str] | None = None
+) -> dict[str, set[str]]:
+    declared: dict[str, set[str]] = {}
+    for source in source_texts:
+        for segment in _declared_segments(source, marker):
+            for table, privileges in _scan_privileges(segment, known_tables).items():
+                declared.setdefault(table, set()).update(privileges)
+    return declared
+
+
+def application_only_privileges(
+    source_texts: list[str], known_tables: set[str] | None = None
+) -> dict[str, set[str]]:
+    return _declared_privileges(source_texts, "application_only_sql", known_tables)
+
+
+def runner_privileges(
+    source_texts: list[str], known_tables: set[str] | None = None
+) -> dict[str, set[str]]:
+    return _declared_privileges(source_texts, "runner_sql", known_tables)
+
+
+def _validate_runner_write_boundary(
+    required: dict[str, set[str]],
+    application_only: dict[str, set[str]],
+    runner_declared: dict[str, set[str]],
+) -> None:
+    for table, privileges in required.items():
+        overlap = (
+            (privileges & _WRITE_PRIVILEGES)
+            & application_only.get(table, set())
+            - runner_declared.get(table, set())
+        )
+        if overlap:
+            values = ", ".join(sorted(overlap))
+            raise SystemExit(
+                f"runner privilege derivation would widen application-only "
+                f"writes on {table}: {values}"
+            )
+
+
 def required_privileges(
     source_texts: list[str], known_tables: set[str] | None = None
 ) -> dict[str, set[str]]:
@@ -58,30 +200,32 @@ def required_privileges(
     # unusual SQL shapes can be missed. False positives fail deployment safely;
     # the durable runner health surface is the backstop for missed references.
     privileges: dict[str, set[str]] = {}
-    aliases: dict[str, str] = {}
     for source in source_texts:
-        source = _mask_application_only_sql(source)
-        for match in _TABLE_ALIAS.finditer(source):
-            aliases[match.group(2).lower()] = match.group(1).lower()
-        for match in _TABLE_REFERENCE.finditer(source):
-            verb, table = match.groups()
-            table = table.lower()
-            if known_tables is not None and table not in known_tables:
-                continue
-            privilege = "DELETE" if verb.upper().startswith("DELETE") else {
-                "FROM": "SELECT",
-                "JOIN": "SELECT",
-                "INTO": "INSERT",
-                "UPDATE": "UPDATE",
-            }[verb.upper()]
-            privileges.setdefault(table, set()).add(privilege)
-        for match in _FOR_UPDATE.finditer(source):
-            table = aliases.get(match.group(1).lower())
-            if table is not None and (
-                known_tables is None or table in known_tables
-            ):
-                privileges.setdefault(table, set()).add("UPDATE")
+        for table, values in _scan_privileges(
+            _mask_application_only_sql(source), known_tables
+        ).items():
+            privileges.setdefault(table, set()).update(values)
     return privileges
+
+
+def derived_grants(
+    source_texts: list[str], known_tables: set[str]
+) -> dict[str, set[str]]:
+    required = required_privileges(source_texts, known_tables)
+    if not required:
+        raise SystemExit("runner privilege derivation produced no table expectations")
+    sensitive = sorted(set(required) & SENSITIVE_RUNNER_TABLES)
+    if sensitive:
+        raise SystemExit(
+            "runner privilege derivation reached sensitive tables: "
+            + ", ".join(sensitive)
+        )
+    _validate_runner_write_boundary(
+        required,
+        application_only_privileges(source_texts, known_tables),
+        runner_privileges(source_texts, known_tables),
+    )
+    return required
 
 
 def _imported_local_modules(module_name: str, source: str) -> set[str]:
@@ -201,9 +345,7 @@ async def assert_runner_privileges(
         source_texts = runner_source_texts()
     if not source_texts:
         raise SystemExit("runner privilege source derivation produced no sources")
-    required = required_privileges(source_texts, tables)
-    if not required:
-        raise SystemExit("runner privilege derivation produced no table expectations")
+    required = derived_grants(source_texts, tables)
     for table, privileges in required.items():
         for privilege in privileges:
             allowed = await conn.fetchval(
@@ -242,4 +384,57 @@ async def assert_runner_privileges(
             ):
                 raise SystemExit(
                     f"runner unexpectedly has {privilege} on brand_profiles"
+                )
+    if "decisions" in tables:
+        for privilege in ("INSERT", "UPDATE", "DELETE"):
+            if await conn.fetchval(
+                "SELECT has_table_privilege(current_user, 'decisions', $1)",
+                privilege,
+            ):
+                raise SystemExit(
+                    f"runner unexpectedly has {privilege} on decisions"
+                )
+
+
+def _quoted_identifier(value: str) -> str:
+    if not re.fullmatch(r"[a-z_][a-z0-9_]*", value):
+        raise ValueError(f"unsafe PostgreSQL identifier: {value}")
+    return f'"{value}"'
+
+
+async def reconcile_runner_privileges(
+    conn: Any,
+    grantee: str = "chitti_runner",
+    source_texts: list[str] | None = None,
+) -> None:
+    tables = {
+        str(row["table_name"])
+        for row in await conn.fetch(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public'"
+        )
+    }
+    if source_texts is None:
+        source_texts = runner_source_texts()
+    if not source_texts:
+        raise SystemExit("runner privilege source derivation produced no sources")
+    required = derived_grants(source_texts, tables)
+    grantee_sql = _quoted_identifier(grantee)
+    await conn.execute(
+        f"REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM {grantee_sql}"
+    )
+    await conn.execute(
+        f"REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM {grantee_sql}"
+    )
+    for table, privileges in sorted(required.items()):
+        values = ", ".join(sorted(privileges))
+        print(f"runner derived grant {table}: {values}")
+        await conn.execute(
+            f"GRANT {values} ON {_quoted_identifier(table)} TO {grantee_sql}"
+        )
+        if "INSERT" in privileges:
+            for sequence in await owned_sequences(conn, table):
+                print(f"runner derived sequence grant {sequence}: USAGE, SELECT")
+                await conn.execute(
+                    f"GRANT USAGE, SELECT ON {sequence} TO {grantee_sql}"
                 )

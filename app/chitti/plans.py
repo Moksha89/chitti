@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .memory import normalize_namespace
 from .namespaces import SHARED_NAMESPACE
-from .runner_access import application_only_sql
+from .runner_access import application_only_sql, runner_sql
 
 if TYPE_CHECKING:
     from .db import Database
@@ -130,10 +130,10 @@ async def create_revision(
     content = document.model_dump(mode="json")
     digest = plan_hash(document)
     revision_result = await session.execute(
-        text(
+        application_only_sql(text(
             "SELECT COALESCE(MAX(revision), 0) + 1 FROM plan_revisions "
             "WHERE project = :project"
-        ),
+        )),
         {"project": project},
     )
     revision = int(revision_result.scalar_one())
@@ -157,11 +157,11 @@ async def create_revision(
     revision_id = int(result.scalar_one())
     for task in document.tasks:
         await session.execute(
-            text(
+            application_only_sql(text(
                 "INSERT INTO plan_task_events "
                 "(revision_id, task_id, event_type, status, detail) "
                 "VALUES (:revision_id, :task_id, 'created', 'queued', :detail)"
-            ),
+            )),
             {
                 "revision_id": revision_id,
                 "task_id": task.id,
@@ -214,7 +214,7 @@ class PlanManager:
     async def resume_queued(self) -> None:
         async with self.database.sessions() as session:
             result = await session.execute(
-                text("SELECT id FROM plan_jobs WHERE status IN ('queued', 'running')")
+                application_only_sql(text("SELECT id FROM plan_jobs WHERE status IN ('queued', 'running')"))
             )
             job_ids = [int(row.id) for row in result]
         for job_id in job_ids:
@@ -226,10 +226,10 @@ class PlanManager:
         async with self.database.sessions() as session:
             job = (
                 await session.execute(
-                    text(
+                    application_only_sql(text(
                         "SELECT project, namespace, brief, parent_revision_id, rejection "
                         "FROM plan_jobs WHERE id = :id"
-                    ),
+                    )),
                     {"id": job_id},
                 )
             ).mappings().one_or_none()
@@ -278,10 +278,10 @@ class PlanManager:
     async def job(self, job_id: int) -> dict[str, object] | None:
         async with self.database.sessions() as session:
             result = await session.execute(
-                text(
+                application_only_sql(text(
                     "SELECT id, project, namespace, brief, status, error, revision_id, created_at "
                     "FROM plan_jobs WHERE id = :id"
-                ),
+                )),
                 {"id": job_id},
             )
             row = result.mappings().one_or_none()
@@ -293,12 +293,12 @@ async def latest_revisions(
 ) -> list[dict[str, object]]:
     namespace = normalize_namespace(namespace)
     result = await session.execute(
-        text(
+        application_only_sql(text(
             "SELECT DISTINCT ON (project) id, project, namespace, revision, content, "
             "content_hash, created_at, parent_revision_id FROM plan_revisions "
             "WHERE namespace IN (:namespace, :shared) "
             "ORDER BY project, namespace = :namespace DESC, revision DESC"
-        ),
+        )),
         {"namespace": namespace, "shared": SHARED_NAMESPACE},
     )
     plans = [
@@ -310,10 +310,10 @@ async def latest_revisions(
     ]
     for plan in plans:
         events = await session.execute(
-            text(
+            application_only_sql(text(
                 "SELECT task_id, status FROM plan_task_events "
                 "WHERE revision_id = :revision ORDER BY id"
-            ),
+            )),
             {"revision": plan["id"]},
         )
         plan["task_statuses"] = task_status_projection(
@@ -327,11 +327,11 @@ async def revision_by_id(
 ) -> PlanRevision | None:
     namespace = normalize_namespace(namespace)
     result = await session.execute(
-        text(
+        runner_sql(text(
             "SELECT id, project, namespace, brief, revision, content, content_hash, "
             "created_at, parent_revision_id FROM plan_revisions "
             "WHERE id = :id AND namespace IN (:namespace, :shared)"
-        ),
+        )),
         {"id": revision_id, "namespace": namespace, "shared": SHARED_NAMESPACE},
     )
     row = result.mappings().one_or_none()
@@ -360,7 +360,7 @@ async def approve_revision(
     if revision is None:
         raise ValueError("plan revision not found")
     prior = await session.execute(
-        text("SELECT 1 FROM plan_approvals WHERE revision_id = :revision LIMIT 1"),
+        application_only_sql(text("SELECT 1 FROM plan_approvals WHERE revision_id = :revision LIMIT 1")),
         {"revision": revision_id},
     )
     if prior.scalar_one_or_none() is not None:
@@ -401,7 +401,7 @@ async def reject_revision(
     if revision is None:
         raise ValueError("plan revision not found")
     prior = await session.execute(
-        text("SELECT 1 FROM plan_approvals WHERE revision_id = :revision LIMIT 1"),
+        application_only_sql(text("SELECT 1 FROM plan_approvals WHERE revision_id = :revision LIMIT 1")),
         {"revision": revision_id},
     )
     if prior.scalar_one_or_none() is not None:

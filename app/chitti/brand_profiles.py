@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .memory import normalize_namespace
 from .namespaces import SHARED_NAMESPACE
-from .runner_access import application_only_sql
+from .runner_access import application_only_sql, runner_sql
 
 
 def _font_manifest_path() -> Path:
@@ -110,12 +110,12 @@ async def get_brand_profile(
 ) -> BrandProfile | None:
     namespace = normalize_namespace(namespace)
     result = await session.execute(
-        text(
+        runner_sql(text(
             "SELECT namespace, brand_colors, typography, poster_formats, audience, voice, "
             "do_not_use, updated_by, updated_at FROM brand_profiles "
             "WHERE namespace IN (:namespace, :shared) "
             "ORDER BY namespace = :namespace DESC LIMIT 1"
-        ),
+        )),
         {"namespace": namespace, "shared": SHARED_NAMESPACE},
     )
     row = result.mappings().one_or_none()
