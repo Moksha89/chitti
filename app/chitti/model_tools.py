@@ -65,6 +65,7 @@ MODEL_TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
                             "test",
                             "export",
                             "poster-export",
+                            "generate-images",
                         ],
                     },
                     "args": {"type": "array", "items": {}},

@@ -413,7 +413,7 @@ BEGIN
   FOREACH required_table IN ARRAY ARRAY[
     'decisions', 'decision_forgets', 'plan_revisions', 'plan_approvals',
     'worker_runs', 'worker_run_events', 'worker_operations',
-    'worker_artifacts', 'worker_model_calls', 'export_manifests',
+    'worker_artifacts', 'worker_model_calls', 'worker_image_jobs', 'export_manifests',
     'promotion_approvals', 'previews'
   ] LOOP
     IF to_regclass('public.' || required_table) IS NULL THEN
@@ -436,6 +436,7 @@ BEGIN
     'reject_worker_operation_mutation_trigger',
     'reject_worker_artifact_mutation_trigger',
     'reject_worker_model_call_mutation_trigger',
+    'reject_worker_image_job_mutation_trigger',
     'reject_export_manifest_mutation_trigger',
     'reject_promotion_approval_mutation_trigger',
     'reject_preview_mutation_trigger',
