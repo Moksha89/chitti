@@ -157,11 +157,11 @@ async def create_revision(
     revision_id = int(result.scalar_one())
     for task in document.tasks:
         await session.execute(
-            text(
+            application_only_sql(text(
                 "INSERT INTO plan_task_events "
                 "(revision_id, task_id, event_type, status, detail) "
                 "VALUES (:revision_id, :task_id, 'created', 'queued', :detail)"
-            ),
+            )),
             {
                 "revision_id": revision_id,
                 "task_id": task.id,
