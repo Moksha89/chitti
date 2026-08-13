@@ -134,12 +134,12 @@ class MemoryStore:
     ) -> list[dict[str, object]]:
         namespace = normalize_namespace(namespace)
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "SELECT d.id, d.decision_key, d.decision, d.namespace FROM decisions d "
                 "LEFT JOIN decision_forgets f ON f.decision_id = d.id "
                 "WHERE d.superseded_by IS NULL AND f.id IS NULL "
                 "AND d.namespace IN (:namespace, :shared) ORDER BY d.id"
-            ),
+            )),
             {"namespace": namespace, "shared": SHARED_NAMESPACE},
         )
         return [dict(row._mapping) for row in result]
@@ -155,7 +155,7 @@ class MemoryStore:
     ) -> tuple[dict[str, object] | None, float]:
         namespace = normalize_namespace(namespace)
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "SELECT d.id, d.decision_key, d.decision, 1.0 AS similarity "
                 "FROM decisions d "
                 "LEFT JOIN decision_forgets f ON f.decision_id = d.id "
@@ -164,7 +164,7 @@ class MemoryStore:
                 "AND d.namespace IN (:namespace, :shared) "
                 "ORDER BY CASE WHEN d.namespace = :namespace THEN 0 ELSE 1 END, d.id "
                 "LIMIT 1"
-            ),
+            )),
             {
                 "key": normalize_key(memory.key),
                 "namespace": namespace,
@@ -197,13 +197,13 @@ class MemoryStore:
             if match:
                 existing_key = str(match["decision_key"])
                 open_conflicts = await session.execute(
-                    text(
+                    application_only_sql(text(
                         "SELECT id, proposed_value, proposal_fingerprint FROM memory_conflicts "
                         "WHERE namespace = :namespace AND decision_key = :key "
                         "AND resolution_decision_id IS NULL AND closed_at IS NULL "
                         "AND proposal_fingerprint = :fingerprint "
                         "ORDER BY id DESC"
-                    ),
+                    )),
                     {
                         "namespace": namespace,
                         "key": existing_key,
@@ -287,13 +287,13 @@ class MemoryStore:
     ) -> list[dict[str, object]]:
         namespace = normalize_namespace(namespace)
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "SELECT d.id, d.decision_key, d.decision, d.rationale, d.project, "
                 "d.source, d.namespace "
                 "FROM decisions d LEFT JOIN decision_forgets f ON f.decision_id = d.id "
                 "WHERE d.superseded_by IS NULL AND f.id IS NULL "
                 "AND d.namespace IN (:namespace, :shared) ORDER BY d.id DESC"
-            ),
+            )),
             {"namespace": namespace, "shared": SHARED_NAMESPACE},
         )
         return [dict(row._mapping) for row in result]
@@ -303,7 +303,7 @@ class MemoryStore:
     ) -> list[dict[str, object]]:
         namespace = normalize_namespace(namespace)
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "SELECT c.id, c.decision_key, c.existing_decision_id, d.decision AS existing_value, "
                 "COALESCE(c.latest_proposed_value, c.proposed_value) AS proposed_value, "
                 "COALESCE(c.latest_proposed_rationale, c.proposed_rationale) AS proposed_rationale, "
@@ -315,7 +315,7 @@ class MemoryStore:
                 "WHERE c.resolution_decision_id IS NULL AND c.closed_at IS NULL AND f.id IS NULL "
                 "AND c.namespace IN (:namespace, :shared) "
                 "AND d.namespace IN (:namespace, :shared) ORDER BY c.id DESC"
-            ),
+            )),
             {"namespace": namespace, "shared": SHARED_NAMESPACE},
         )
         return [dict(row._mapping) for row in result]
@@ -357,7 +357,7 @@ class MemoryStore:
         actor: str | None = None,
     ) -> int:
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "SELECT decision_key, existing_decision_id, "
                 "COALESCE(latest_proposed_value, proposed_value) AS proposed_value, "
                 "COALESCE(latest_proposed_rationale, proposed_rationale) AS proposed_rationale, "
@@ -365,7 +365,7 @@ class MemoryStore:
                 "COALESCE(latest_proposed_source, proposed_source) AS proposed_source "
                 "FROM memory_conflicts "
                 "WHERE id = :id AND resolution_decision_id IS NULL AND closed_at IS NULL"
-            ),
+            )),
             {"id": conflict_id},
         )
         conflict = result.mappings().one_or_none()
@@ -373,7 +373,7 @@ class MemoryStore:
             raise ValueError("invalid or already resolved conflict")
         if choice == "existing":
             value = await session.execute(
-                text("SELECT decision, rationale, project, source FROM decisions WHERE id = :id"),
+                application_only_sql(text("SELECT decision, rationale, project, source FROM decisions WHERE id = :id")),
                 {"id": conflict["existing_decision_id"]},
             )
             existing = value.mappings().one()
@@ -393,7 +393,7 @@ class MemoryStore:
                 str(conflict["proposed_source"]),
             )
         namespace_result = await session.execute(
-            text("SELECT namespace FROM decisions WHERE id = :id"),
+            application_only_sql(text("SELECT namespace FROM decisions WHERE id = :id")),
             {"id": conflict["existing_decision_id"]},
         )
         namespace = normalize_namespace(str(namespace_result.scalar_one()))
@@ -428,13 +428,13 @@ class MemoryStore:
             )
             return new_id
         siblings = await session.execute(
-            text(
-                "SELECT id, proposed_value, latest_proposed_value, "
+                    application_only_sql(text(
+                        "SELECT id, proposed_value, latest_proposed_value, "
                 "COALESCE(latest_proposed_value, proposed_value) AS effective_value "
                 "FROM memory_conflicts "
                 "WHERE existing_decision_id = :old_id "
                 "AND id <> :id AND resolution_decision_id IS NULL AND closed_at IS NULL"
-            ),
+                    )),
             {"old_id": conflict["existing_decision_id"], "id": conflict_id},
         )
         for sibling in siblings.mappings():
@@ -459,11 +459,11 @@ class MemoryStore:
 
     async def forget_decision(self, session: AsyncSession, decision_id: int) -> None:
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "SELECT d.id FROM decisions d LEFT JOIN decision_forgets f "
                 "ON f.decision_id = d.id WHERE d.id = :id AND d.superseded_by IS NULL "
                 "AND f.id IS NULL"
-            ),
+            )),
             {"id": decision_id},
         )
         if result.scalar_one_or_none() is None:
@@ -508,14 +508,14 @@ class MemoryStore:
         namespace = normalize_namespace(namespace)
         embedding = vector_literal(self.embedder.embed(query))
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "SELECT content, source_type, 1 - "
                 "(embedding <=> CAST(:embedding AS vector)) AS similarity "
                 "FROM memory_chunks "
                 "WHERE namespace IN (:namespace, :shared) "
                 "ORDER BY embedding <=> CAST(:embedding AS vector) "
                 "LIMIT CAST(:limit AS integer)"
-            ),
+            )),
             {
                 "embedding": embedding,
                 "namespace": namespace,

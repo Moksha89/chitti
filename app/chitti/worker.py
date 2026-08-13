@@ -589,11 +589,11 @@ class DockerSandboxDispatcher:
         starter_context = _starter_context(workspace)
         async with self.database.sessions() as session:
             result = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT d.decision_key, d.decision FROM decisions d "
                     "LEFT JOIN decision_forgets f ON f.decision_id = d.id "
                     "WHERE d.superseded_by IS NULL AND f.id IS NULL ORDER BY d.id"
-                )
+                )),
             )
             beliefs = [dict(row._mapping) for row in result]
         stable = _model_system_prompt(policy, brand_profile)

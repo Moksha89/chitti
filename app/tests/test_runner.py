@@ -148,6 +148,32 @@ def test_runner_access_rejects_derived_application_only_write() -> None:
         )
 
 
+def test_runner_access_masks_declared_sensitive_read() -> None:
+    assert derived_grants(
+        [
+            (
+                "application_only_sql(text(\"SELECT content FROM "
+                "chat_transcript_entries\"))"
+            ),
+            "SELECT id FROM decisions",
+        ],
+        {"chat_transcript_entries", "decisions"},
+    ) == {"decisions": {"SELECT"}}
+
+
+def test_runner_access_rejects_sensitive_read_before_granting() -> None:
+    with pytest.raises(
+        SystemExit, match="reached sensitive tables: chat_transcript_entries"
+    ):
+        derived_grants(
+            [
+                "SELECT content FROM chat_transcript_entries",
+                "SELECT id FROM decisions",
+            ],
+            {"chat_transcript_entries", "decisions"},
+        )
+
+
 def test_runner_access_fails_when_required_grant_is_missing() -> None:
     class Connection:
         async def fetch(self, _query):

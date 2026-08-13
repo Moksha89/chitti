@@ -1126,6 +1126,22 @@ async def test_runner_brand_profile_access_is_read_only(database):
         connection = await asyncpg.connect(runner_database_url)
         try:
             with pytest.raises(
+                SystemExit,
+                match="reached sensitive tables: chat_transcript_entries",
+            ):
+                await reconcile_runner_privileges(
+                    admin,
+                    role,
+                    [
+                        "SELECT content FROM chat_transcript_entries",
+                        "SELECT id FROM decisions",
+                    ],
+                )
+            assert not await admin.fetchval(
+                "SELECT has_table_privilege($1, 'chat_transcript_entries', 'SELECT')",
+                role,
+            )
+            with pytest.raises(
                 SystemExit, match="runner lacks INSERT on decisions"
             ):
                 await assert_runner_privileges(

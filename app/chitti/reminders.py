@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from .db import Database
-from .runner_access import application_only_sql
+from .runner_access import application_only_sql, runner_sql
 
 logger = logging.getLogger("chitti.reminders")
 
@@ -34,7 +34,7 @@ async def sweep_reminders(
     fired = 0
     async with database.sessions() as session:
         result = await session.execute(
-            text(
+            runner_sql(text(
                 "SELECT r.id, r.namespace, r.text, r.due_at, r.recurrence, "
                 "MAX(o.due_at) AS last_due "
                 "FROM reminders r LEFT JOIN reminder_occurrences o "
@@ -42,7 +42,7 @@ async def sweep_reminders(
                 "WHERE r.active = true GROUP BY r.id "
                 "HAVING (r.recurrence IS NOT NULL OR MAX(o.due_at) IS NULL) "
                 "AND r.due_at <= :now ORDER BY r.id"
-            ),
+            )),
             {"now": now},
         )
         reminders = list(result.mappings())
@@ -147,11 +147,11 @@ async def cancel_reminder(database: Database, namespace: str, reminder_id: int) 
 async def recent_reminders(database: Database, namespace: str) -> list[dict[str, object]]:
     async with database.sessions() as session:
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "SELECT id, text, due_at, recurrence, active FROM reminders "
                 "WHERE namespace = :namespace AND active = true "
                 "ORDER BY due_at, id LIMIT 50"
-            ),
+            )),
             {"namespace": namespace},
         )
         return [dict(row) for row in result.mappings()]

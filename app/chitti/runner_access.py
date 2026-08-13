@@ -17,6 +17,21 @@ _TABLE_ALIAS = re.compile(
     r"\bFROM\s+([a-z_][a-z0-9_]*)\s+([a-z_][a-z0-9_]*)", re.IGNORECASE
 )
 _WRITE_PRIVILEGES = frozenset({"INSERT", "UPDATE", "DELETE"})
+SENSITIVE_RUNNER_TABLES = frozenset(
+    {
+        "auth_sessions",
+        "auth_users",
+        "chat_transcript_entries",
+        "credential_store",
+        "decision_embeddings",
+        "memory_chunks",
+        "memory_conflicts",
+        "memory_namespaces",
+        "provider_credentials",
+        "provider_keys",
+        "session_store",
+    }
+)
 
 
 def application_only_sql(statement: Any) -> Any:
@@ -167,6 +182,12 @@ def derived_grants(
     required = required_privileges(source_texts, known_tables)
     if not required:
         raise SystemExit("runner privilege derivation produced no table expectations")
+    sensitive = sorted(set(required) & SENSITIVE_RUNNER_TABLES)
+    if sensitive:
+        raise SystemExit(
+            "runner privilege derivation reached sensitive tables: "
+            + ", ".join(sensitive)
+        )
     _validate_runner_write_boundary(
         required,
         application_only_privileges(source_texts, known_tables),
