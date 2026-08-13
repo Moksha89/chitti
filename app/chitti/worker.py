@@ -16,7 +16,7 @@ from typing import IO, TYPE_CHECKING, Protocol, cast
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .brand_profiles import BrandProfile, get_brand_profile
+from .brand_profiles import BrandProfile, available_font_families, get_brand_profile
 from .job_types import (
     WEBSITE_POLICY,
     JobTypePolicy,
@@ -262,6 +262,27 @@ def _file_write_stall(path: str, path_writes: int, total_writes: int) -> str | N
 
 def _reset_file_write_counter(tool: str, current: int) -> int:
     return 0 if tool == "run_command" else current
+
+
+def _run_command_was_executed(
+    tool: str, arguments: Mapping[str, object]
+) -> bool:
+    return (
+        tool == "run_command"
+        and str(arguments.get("name", "")) in MODEL_COMMANDS
+        and arguments.get("args", []) in ([], None)
+    )
+
+
+def _reset_file_write_counters(
+    tool: str,
+    arguments: Mapping[str, object],
+    total: int,
+    per_file: dict[str, int],
+) -> tuple[int, dict[str, int]]:
+    if not _run_command_was_executed(tool, arguments):
+        return total, per_file
+    return 0, {}
 
 
 def _model_tool_progress_detail(tool: str, arguments: Mapping[str, object]) -> str:
@@ -875,10 +896,14 @@ class DockerSandboxDispatcher:
                                             last_refused_missing_gates = None
                                         elif not _missing_gate_evidence(completed_commands, policy.required_gates):
                                             gate_stale_reason = None
-                                        file_writes_without_command = (
-                                            _reset_file_write_counter(
-                                                tool, file_writes_without_command
-                                            )
+                                        (
+                                            file_writes_without_command,
+                                            file_write_counts,
+                                        ) = _reset_file_write_counters(
+                                            tool,
+                                            arguments,
+                                            file_writes_without_command,
+                                            file_write_counts,
                                         )
                                     elif tool == "capture_screenshot":
                                         completed_commands.add("capture_screenshot")
@@ -920,6 +945,15 @@ class DockerSandboxDispatcher:
                                             run_id, task.id, "failed", str(exc)[:1000]
                                         )
                                         raise
+                                    (
+                                        file_writes_without_command,
+                                        file_write_counts,
+                                    ) = _reset_file_write_counters(
+                                        tool,
+                                        arguments,
+                                        file_writes_without_command,
+                                        file_write_counts,
+                                    )
                                     remember_tool_result(tool, arguments, succeeded=False)
                                     result_text = (
                                         f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
@@ -1058,8 +1092,14 @@ class DockerSandboxDispatcher:
                             last_refused_missing_gates = None
                         elif not _missing_gate_evidence(completed_commands, policy.required_gates):
                             gate_stale_reason = None
-                        file_writes_without_command = _reset_file_write_counter(
-                            tool, file_writes_without_command
+                        (
+                            file_writes_without_command,
+                            file_write_counts,
+                        ) = _reset_file_write_counters(
+                            tool,
+                            arguments,
+                            file_writes_without_command,
+                            file_write_counts,
                         )
                     elif tool == "capture_screenshot":
                         completed_commands.add("capture_screenshot")
@@ -1095,6 +1135,15 @@ class DockerSandboxDispatcher:
                             run_id, task.id, "failed", str(exc)[:1000]
                         )
                         raise
+                    (
+                        file_writes_without_command,
+                        file_write_counts,
+                    ) = _reset_file_write_counters(
+                        tool,
+                        arguments,
+                        file_writes_without_command,
+                        file_write_counts,
+                    )
                     remember_tool_result(tool, arguments, succeeded=False)
                     result_text = f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
                     await record_nonproductive(result_text)
@@ -2824,11 +2873,18 @@ def _model_system_prompt(
 ) -> str:
     if policy.is_poster:
         profile_data = getattr(profile, "__dict__", {})
+        manifest = "\n".join(available_font_families()) or "(empty)"
         return (
             "You are producing one offline poster artifact, not a website. "
             "Write only HTML, CSS, and SVG; do not use npm, package.json, lockfiles, "
             "JavaScript frameworks, remote URLs, runtime fetches, or external fonts. "
-            "Use only the supplied sandbox font manifest. The owner brand profile is "
+            "The poster validator rejects http://, https://, data:, and other "
+            "network-bearing CSS url(...) values unless they are same-document "
+            "fragment references, rejects fetch(...), and permits examples such as "
+            "url(#gradient). Use only "
+            "a font family from this supplied sandbox manifest:\n"
+            f"{manifest}\n"
+            "The owner brand profile is "
             "authoritative and must be reflected exactly; do not invent colours, voice, "
             "audience, or typography. Create the declared artifact under out/ and an "
             "out/index.html entry that renders it for the cage capture. Run "

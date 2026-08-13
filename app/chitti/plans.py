@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -278,19 +278,37 @@ class PlanManager:
                 profile = None
                 if str(job["job_type"]) == "poster":
                     profile = await get_brand_profile(session, str(job["namespace"]))
-            raw = await self.provider.plan(
-                str(job["brief"]),
-                str(job["project"]),
-                beliefs,
-                str(job["rejection"]) if job["rejection"] else None,
-                str(job["job_type"]),
-                job["job_config"],
-                profile,
-            )
-            match = re.search(r"\{[\s\S]*\}", raw)
-            if not match:
-                raise ValueError("planner returned no JSON object")
-            document = PlanDocument.model_validate(json.loads(match.group(0)))
+            planner_feedback = str(job["rejection"]) if job["rejection"] else None
+            document: PlanDocument | None = None
+            for attempt in range(2):
+                raw = await self.provider.plan(
+                    str(job["brief"]),
+                    str(job["project"]),
+                    beliefs,
+                    planner_feedback,
+                    str(job["job_type"]),
+                    job["job_config"],
+                    profile,
+                )
+                match = re.search(r"\{[\s\S]*\}", raw)
+                if not match:
+                    raise ValueError("planner returned no JSON object")
+                try:
+                    document = PlanDocument.model_validate(
+                        json.loads(match.group(0))
+                    )
+                except ValidationError as exc:
+                    if attempt == 1:
+                        raise
+                    planner_feedback = (
+                        (f"{planner_feedback}\n\n" if planner_feedback else "")
+                        + "The previous planner response failed PlanDocument "
+                        "validation. Correct these errors in the next strict JSON "
+                        "response:\n"
+                        + str(exc)
+                    )
+            if document is None:
+                raise RuntimeError("planner produced no document")
             async with self.database.sessions() as session:
                 revision_id = await create_revision(
                     session,

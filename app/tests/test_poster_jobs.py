@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from chitti.brand_profiles import available_font_families
 from chitti.job_types import (
     MAX_POSTER_CSS_DIMENSION,
     POSTER_POLICY,
@@ -13,7 +14,11 @@ from chitti.job_types import (
     policy_for,
     poster_config,
 )
-from chitti.worker import WorkerRunManager, _model_system_prompt, _reviewer_system_prompt
+from chitti.worker import (
+    WorkerRunManager,
+    _model_system_prompt,
+    _reviewer_system_prompt,
+)
 
 
 class _Result:
@@ -64,6 +69,9 @@ def test_poster_prompts_require_brand_and_honest_visual_review() -> None:
     prompt = _model_system_prompt(POSTER_POLICY, {"typography": "FreeSans"})
     review = _reviewer_system_prompt(POSTER_POLICY)
     assert "do not invent" in prompt
+    for family in available_font_families():
+        assert family in prompt
+    assert "url(#gradient)" in prompt
     assert "visual quality was not assessed" in review
 
 
