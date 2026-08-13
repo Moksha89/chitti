@@ -270,6 +270,50 @@ def test_poster_capture_uses_named_poster_layout_script(tmp_path) -> None:
     assert scripts == [module.POSTER_LAYOUT_SCRIPT]
 
 
+def test_poster_capture_ignores_decorative_wrapper_but_rejects_clipped_text(
+    tmp_path, capsys
+) -> None:
+    module = _capture_module()
+    (tmp_path / "out").mkdir()
+    poster = tmp_path / "out" / "poster.html"
+    (tmp_path / "artifacts").mkdir()
+    poster.write_text(
+        "<div id='poster' style='position:absolute;left:-40px;width:1160px'>"
+        "<h1 style='position:absolute;left:500px'>Safe</h1></div>"
+    )
+
+    module.capture(
+        tmp_path,
+        playwright_factory=_poster_capture_factory([]),
+        width=1080,
+        height=1350,
+        artifact="poster.html",
+    )
+
+    poster.write_text("<h1 style='position:absolute;left:-20px'>Clipped</h1>")
+    with pytest.raises(SystemExit):
+        module.capture(
+            tmp_path,
+            playwright_factory=_poster_capture_factory(
+                [
+                    {
+                        "kind": "poster-overflow",
+                        "axis": "horizontal",
+                        "overflow": 20,
+                        "message": "poster overflow: horizontal by 20 CSS pixels",
+                    }
+                ]
+            ),
+            width=1080,
+            height=1350,
+            artifact="poster.html",
+        )
+
+    assert "horizontal by 20 CSS pixels" in capsys.readouterr().err
+    assert "childNodes" in module.POSTER_LAYOUT_SCRIPT
+    assert "Node.TEXT_NODE" in module.POSTER_LAYOUT_SCRIPT
+
+
 @pytest.mark.parametrize(
     ("overflow", "should_refuse"),
     [(0.99, False), (1.01, True)],

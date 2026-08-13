@@ -20,7 +20,16 @@ POSTER_LAYOUT_SCRIPT = """() => {
     ),
   ]);
   for (const element of document.querySelectorAll("*")) {
-    if ((element.innerText || "").trim()) candidates.add(element);
+    const style = getComputedStyle(element);
+    const hasDirectText = [...element.childNodes].some(
+      (node) =>
+        node.nodeType === Node.TEXT_NODE &&
+        node.textContent.trim() &&
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        style.opacity !== "0"
+    );
+    if (hasDirectText) candidates.add(element);
   }
   const bounds = {
     left: 0,
