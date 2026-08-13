@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from .db import Database
+from .runner_access import application_only_sql
 
 logger = logging.getLogger("chitti.reminders")
 
@@ -113,10 +114,10 @@ async def create_reminder(
 ) -> int:
     async with database.sessions() as session:
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "INSERT INTO reminders (namespace, text, due_at, recurrence) "
                 "VALUES (:namespace, :text, :due_at, :recurrence) RETURNING id"
-            ),
+            )),
             {
                 "namespace": namespace,
                 "text": text_value,
@@ -132,11 +133,11 @@ async def create_reminder(
 async def cancel_reminder(database: Database, namespace: str, reminder_id: int) -> bool:
     async with database.sessions() as session:
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "UPDATE reminders SET active = false "
                 "WHERE id = :id AND namespace = :namespace AND active = true "
                 "RETURNING id"
-            ),
+            )),
             {"id": reminder_id, "namespace": namespace},
         )
         await session.commit()

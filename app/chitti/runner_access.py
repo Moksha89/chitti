@@ -8,14 +8,6 @@ from pathlib import Path
 from typing import Any
 
 RUNNER_ENTRYPOINT = "chitti.runner"
-RUNNER_ACCESS_EXCLUSIONS = {
-    # These helpers also serve the application process, but the runner never
-    # calls their application-only mutation paths.
-    ("brand_profiles", "INSERT"),
-    ("worker_runs", "INSERT"),
-    ("reminders", "INSERT"),
-    ("reminders", "UPDATE"),
-}
 _TABLE_REFERENCE = re.compile(
     r"\b(DELETE\s+FROM|FROM|JOIN|INTO|UPDATE)\s+([a-z_][a-z0-9_]*)",
     re.IGNORECASE,
@@ -24,6 +16,39 @@ _FOR_UPDATE = re.compile(r"\bFOR\s+UPDATE\s+OF\s+([a-z_][a-z0-9_]*)", re.IGNOREC
 _TABLE_ALIAS = re.compile(
     r"\bFROM\s+([a-z_][a-z0-9_]*)\s+([a-z_][a-z0-9_]*)", re.IGNORECASE
 )
+
+
+def application_only_sql(statement: Any) -> Any:
+    return statement
+
+
+def _mask_application_only_sql(source: str) -> str:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    lines = source.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+    masked = list(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if not (
+            isinstance(function, ast.Name)
+            and function.id == "application_only_sql"
+        ):
+            continue
+        if node.end_lineno is None or node.end_col_offset is None:
+            continue
+        start = offsets[node.lineno - 1] + node.col_offset
+        end = offsets[node.end_lineno - 1] + node.end_col_offset
+        masked[start:end] = " " * (end - start)
+    return "".join(masked)
 
 
 def required_privileges(
@@ -35,6 +60,7 @@ def required_privileges(
     privileges: dict[str, set[str]] = {}
     aliases: dict[str, str] = {}
     for source in source_texts:
+        source = _mask_application_only_sql(source)
         for match in _TABLE_ALIAS.finditer(source):
             aliases[match.group(2).lower()] = match.group(1).lower()
         for match in _TABLE_REFERENCE.finditer(source):
@@ -48,16 +74,12 @@ def required_privileges(
                 "INTO": "INSERT",
                 "UPDATE": "UPDATE",
             }[verb.upper()]
-            if (table, privilege) in RUNNER_ACCESS_EXCLUSIONS:
-                continue
             privileges.setdefault(table, set()).add(privilege)
         for match in _FOR_UPDATE.finditer(source):
             table = aliases.get(match.group(1).lower())
             if table is not None and (
                 known_tables is None or table in known_tables
             ):
-                if (table, "UPDATE") in RUNNER_ACCESS_EXCLUSIONS:
-                    continue
                 privileges.setdefault(table, set()).add("UPDATE")
     return privileges
 

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .embedding import EmbedderProtocol, vector_literal
 from .namespaces import MEMORY_NAMESPACES, SHARED_NAMESPACE
 from .provider import ExtractedMemory
+from .runner_access import application_only_sql
 
 logger = logging.getLogger(__name__)
 _PROPOSAL_STOP_WORDS = frozenset(
@@ -111,12 +112,12 @@ class MemoryStore:
     ) -> int:
         namespace = normalize_namespace(namespace)
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "INSERT INTO decisions "
                 "(project, decision, rationale, source, decision_key, namespace) "
                 "VALUES (:project, :decision, :rationale, :source, :key, :namespace) "
                 "RETURNING id"
-            ),
+            )),
             {
                 "project": item.project,
                 "decision": item.value,
@@ -212,13 +213,13 @@ class MemoryStore:
                 for open_conflict in open_conflicts.mappings():
                     if equivalent_proposal(str(open_conflict["proposed_value"]), memory.value):
                         await session.execute(
-                            text(
+                            application_only_sql(text(
                                 "UPDATE memory_conflicts SET recurrence_count = recurrence_count + 1, "
                                 "last_seen_at = now(), latest_proposed_value = :value, "
                                 "latest_proposed_rationale = :rationale, "
                                 "latest_proposed_project = :project, "
                                 "latest_proposed_source = :source WHERE id = :id"
-                            ),
+                            )),
                             {
                                 "id": open_conflict["id"],
                                 "value": memory.value,
@@ -239,7 +240,7 @@ class MemoryStore:
                         break
                 else:
                     result = await session.execute(
-                        text(
+                        application_only_sql(text(
                             "INSERT INTO memory_conflicts "
                             "(decision_key, existing_decision_id, proposed_value, proposed_rationale, "
                             "proposed_project, proposed_source, namespace, last_seen_at, "
@@ -248,7 +249,7 @@ class MemoryStore:
                             "VALUES (:key, :existing_id, :value, :rationale, :project, :source, "
                             ":namespace, now(), :value, :rationale, :project, :source, :fingerprint) "
                             "RETURNING id"
-                        ),
+                        )),
                         {
                             "key": existing_key,
                             "existing_id": match["id"],
@@ -398,26 +399,26 @@ class MemoryStore:
         namespace = normalize_namespace(str(namespace_result.scalar_one()))
         new_id = await self.append_decision(session, replacement, namespace)
         await session.execute(
-            text("UPDATE decisions SET superseded_by = :new_id WHERE id = :old_id"),
+            application_only_sql(text("UPDATE decisions SET superseded_by = :new_id WHERE id = :old_id")),
             {"new_id": new_id, "old_id": conflict["existing_decision_id"]},
         )
         await session.execute(
-            text(
+            application_only_sql(text(
                 "UPDATE memory_conflicts SET resolution_decision_id = :new_id, "
                 "closed_at = now(), closure_reason = 'owner', "
                 "resolution_actor = :actor, resolved_at = now() WHERE id = :id"
-            ),
+            )),
             {"new_id": new_id, "id": conflict_id, "actor": actor},
         )
         if choice == "existing":
             await session.execute(
-                text(
+                application_only_sql(text(
                     "UPDATE memory_conflicts SET resolution_decision_id = :new_id, "
                     "closed_at = now(), closure_reason = 'declined', "
                     "resolution_actor = :actor, resolved_at = now() "
                     "WHERE existing_decision_id = :old_id AND id <> :id "
                     "AND resolution_decision_id IS NULL AND closed_at IS NULL"
-                ),
+                )),
                 {
                     "new_id": new_id,
                     "old_id": conflict["existing_decision_id"],
@@ -439,19 +440,19 @@ class MemoryStore:
         for sibling in siblings.mappings():
             if equivalent_proposal(str(sibling["effective_value"]), replacement.value):
                 await session.execute(
-                    text(
+                    application_only_sql(text(
                         "UPDATE memory_conflicts SET resolution_decision_id = :new_id, "
                         "closed_at = now(), closure_reason = 'owner_reconciled', "
                         "resolution_actor = :actor, resolved_at = now() WHERE id = :id"
-                    ),
+                    )),
                     {"new_id": new_id, "id": sibling["id"], "actor": actor},
                 )
             else:
                 await session.execute(
-                    text(
+                    application_only_sql(text(
                         "UPDATE memory_conflicts SET existing_decision_id = :new_id "
                         "WHERE id = :id"
-                    ),
+                    )),
                     {"new_id": new_id, "id": sibling["id"]},
                 )
         return new_id
@@ -468,7 +469,7 @@ class MemoryStore:
         if result.scalar_one_or_none() is None:
             raise ValueError("invalid or already forgotten decision")
         await session.execute(
-            text("INSERT INTO decision_forgets (decision_id) VALUES (:id)"),
+            application_only_sql(text("INSERT INTO decision_forgets (decision_id) VALUES (:id)")),
             {"id": decision_id},
         )
 
@@ -485,12 +486,12 @@ class MemoryStore:
         metadata = {**metadata, "namespace": namespace}
         embedding = vector_literal(self.embedder.embed(content))
         await session.execute(
-            text(
-                "INSERT INTO memory_chunks "
+                application_only_sql(text(
+                    "INSERT INTO memory_chunks "
                 "(content, source_type, source_id, metadata, embedding, namespace) "
                 "VALUES (:content, :source_type, :source_id, CAST(:metadata AS jsonb), "
                 "CAST(:embedding AS vector), :namespace)"
-            ),
+                )),
             {
                 "content": content,
                 "source_type": source_type,
@@ -533,7 +534,7 @@ class MemoryStore:
     ) -> int:
         new_id = await self.append_decision(session, replacement, namespace)
         await session.execute(
-            text("UPDATE decisions SET superseded_by = :new_id WHERE id = :old_id"),
+            application_only_sql(text("UPDATE decisions SET superseded_by = :new_id WHERE id = :old_id")),
             {"new_id": new_id, "old_id": old_id},
         )
         return new_id

@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .memory import normalize_namespace
 from .namespaces import SHARED_NAMESPACE
+from .runner_access import application_only_sql
 
 if TYPE_CHECKING:
     from .db import Database
@@ -137,12 +138,12 @@ async def create_revision(
     )
     revision = int(revision_result.scalar_one())
     result = await session.execute(
-        text(
+        application_only_sql(text(
             "INSERT INTO plan_revisions "
             "(project, namespace, brief, revision, content, content_hash, parent_revision_id) "
             "VALUES (:project, :namespace, :brief, :revision, CAST(:content AS jsonb), "
             ":content_hash, :parent_revision_id) RETURNING id"
-        ),
+        )),
         {
             "project": project,
             "namespace": namespace,
@@ -190,11 +191,11 @@ class PlanManager:
         namespace = normalize_namespace(namespace)
         async with self.database.sessions() as session:
             result = await session.execute(
-                text(
+                application_only_sql(text(
                     "INSERT INTO plan_jobs "
                     "(project, namespace, brief, parent_revision_id, rejection) "
                     "VALUES (:project, :namespace, :brief, :parent, :rejection) RETURNING id"
-                ),
+                )),
                 {
                     "project": project,
                     "namespace": namespace,
@@ -235,7 +236,7 @@ class PlanManager:
             if job is None:
                 return
             await session.execute(
-                text("UPDATE plan_jobs SET status = 'running', error = NULL WHERE id = :id"),
+                application_only_sql(text("UPDATE plan_jobs SET status = 'running', error = NULL WHERE id = :id")),
                 {"id": job_id},
             )
             await session.commit()
@@ -262,14 +263,14 @@ class PlanManager:
                     str(job["namespace"]),
                 )
                 await session.execute(
-                    text("UPDATE plan_jobs SET status = 'complete', revision_id = :revision WHERE id = :id"),
+                application_only_sql(text("UPDATE plan_jobs SET status = 'complete', revision_id = :revision WHERE id = :id")),
                     {"revision": revision_id, "id": job_id},
                 )
                 await session.commit()
         except Exception as exc:
             async with self.database.sessions() as session:
                 await session.execute(
-                    text("UPDATE plan_jobs SET status = 'failed', error = :error WHERE id = :id"),
+                application_only_sql(text("UPDATE plan_jobs SET status = 'failed', error = :error WHERE id = :id")),
                     {"error": str(exc)[:2000], "id": job_id},
                 )
                 await session.commit()
@@ -365,12 +366,12 @@ async def approve_revision(
     if prior.scalar_one_or_none() is not None:
         raise ValueError("plan revision already has an approval decision")
     result = await session.execute(
-        text(
+        application_only_sql(text(
             "INSERT INTO plan_approvals "
             "(revision_id, decision, reason, content_hash) "
             "VALUES (:revision_id, 'approved', :reason, :content_hash) "
             "RETURNING id, created_at"
-        ),
+        )),
         {
             "revision_id": revision_id,
             "reason": reason,
@@ -406,12 +407,12 @@ async def reject_revision(
     if prior.scalar_one_or_none() is not None:
         raise ValueError("plan revision already has an approval decision")
     result = await session.execute(
-        text(
+        application_only_sql(text(
             "INSERT INTO plan_approvals "
             "(revision_id, decision, reason, content_hash) "
             "VALUES (:revision_id, 'rejected', :reason, :content_hash) "
             "RETURNING id, created_at"
-        ),
+        )),
         {
             "revision_id": revision_id,
             "reason": reason.strip(),

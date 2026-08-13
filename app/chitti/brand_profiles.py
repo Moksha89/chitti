@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .memory import normalize_namespace
 from .namespaces import SHARED_NAMESPACE
+from .runner_access import application_only_sql
 
 
 def _font_manifest_path() -> Path:
@@ -144,16 +145,16 @@ async def save_brand_profile(
     )
     snapshot = json.dumps(values)
     await session.execute(
-        text(
-            "INSERT INTO brand_profile_history "
+            application_only_sql(text(
+                "INSERT INTO brand_profile_history "
             "(namespace, profile, changed_by) VALUES "
             "(:namespace, CAST(:profile AS jsonb), :actor)"
-        ),
+            )),
         {"namespace": namespace, "profile": snapshot, "actor": actor},
     )
     result = await session.execute(
-        text(
-            "INSERT INTO brand_profiles "
+            application_only_sql(text(
+                "INSERT INTO brand_profiles "
             "(namespace, brand_colors, typography, poster_formats, audience, voice, "
             "do_not_use, updated_by) VALUES "
             "(:namespace, CAST(:brand_colors AS jsonb), :typography, "
@@ -166,7 +167,7 @@ async def save_brand_profile(
             "updated_by = EXCLUDED.updated_by, updated_at = now() "
             "RETURNING namespace, brand_colors, typography, poster_formats, audience, "
             "voice, do_not_use, updated_by, updated_at"
-        ),
+            )),
         {
             "namespace": namespace,
             "brand_colors": json.dumps(values["brand_colors"]),

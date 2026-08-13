@@ -1111,7 +1111,7 @@ async def test_runner_brand_profile_access_is_read_only(database):
         )
         await admin.execute(f'GRANT USAGE ON SCHEMA public TO "{role}"')
         await admin.execute(
-            f'GRANT SELECT, INSERT ON brand_profiles TO "{role}"'
+            f'GRANT SELECT ON decisions, brand_profiles TO "{role}"'
         )
         runner_database_url = urlunsplit(
             (
@@ -1125,17 +1125,43 @@ async def test_runner_brand_profile_access_is_read_only(database):
         connection = await asyncpg.connect(runner_database_url)
         try:
             with pytest.raises(
+                SystemExit, match="runner lacks INSERT on decisions"
+            ):
+                await assert_runner_privileges(
+                    connection,
+                    [
+                        "INSERT INTO decisions (decision) VALUES ('unclassified')",
+                        "SELECT namespace FROM brand_profiles",
+                    ],
+                )
+            await admin.execute(f'GRANT INSERT ON brand_profiles TO "{role}"')
+            with pytest.raises(
                 SystemExit, match="runner unexpectedly has INSERT on brand_profiles"
             ):
                 await assert_runner_privileges(
                     connection,
-                    ["SELECT namespace FROM brand_profiles"],
+                    [
+                        "application_only_sql(text(\"INSERT INTO decisions "
+                        "(decision) VALUES ('classified')\"))",
+                        "SELECT namespace FROM brand_profiles",
+                    ],
                 )
             await admin.execute(f'REVOKE INSERT ON brand_profiles FROM "{role}"')
-            await assert_runner_privileges(connection, ["SELECT namespace FROM brand_profiles"])
+            await assert_runner_privileges(
+                connection,
+                [
+                    "application_only_sql(text(\"INSERT INTO decisions "
+                    "(decision) VALUES ('classified')\"))",
+                    "SELECT namespace FROM brand_profiles",
+                ],
+            )
             with pytest.raises(asyncpg.InsufficientPrivilegeError):
                 await connection.execute(
                     "DELETE FROM brand_profiles WHERE namespace = 'general'"
+                )
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await connection.execute(
+                    "UPDATE decisions SET decision = decision WHERE id = 1"
                 )
         finally:
             await connection.close()

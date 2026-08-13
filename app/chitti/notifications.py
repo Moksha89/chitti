@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy import text
 
 from .db import Database
+from .runner_access import application_only_sql
 
 
 async def recent_notifications(
@@ -58,11 +59,11 @@ async def notifications_after(
 async def acknowledge_notification(database: Database, namespace: str, notification_id: int) -> bool:
     async with database.sessions() as session:
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "INSERT INTO notification_acknowledgements (notification_id) "
                 "SELECT id FROM notifications WHERE id = :id AND namespace = :namespace "
                 "ON CONFLICT DO NOTHING RETURNING notification_id"
-            ),
+            )),
             {"id": notification_id, "namespace": namespace},
         )
         await session.commit()
