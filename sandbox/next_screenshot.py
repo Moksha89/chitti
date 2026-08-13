@@ -106,6 +106,62 @@ def capture(
                             )
                         layout_errors = page.evaluate(
                             """() => {
+                              const viewportWidth = window.innerWidth;
+                              const viewportHeight = window.innerHeight;
+                              const tolerance = 1;
+                              const bounds = {
+                                left: 0,
+                                top: 0,
+                                right: viewportWidth,
+                                bottom: viewportHeight,
+                              };
+                              for (const element of document.querySelectorAll("*")) {
+                                const rect = element.getBoundingClientRect();
+                                if (!rect.width && !rect.height) continue;
+                                bounds.left = Math.min(bounds.left, rect.left);
+                                bounds.top = Math.min(bounds.top, rect.top);
+                                bounds.right = Math.max(bounds.right, rect.right);
+                                bounds.bottom = Math.max(bounds.bottom, rect.bottom);
+                              }
+                              const horizontal = Math.max(
+                                0,
+                                bounds.left < -tolerance
+                                  ? -bounds.left
+                                  : bounds.right - viewportWidth > tolerance
+                                    ? bounds.right - viewportWidth
+                                    : 0,
+                              );
+                              const vertical = Math.max(
+                                0,
+                                bounds.top < -tolerance
+                                  ? -bounds.top
+                                  : bounds.bottom - viewportHeight > tolerance
+                                    ? bounds.bottom - viewportHeight
+                                    : 0,
+                              );
+                              const errors = [];
+                              if (horizontal > tolerance) {
+                                const amount = Math.round(horizontal * 100) / 100;
+                                errors.push({
+                                  kind: "poster-overflow",
+                                  axis: "horizontal",
+                                  overflow: amount,
+                                  message: `poster overflow: horizontal by ${amount} CSS pixels`,
+                                });
+                              }
+                              if (vertical > tolerance) {
+                                const amount = Math.round(vertical * 100) / 100;
+                                errors.push({
+                                  kind: "poster-overflow",
+                                  axis: "vertical",
+                                  message: `poster overflow: vertical by ${amount} CSS pixels`,
+                                  overflow: amount,
+                                });
+                              }
+                              return errors;
+                            }"""
+                            if artifact is not None
+                            else """() => {
                               const errors = [];
                               const viewport = document.documentElement.clientWidth;
                               if (document.documentElement.scrollWidth > viewport + 1) {

@@ -156,6 +156,143 @@ def test_static_capture_serves_produced_export_without_model_server(tmp_path) ->
     assert served["process"].poll() is not None
 
 
+def _poster_capture_factory(layout_errors):
+    class Page:
+        def on(self, *_args) -> None:
+            pass
+
+        def goto(self, _url, **_kwargs) -> None:
+            pass
+
+        def wait_for_timeout(self, _milliseconds) -> None:
+            pass
+
+        def locator(self, _selector):
+            return self
+
+        def inner_text(self) -> str:
+            return "poster"
+
+        def evaluate(self, _script):
+            return layout_errors
+
+        def screenshot(self, path, **_kwargs) -> None:
+            Path(path).write_bytes(b"png")
+
+        def close(self) -> None:
+            pass
+
+    class Browser:
+        def new_page(self, **_kwargs):
+            return Page()
+
+        def close(self) -> None:
+            pass
+
+    class Playwright:
+        class Chromium:
+            def launch(self):
+                return Browser()
+
+        chromium = Chromium()
+
+    class PlaywrightContext:
+        def __enter__(self):
+            return Playwright()
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+    return lambda: PlaywrightContext()
+
+
+def test_poster_capture_rejects_measured_horizontal_overflow(tmp_path, capsys) -> None:
+    module = _capture_module()
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "poster.html").write_text("<html><body>poster</body></html>")
+    (tmp_path / "artifacts").mkdir()
+
+    with pytest.raises(SystemExit):
+        module.capture(
+            tmp_path,
+            playwright_factory=_poster_capture_factory(
+                [
+                    {
+                        "kind": "poster-overflow",
+                        "axis": "horizontal",
+                        "overflow": 8,
+                        "message": "poster overflow: horizontal by 8 CSS pixels",
+                    }
+                ]
+            ),
+            width=1080,
+            height=1350,
+            artifact="poster.html",
+        )
+
+    assert "horizontal by 8 CSS pixels" in capsys.readouterr().err
+
+
+def test_poster_capture_accepts_fitting_content(tmp_path) -> None:
+    module = _capture_module()
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "poster.html").write_text("<html><body>poster</body></html>")
+    (tmp_path / "artifacts").mkdir()
+
+    module.capture(
+        tmp_path,
+        playwright_factory=_poster_capture_factory([]),
+        width=1080,
+        height=1350,
+        artifact="poster.html",
+    )
+
+    assert (tmp_path / "artifacts" / "poster.png").exists()
+
+
+@pytest.mark.parametrize(
+    ("overflow", "should_refuse"),
+    [(0.99, False), (1.01, True)],
+)
+def test_poster_capture_tolerance_does_not_hide_real_overflow(
+    tmp_path, overflow, should_refuse
+) -> None:
+    module = _capture_module()
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "poster.html").write_text("<html><body>poster</body></html>")
+    (tmp_path / "artifacts").mkdir()
+
+    errors = (
+        [
+            {
+                "kind": "poster-overflow",
+                "axis": "horizontal",
+                "overflow": overflow,
+                "message": f"poster overflow: horizontal by {overflow} CSS pixels",
+            }
+        ]
+        if should_refuse
+        else []
+    )
+    if should_refuse:
+        with pytest.raises(SystemExit):
+            module.capture(
+                tmp_path,
+                playwright_factory=_poster_capture_factory(errors),
+                width=1080,
+                height=1350,
+                artifact="poster.html",
+            )
+    else:
+        module.capture(
+            tmp_path,
+            playwright_factory=_poster_capture_factory(errors),
+            width=1080,
+            height=1350,
+            artifact="poster.html",
+        )
+
+
 def test_static_capture_module_imports_without_playwright() -> None:
     _capture_module()
 
