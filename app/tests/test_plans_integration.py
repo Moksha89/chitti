@@ -1115,7 +1115,6 @@ async def test_runner_brand_profile_access_is_read_only(database):
         await admin.execute(
             f'GRANT SELECT ON decisions, brand_profiles TO "{role}"'
         )
-        await reconcile_runner_privileges(admin, role)
         runner_database_url = urlunsplit(
             (
                 parsed.scheme,
@@ -1125,6 +1124,16 @@ async def test_runner_brand_profile_access_is_read_only(database):
                 parsed.fragment,
             )
         )
+        non_granting_connection = await asyncpg.connect(runner_database_url)
+        try:
+            with pytest.raises(
+                SystemExit,
+                match="requires a database role that can grant and revoke privileges",
+            ):
+                await reconcile_runner_privileges(non_granting_connection, role)
+        finally:
+            await non_granting_connection.close()
+        await reconcile_runner_privileges(admin, role)
         connection = await asyncpg.connect(runner_database_url)
         try:
             with pytest.raises(
