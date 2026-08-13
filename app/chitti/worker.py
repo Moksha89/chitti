@@ -1211,6 +1211,15 @@ class DockerSandboxDispatcher:
         )
         if diff_result.returncode:
             raise RuntimeError(diff_err[-1000:] or "git diff failed")
+        if policy.is_poster:
+            verify_operation = FixedOperation(
+                "runner",
+                "poster-export-assets",
+                ("sh", "-c", "verify generated export assets"),
+            )
+            await self._verify_poster_assets(
+                run_id, workspace, verify_operation, operation_index + 1
+            )
         await self._operation(
             run_id, diff, operation_index, "passed", _diff_out, diff_err,
             diff_result.returncode, datetime.now(UTC),
@@ -1232,6 +1241,15 @@ class DockerSandboxDispatcher:
             )
         staging = self.preview_staging_root / str(run_id)
         try:
+            if revision.job_type == "poster":
+                verify_operation = FixedOperation(
+                    "runner",
+                    "poster-preview-assets",
+                    ("sh", "-c", "verify generated preview assets"),
+                )
+                await self._verify_poster_assets(
+                    run_id, workspace, verify_operation, 0
+                )
             manifest = await asyncio.to_thread(copy_export, export_root, staging)
             async with self.database.sessions() as session:
                 artifacts = await session.execute(
@@ -1347,6 +1365,10 @@ class DockerSandboxDispatcher:
                 operation_index=operation_index + 1,
             )
             operation_index += 1
+            if policy.is_poster and result.returncode == 0:
+                await self._verify_poster_assets(
+                    run_id, workspace, operation, operation_index, stdout
+                )
             await self._operation(
                 run_id, operation, operation_index,
                 "passed" if result.returncode == 0 else "failed",
@@ -1410,7 +1432,9 @@ class DockerSandboxDispatcher:
             op_name, command, network = MODEL_COMMANDS[name]
             operation = FixedOperation(task_id, op_name, command, network=network)
             if name == "poster-export":
-                await verify_export_assets(self.database, run_id, workspace)
+                await self._verify_poster_assets(
+                    run_id, workspace, operation, operation_index + 1
+                )
             result, stdout, stderr = await self._run_container(
                 run_id,
                 self._docker_command(
@@ -1421,6 +1445,10 @@ class DockerSandboxDispatcher:
             )
             operation_index += 1
             status = "passed" if result.returncode == 0 else "failed"
+            if name == "poster-export" and result.returncode == 0:
+                await self._verify_poster_assets(
+                    run_id, workspace, operation, operation_index, stdout
+                )
             await self._operation(
                 run_id, operation, operation_index, status, stdout, stderr,
                 result.returncode, datetime.now(UTC),
@@ -2544,6 +2572,25 @@ class DockerSandboxDispatcher:
                     {"artifact_id": int(artifact.scalar_one()), "content": content},
                 )
                 await session.commit()
+
+    async def _verify_poster_assets(
+        self,
+        run_id: int,
+        workspace: Path,
+        operation: FixedOperation,
+        operation_index: int,
+        stdout: str = "",
+    ) -> None:
+        if not hasattr(self, "database"):
+            return
+        try:
+            await verify_export_assets(self.database, run_id, workspace)
+        except ImageManifestRefused as exc:
+            await self._operation(
+                run_id, operation, operation_index, "failed", stdout,
+                str(exc)[:2000], 1, datetime.now(UTC),
+            )
+            raise RuntimeError(str(exc)) from exc
 
 
 class WorkerRunManager:

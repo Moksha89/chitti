@@ -15,6 +15,7 @@ from chitti.image_generation import (
     generate_manifest_images,
     verify_export_assets,
 )
+from chitti.worker import DockerSandboxDispatcher, FixedOperation
 
 
 def test_image_request_owns_comfy_workflow_and_accepts_only_intent() -> None:
@@ -190,6 +191,68 @@ def test_host_rejects_forged_resolved_asset(tmp_path) -> None:
 
     with pytest.raises(ImageManifestRefused, match="unverified raster asset"):
         asyncio.run(verify_export_assets(Database(), 1, tmp_path))
+
+
+def test_asset_added_after_initial_check_is_rejected_on_next_check(tmp_path) -> None:
+    generated = tmp_path / "out" / "generated"
+    generated.mkdir(parents=True)
+    first = generated / "first.png"
+    first.write_bytes(b"first")
+
+    class Result:
+        def scalar_one_or_none(self):
+            return True
+
+    class Session:
+        async def execute(self, _statement, _params):
+            return Result()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Database:
+        def sessions(self):
+            return Session()
+
+    database = Database()
+    asyncio.run(verify_export_assets(database, 1, tmp_path))
+    second = generated / "second.png"
+    second.write_bytes(b"second")
+
+    class RejectingSession(Session):
+        async def execute(self, _statement, params):
+            result = Result()
+            result.scalar_one_or_none = lambda: (True if params["path"].endswith("first.png") else None)
+            return result
+
+    class RejectingDatabase:
+        def sessions(self):
+            return RejectingSession()
+
+    with pytest.raises(ImageManifestRefused, match="second.png"):
+        asyncio.run(verify_export_assets(RejectingDatabase(), 1, tmp_path))
+
+
+def test_verification_refusal_is_recorded_as_operation_failure(monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+
+    dispatcher = object.__new__(DockerSandboxDispatcher)
+    dispatcher.database = None
+    dispatcher._operation = AsyncMock()
+
+    async def reject(*_args):
+        raise ImageManifestRefused("unverified raster asset: generated/fake.png")
+
+    monkeypatch.setattr("chitti.worker.verify_export_assets", reject)
+    operation = FixedOperation("task", "poster-export", ("true",))
+
+    with pytest.raises(RuntimeError, match="generated/fake.png"):
+        asyncio.run(dispatcher._verify_poster_assets(1, tmp_path, operation, 3))
+    dispatcher._operation.assert_awaited_once()
+    assert "generated/fake.png" in dispatcher._operation.await_args.args[5]
 
 
 def test_budget_exhaustion_is_terminal(monkeypatch, tmp_path) -> None:
