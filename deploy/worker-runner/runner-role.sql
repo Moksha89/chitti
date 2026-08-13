@@ -11,7 +11,8 @@ GRANT SELECT ON plan_revisions, plan_approvals, decisions, decision_forgets, wor
     worker_retention_policy, worker_artifact_payloads, worker_model_calls,
     export_manifests, promotion_approvals, previews,
     reminders, reminder_occurrences, notifications,
-    notification_acknowledgements, daily_briefings, runner_health
+    notification_acknowledgements, daily_briefings, runner_health,
+    brand_profiles
     TO chitti_runner;
 GRANT INSERT ON plan_task_events, worker_run_events, worker_operations, worker_artifacts,
     worker_operation_output_chunks, worker_artifact_payloads, worker_model_calls,

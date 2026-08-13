@@ -13,6 +13,7 @@ from chitti.runner_access import (
     assert_runner_privileges,
     owned_sequences,
     required_privileges,
+    runner_source_texts,
 )
 from chitti.worker import RunBudgetExceeded
 
@@ -110,6 +111,24 @@ def test_runner_access_derives_new_schema_table_without_table_list() -> None:
         ["SELECT id FROM newly_added_table"],
         {"newly_added_table"},
     ) == {"newly_added_table": {"SELECT"}}
+
+
+def test_runner_access_follows_newly_imported_module(tmp_path, monkeypatch) -> None:
+    package = tmp_path / "runnergraph"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "entry.py").write_text("from .new_module import read_new_table\n")
+    (package / "new_module.py").write_text(
+        "def read_new_table():\n"
+        "    return 'SELECT id FROM newly_imported_table'\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    sources = runner_source_texts("runnergraph.entry")
+
+    assert required_privileges(sources, {"newly_imported_table"}) == {
+        "newly_imported_table": {"SELECT"}
+    }
 
 
 def test_runner_access_fails_when_required_grant_is_missing() -> None:
