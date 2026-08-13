@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from chitti.embedding import FakeEmbedder
-from chitti.memory import MemoryStore, normalize, normalize_key
+from chitti.memory import MemoryStore, equivalent_proposal, normalize, normalize_key
 from chitti.namespaces import NAMESPACE_ROWS
 from chitti.provider import ExtractedMemory
 
@@ -30,6 +30,22 @@ def test_normalize_key_collapses_namespace_drift() -> None:
     ):
         assert normalize_key(key) == expected
     assert normalize_key("project.frontend_framework") == "project_frontend_framework"
+
+
+def test_equivalent_proposal_accepts_conservative_restatement() -> None:
+    assert equivalent_proposal(
+        "Keep worker caps at $0.75 and 300,000 model tokens per run.",
+        "Worker caps are $0.75 per run and 300,000 model tokens.",
+    )
+    assert not equivalent_proposal("Tailwind CSS", "Plain CSS modules on every project.")
+    assert not equivalent_proposal(
+        "Do not use webgl-fluid.",
+        "Do not use webgl-fluid, Drei Environment presets, or Drei Text in generated 3D websites.",
+    )
+    assert not equivalent_proposal(
+        "The completion gate requires successful install, build, test, and export.",
+        "The completion gate requires successful install, build, test, and export with phone and desktop screenshots.",
+    )
 
 
 class SubjectEmbedder:

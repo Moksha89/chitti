@@ -102,6 +102,202 @@ async def test_conflicting_extractions_in_one_batch_use_real_decision_ids(store)
         assert result.scalar_one() == 1
 
 
+async def test_equivalent_conflict_recurrence_updates_one_open_row(store) -> None:
+    engine, memory = store
+    async with engine.begin() as session:
+        await memory.append_decision(
+            session,
+            ExtractedMemory(
+                "worker_caps",
+                "Keep worker caps at $0.75 and 300,000 model tokens per run.",
+                None,
+                None,
+                "user_stated",
+            ),
+            "general",
+        )
+        first = await memory.record_memories(
+            session,
+            [
+                ExtractedMemory(
+                    "worker_caps",
+                    "Worker caps are $0.75 per run and 300,000 model tokens.",
+                    None,
+                    None,
+                    "user_stated",
+                )
+            ],
+            "general",
+        )
+        second = await memory.record_memories(
+            session,
+            [
+                ExtractedMemory(
+                    "worker_caps",
+                    "Worker caps are $0.75 per run and 300,000 model tokens.",
+                    None,
+                    None,
+                    "user_stated",
+                )
+            ],
+            "general",
+        )
+        assert len(first) == len(second) == 1
+        row = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) AS count, MAX(recurrence_count) AS recurrence_count "
+                    "FROM memory_conflicts WHERE decision_key = 'worker_caps' "
+                    "AND closed_at IS NULL"
+                )
+            )
+        ).mappings().one()
+        assert row["count"] == 1
+        assert row["recurrence_count"] == 2
+        visible = await memory.conflicts(session, "general")
+        assert visible[0]["proposed_value"] == (
+            "Worker caps are $0.75 per run and 300,000 model tokens."
+        )
+        latest = (
+            await session.execute(
+                text(
+                    "SELECT latest_proposed_value FROM memory_conflicts "
+                    "WHERE decision_key = 'worker_caps' AND closed_at IS NULL"
+                )
+            )
+        ).scalar_one()
+        assert latest == "Worker caps are $0.75 per run and 300,000 model tokens."
+
+
+async def test_different_conflict_supersedes_previous_open_row(store) -> None:
+    engine, memory = store
+    async with engine.begin() as session:
+        await memory.append_decision(
+            session,
+            ExtractedMemory("style", "Tailwind CSS", None, None, "user_stated"),
+            "general",
+        )
+        first = await memory.record_memories(
+            session,
+            [ExtractedMemory("style", "CSS modules", None, None, "user_stated")],
+            "general",
+        )
+        second = await memory.record_memories(
+            session,
+            [ExtractedMemory("style", "Vanilla CSS", None, None, "user_stated")],
+            "general",
+        )
+        assert first and second
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT proposed_value, closed_at, closure_reason, superseded_by_conflict_id "
+                    "FROM memory_conflicts WHERE decision_key = 'style' ORDER BY id"
+                )
+            )
+        ).mappings().all()
+        assert rows[0]["closure_reason"] == "superseded"
+        assert rows[0]["superseded_by_conflict_id"] == second[0].conflict_id
+        assert rows[1]["closed_at"] is None
+
+
+async def test_resolution_records_actor_and_namespace_conflicts_are_private(store) -> None:
+    engine, memory = store
+    async with engine.begin() as session:
+        await memory.append_decision(
+            session,
+            ExtractedMemory("shared_preference", "Existing", None, None, "user_stated"),
+            "general",
+        )
+        conflicts = await memory.record_memories(
+            session,
+            [ExtractedMemory("shared_preference", "PJ proposal", None, None, "user_stated")],
+            "pj-digi",
+        )
+        assert len(await memory.conflicts(session, "pj-digi")) == 1
+        assert await memory.conflicts(session, "jsv-fashion") == []
+        await memory.resolve_conflict(session, conflicts[0].conflict_id, "existing", "akirah")
+        row = (
+            await session.execute(
+                text(
+                    "SELECT resolution_actor, resolved_at, closure_reason "
+                    "FROM memory_conflicts WHERE id = :id"
+                ),
+                {"id": conflicts[0].conflict_id},
+            )
+        ).mappings().one()
+        assert row["resolution_actor"] == "akirah"
+        assert row["resolved_at"] is not None
+        assert row["closure_reason"] == "owner"
+
+
+async def test_conflict_backfill_keeps_one_historical_row_per_key_without_deleting(store) -> None:
+    engine, _ = store
+    env = {
+        **os.environ,
+        "DATABASE_URL": engine.url.render_as_string(hide_password=False).replace(
+            "+asyncpg", "+psycopg"
+        ),
+    }
+    subprocess.run(
+        ["python", "-m", "alembic", "-c", "alembic.ini", "downgrade", "0021_runner_health_success"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+    async with engine.begin() as session:
+        decision = await session.execute(
+            text(
+                "INSERT INTO decisions "
+                "(project, decision, rationale, source, decision_key, namespace) "
+                "VALUES (NULL, 'Tailwind CSS', NULL, 'user_stated', 'styling_framework', 'general') "
+                "RETURNING id"
+            )
+        )
+        decision_id = decision.scalar_one()
+        for value in ("Plain CSS modules", "Next.js and Three.js"):
+            await session.execute(
+                text(
+                    "INSERT INTO memory_conflicts "
+                    "(decision_key, existing_decision_id, proposed_value, proposed_source, namespace) "
+                    "VALUES ('styling_framework', :decision_id, :value, 'user_stated', 'general')"
+                ),
+                {"decision_id": decision_id, "value": value},
+            )
+        before = await session.execute(text("SELECT COUNT(*) FROM memory_conflicts"))
+        before_count = before.scalar_one()
+    subprocess.run(
+        ["python", "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+    async with engine.begin() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT proposed_value, closed_at, closure_reason "
+                    "FROM memory_conflicts WHERE decision_key = 'styling_framework' "
+                    "ORDER BY id"
+                )
+            )
+        ).mappings().all()
+        after = await session.execute(text("SELECT COUNT(*) FROM memory_conflicts"))
+        assert after.scalar_one() == before_count
+        assert rows[0]["closed_at"] is None
+        assert rows[0]["proposed_value"] == "Plain CSS modules"
+        assert rows[1]["closure_reason"] == "deduplicated"
+        latest = (
+            await session.execute(
+                text(
+                    "SELECT latest_proposed_value FROM memory_conflicts "
+                    "WHERE decision_key = 'styling_framework' AND closed_at IS NULL"
+                )
+            )
+        ).scalar_one()
+        assert latest == "Next.js and Three.js"
+
+
 async def test_memory_namespaces_isolate_business_data_and_share_general_data(store) -> None:
     engine, memory = store
     async with engine.begin() as session:
