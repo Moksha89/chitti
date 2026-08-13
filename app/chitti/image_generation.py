@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import text
 
@@ -105,7 +105,7 @@ def _call_runpod(endpoint: str, key: str, payload: dict[str, Any]) -> dict[str, 
     )
     try:
         with urllib.request.urlopen(request, timeout=900) as response:
-            result = json.load(response)
+            result = cast(dict[str, Any], json.load(response))
     except (OSError, urllib.error.URLError, TimeoutError) as exc:
         raise ImageProviderFailure(f"image provider request failed: {exc}") from exc
     if result.get("status") != "COMPLETED":
