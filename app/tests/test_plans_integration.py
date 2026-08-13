@@ -43,7 +43,11 @@ from chitti.runner import (
     reconcile_interrupted_runs,
 )
 from chitti.runner_access import assert_runner_privileges
-from chitti.runner_health import recent_runner_health, record_runner_health_failure
+from chitti.runner_health import (
+    recent_runner_health,
+    record_runner_health_failure,
+    record_runner_health_success,
+)
 from chitti.transcripts import append_entry, recent_entries
 from chitti.worker import (
     MAX_CAPTURE_ARTIFACTS_PER_RUN,
@@ -859,7 +863,21 @@ async def test_reminders_are_exactly_once_and_namespace_scoped(database):
     assert await acknowledge_notification(
         adapter, "pj-digi", int(notifications[0]["id"])
     ) is False
-    after = (await recent_notifications(adapter, "pj-digi"))[0]
+    assert await recent_notifications(adapter, "pj-digi") == []
+    assert len(
+        await recent_notifications(adapter, "pj-digi", include_acknowledged=True)
+    ) == 1
+    assert await notifications_after(adapter, "pj-digi", 0) == []
+    assert len(
+        await notifications_after(
+            adapter, "pj-digi", 0, include_acknowledged=True
+        )
+    ) == 1
+    after = (
+        await recent_notifications(
+            adapter, "pj-digi", include_acknowledged=True
+        )
+    )[0]
     assert after["body"] == original["body"]
     assert after["created_at"] == original["created_at"]
 
@@ -954,6 +972,22 @@ async def test_persistent_runner_failure_is_visible_in_durable_health(database):
     assert health[0]["component"] == "reminder_sweep"
     assert health[0]["status"] == "failed"
     assert "permission denied" in str(health[0]["detail"])
+
+
+async def test_runner_health_distinguishes_never_recent_and_failed(database):
+    adapter = _DatabaseAdapter(database)
+    assert await recent_runner_health(adapter) == []
+    await record_runner_health_success(adapter, "reminder_sweep")
+    health = await recent_runner_health(adapter)
+    assert len(health) == 1
+    assert health[0]["status"] == "healthy"
+    assert health[0]["last_succeeded_at"] is not None
+    await record_runner_health_failure(adapter, "reminder_sweep", "database unavailable")
+    assert (await recent_runner_health(adapter))[0]["status"] == "failed"
+    await record_runner_health_success(adapter, "reminder_sweep")
+    recovered = await recent_runner_health(adapter)
+    assert recovered[0]["status"] == "healthy"
+    assert recovered[0]["last_succeeded_at"] is not None
 
 
 async def test_runner_privilege_assertion_handles_non_id_primary_key(database):

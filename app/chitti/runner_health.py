@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import cast
-
 from sqlalchemy import text
 
 from .db import Database
@@ -30,25 +27,35 @@ async def record_runner_health_failure(
 
 
 async def clear_runner_health(database: Database, component: str) -> None:
+    await record_runner_health_success(database, component)
+
+
+async def record_runner_health_success(database: Database, component: str) -> None:
     async with database.sessions() as session:
         await session.execute(
             text(
-                "UPDATE runner_health SET status = 'healthy', "
-                "resolved_at = now(), consecutive_failures = 0 "
-                "WHERE component = :component AND status = 'failed'"
+                "INSERT INTO runner_health "
+                "(component, status, detail, first_failed_at, last_failed_at, "
+                "consecutive_failures, resolved_at, last_succeeded_at) "
+                "VALUES (:component, 'healthy', 'reminder sweep completed', "
+                "now(), now(), 0, NULL, now()) "
+                "ON CONFLICT (component) DO UPDATE SET "
+                "status = 'healthy', detail = 'reminder sweep completed', "
+                "consecutive_failures = 0, resolved_at = now(), "
+                "last_succeeded_at = now()"
             ),
             {"component": component},
         )
         await session.commit()
 
 
-async def recent_runner_health(database: Database) -> list[Mapping[str, object]]:
+async def recent_runner_health(database: Database) -> list[dict[str, object]]:
     async with database.sessions() as session:
         result = await session.execute(
             text(
                 "SELECT component, status, detail, first_failed_at, last_failed_at, "
-                "consecutive_failures FROM runner_health "
-                "WHERE status = 'failed' ORDER BY last_failed_at DESC"
+                "consecutive_failures, last_succeeded_at FROM runner_health "
+                "ORDER BY COALESCE(last_succeeded_at, last_failed_at) DESC"
             )
         )
-        return cast(list[Mapping[str, object]], list(result.mappings()))
+        return [dict(row) for row in result.mappings()]

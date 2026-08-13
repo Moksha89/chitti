@@ -31,7 +31,7 @@ from .provider import (
 )
 from .reminders import sweep_reminders
 from .run_status import TERMINAL_RUN_STATUSES
-from .runner_health import clear_runner_health, record_runner_health_failure
+from .runner_health import record_runner_health_failure, record_runner_health_success
 from .runtime_identity import write_loaded_code_identity
 from .settings import Settings, get_settings
 from .worker import (
@@ -56,6 +56,8 @@ TERMINAL_PREVIEW_FAILURES = frozenset(
         PREVIEW_STAGING_MISSING,
     }
 )
+REMINDER_HEALTH_WRITE_INTERVAL_SECONDS = 30.0
+_last_reminder_health_success = 0.0
 
 def _copy_and_verify_export(
     source: Path, destination: Path, approved: ExportManifest
@@ -70,10 +72,19 @@ def _copy_and_verify_export(
 async def best_effort_reminder_sweep(
     database: Database, timezone_name: str = "UTC"
 ) -> None:
+    global _last_reminder_health_success
     try:
         await sweep_reminders(database, timezone_name=timezone_name)
-        await clear_runner_health(database, "reminder_sweep")
+        now = asyncio.get_running_loop().time()
+        if (
+            _last_reminder_health_success == 0.0
+            or now - _last_reminder_health_success
+            >= REMINDER_HEALTH_WRITE_INTERVAL_SECONDS
+        ):
+            await record_runner_health_success(database, "reminder_sweep")
+            _last_reminder_health_success = now
     except Exception as exc:
+        _last_reminder_health_success = 0.0
         logger.exception("reminder sweep failed")
         try:
             await record_runner_health_failure(

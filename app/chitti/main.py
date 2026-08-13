@@ -392,6 +392,12 @@ async def dashboard_context(
             notification["created_at"] = created_at.astimezone(display_zone).isoformat(
                 timespec="minutes"
             )
+    for health in runner_health:
+        succeeded_at = health.get("last_succeeded_at")
+        if isinstance(succeeded_at, datetime):
+            health["last_succeeded_at"] = succeeded_at.astimezone(
+                display_zone
+            ).isoformat(timespec="minutes")
     briefing = await compose_briefing(
         database, namespace, request.app.state.settings.display_timezone, now.astimezone(UTC)
     )
@@ -407,6 +413,7 @@ async def dashboard_context(
         "conflicts": conflicts,
         "plans": plans,
         "greeting": greeting,
+        "owner_name": None,
         "display_timezone": request.app.state.settings.display_timezone,
         "namespace": namespace,
         "namespace_options": namespace_options(),
