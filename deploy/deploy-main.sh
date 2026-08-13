@@ -268,10 +268,14 @@ else
   trap - EXIT
 fi
 
-RUNNER_ENV="${RUNNER_ENV}" PYTHONPATH="${INSTALL_DIR}/app" "${RUNNER_PYTHON}" - <<'PY'
+POSTGRES_USER="${POSTGRES_USER}" \
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD}" \
+POSTGRES_DB="${POSTGRES_DB}" \
+POSTGRES_PORT="${POSTGRES_PORT:-5432}" \
+PYTHONPATH="${INSTALL_DIR}/app" "${RUNNER_PYTHON}" - <<'PY'
 import asyncio
 import os
-from pathlib import Path
+from urllib.parse import quote
 
 import asyncpg
 
@@ -279,12 +283,11 @@ from chitti.runner_access import reconcile_runner_privileges
 
 
 def database_url() -> str:
-    for line in Path(os.environ["RUNNER_ENV"]).read_text().splitlines():
-        if line.startswith("DATABASE_URL="):
-            return line.partition("=")[2].replace(
-                "postgresql+asyncpg://", "postgresql://", 1
-            )
-    raise SystemExit("runner database URL is missing")
+    user = quote(os.environ["POSTGRES_USER"], safe="")
+    password = quote(os.environ["POSTGRES_PASSWORD"], safe="")
+    database = quote(os.environ["POSTGRES_DB"], safe="")
+    port = os.environ["POSTGRES_PORT"]
+    return f"postgresql://{user}:{password}@127.0.0.1:{port}/{database}"
 
 
 async def main() -> None:
