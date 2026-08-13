@@ -12,6 +12,17 @@ RUNNER_ACCESS_EXCLUSIONS = {
     # These helpers also serve the application process, but the runner never
     # calls their application-only mutation paths.
     ("brand_profiles", "INSERT"),
+    ("brand_profile_history", "INSERT"),
+    ("decision_forgets", "INSERT"),
+    ("decisions", "INSERT"),
+    ("decisions", "UPDATE"),
+    ("memory_chunks", "INSERT"),
+    ("memory_conflicts", "INSERT"),
+    ("memory_conflicts", "UPDATE"),
+    ("plan_approvals", "INSERT"),
+    ("plan_jobs", "INSERT"),
+    ("plan_jobs", "UPDATE"),
+    ("plan_revisions", "INSERT"),
     ("worker_runs", "INSERT"),
     ("reminders", "INSERT"),
     ("reminders", "UPDATE"),
