@@ -151,6 +151,22 @@ def test_runner_access_fails_when_required_grant_is_missing() -> None:
         )
 
 
+def test_runner_access_rejects_empty_derivation() -> None:
+    class Connection:
+        async def fetchval(self, *_args):
+            raise AssertionError("privilege checks must not run")
+
+    with pytest.raises(
+        SystemExit, match="runner privilege source derivation produced no sources"
+    ):
+        asyncio.run(assert_runner_privileges(Connection(), [], {"worker_runs"}))
+
+    with pytest.raises(
+        SystemExit, match="runner privilege derivation produced no table expectations"
+    ):
+        asyncio.run(assert_runner_privileges(Connection(), ["# no SQL"], {"worker_runs"}))
+
+
 def test_runner_sequence_discovery_failure_is_distinct() -> None:
     class Connection:
         async def fetch(self, _query, _table):

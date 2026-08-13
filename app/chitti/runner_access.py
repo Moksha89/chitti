@@ -177,7 +177,11 @@ async def assert_runner_privileges(
     }
     if source_texts is None:
         source_texts = runner_source_texts()
+    if not source_texts:
+        raise SystemExit("runner privilege source derivation produced no sources")
     required = required_privileges(source_texts, tables)
+    if not required:
+        raise SystemExit("runner privilege derivation produced no table expectations")
     for table, privileges in required.items():
         for privilege in privileges:
             allowed = await conn.fetchval(
