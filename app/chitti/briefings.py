@@ -125,11 +125,14 @@ async def compose_briefing(
         content = "\n\n".join(sections)
         if not runs and not approvals and conflicts == 0 and not previews and not reminders:
             content = "Nothing needs your attention today."
+        refresh_today = local_date == datetime.now(UTC).astimezone(zone).date()
         result = await session.execute(
             text(
                 "INSERT INTO daily_briefings (namespace, local_date, generated_at, content) "
                 "VALUES (:namespace, :local_date, :generated_at, :content) "
-                "ON CONFLICT (namespace, local_date) DO UPDATE SET content = daily_briefings.content "
+                "ON CONFLICT (namespace, local_date) DO UPDATE SET "
+                "generated_at = EXCLUDED.generated_at, content = EXCLUDED.content "
+                "WHERE :refresh_today "
                 "RETURNING content, generated_at"
             ),
             {
@@ -137,9 +140,21 @@ async def compose_briefing(
                 "local_date": local_date,
                 "generated_at": now,
                 "content": content,
+                "refresh_today": refresh_today,
             },
         )
-        briefing_row = cast(Mapping[str, object], result.mappings().one())
+        briefing_row: Mapping[str, object] | None = cast(
+            Mapping[str, object] | None, result.mappings().one_or_none()
+        )
+        if briefing_row is None:
+            existing = await session.execute(
+                text(
+                    "SELECT content, generated_at FROM daily_briefings "
+                    "WHERE namespace = :namespace AND local_date = :local_date"
+                ),
+                {"namespace": namespace, "local_date": local_date},
+            )
+            briefing_row = cast(Mapping[str, object], existing.mappings().one())
         await session.commit()
         return {
             "content": str(briefing_row["content"]),

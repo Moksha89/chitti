@@ -16,6 +16,7 @@ RUNNER_ACCESS_EXCLUSIONS = {
     # calls their application-only mutation paths.
     ("worker_runs", "INSERT"),
     ("reminders", "INSERT"),
+    ("reminders", "UPDATE"),
 }
 _TABLE_REFERENCE = re.compile(
     r"\b(DELETE\s+FROM|FROM|JOIN|INTO|UPDATE)\s+([a-z_][a-z0-9_]*)",

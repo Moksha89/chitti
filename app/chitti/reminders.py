@@ -129,6 +129,20 @@ async def create_reminder(
         return reminder_id
 
 
+async def cancel_reminder(database: Database, namespace: str, reminder_id: int) -> bool:
+    async with database.sessions() as session:
+        result = await session.execute(
+            text(
+                "UPDATE reminders SET active = false "
+                "WHERE id = :id AND namespace = :namespace AND active = true "
+                "RETURNING id"
+            ),
+            {"id": reminder_id, "namespace": namespace},
+        )
+        await session.commit()
+        return result.scalar_one_or_none() is not None
+
+
 async def recent_reminders(database: Database, namespace: str) -> list[dict[str, object]]:
     async with database.sessions() as session:
         result = await session.execute(

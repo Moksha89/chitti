@@ -34,7 +34,13 @@ from chitti.plans import (
     validate_approval_binding,
 )
 from chitti.provider import FakeProvider
-from chitti.reminders import create_reminder, next_due, sweep_reminders
+from chitti.reminders import (
+    cancel_reminder,
+    create_reminder,
+    next_due,
+    recent_reminders,
+    sweep_reminders,
+)
 from chitti.run_context import RunContextError, build_run_evidence
 from chitti.runner import (
     cancellation_requested,
@@ -882,6 +888,35 @@ async def test_reminders_are_exactly_once_and_namespace_scoped(database):
     assert after["created_at"] == original["created_at"]
 
 
+async def test_cancelled_recurring_reminder_stays_auditable_but_never_fires(database):
+    adapter = _DatabaseAdapter(database)
+    reminder_id = await create_reminder(
+        adapter,
+        "general",
+        "cancel this",
+        datetime(2026, 1, 1, 9, tzinfo=UTC),
+        "daily",
+    )
+    assert await sweep_reminders(adapter, datetime(2026, 1, 1, 9, tzinfo=UTC)) == 1
+    assert await cancel_reminder(adapter, "general", reminder_id)
+    assert await sweep_reminders(adapter, datetime(2026, 1, 5, 9, tzinfo=UTC)) == 0
+    async with database.begin() as session:
+        reminder = await session.execute(
+            text("SELECT active FROM reminders WHERE id = :id"),
+            {"id": reminder_id},
+        )
+        assert reminder.scalar_one() is False
+        occurrences = await session.execute(
+            text(
+                "SELECT COUNT(*) FROM reminder_occurrences WHERE reminder_id = :id"
+            ),
+            {"id": reminder_id},
+        )
+        assert occurrences.scalar_one() == 1
+    assert await recent_reminders(adapter, "general") == []
+    assert len(await recent_notifications(adapter, "general")) == 1
+
+
 async def test_reminder_local_time_and_empty_briefing_are_deterministic(database):
     from zoneinfo import ZoneInfo
 
@@ -917,6 +952,37 @@ async def test_reminder_local_time_and_empty_briefing_are_deterministic(database
         datetime(2026, 1, 1, 19, tzinfo=UTC),
     )
     assert empty["content"] == "Nothing needs your attention today."
+
+
+async def test_today_briefing_refreshes_but_past_briefing_stays_frozen(database):
+    now = datetime.now(UTC).replace(microsecond=0)
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+    async with database.begin() as session:
+        await session.execute(
+            text(
+                "INSERT INTO daily_briefings "
+                "(namespace, local_date, generated_at, content) "
+                "VALUES ('general', :today, :generated, 'frozen today')"
+            ),
+            {"today": today, "generated": now - timedelta(hours=1)},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO daily_briefings "
+                "(namespace, local_date, generated_at, content) "
+                "VALUES ('general', :yesterday, :generated, 'frozen past')"
+            ),
+            {"yesterday": yesterday, "generated": now - timedelta(days=1)},
+        )
+    today_briefing = await compose_briefing(
+        _DatabaseAdapter(database), "general", "UTC", now
+    )
+    assert today_briefing["content"] != "frozen today"
+    past_briefing = await compose_briefing(
+        _DatabaseAdapter(database), "general", "UTC", now - timedelta(days=1)
+    )
+    assert past_briefing["content"] == "frozen past"
 
 
 async def test_briefing_never_invokes_model_provider(database, monkeypatch):
