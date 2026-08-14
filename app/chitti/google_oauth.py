@@ -4,7 +4,7 @@ import secrets
 import time
 from typing import Any
 
-from google_auth_oauthlib.flow import Flow  # type: ignore[import-untyped]
+from google_auth_oauthlib.flow import Flow
 
 from .google_provider import GOOGLE_SCOPES
 from .settings import Settings

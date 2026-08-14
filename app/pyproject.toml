@@ -14,3 +14,7 @@ ignore_missing_imports = true
 module = ["google.*", "googleapiclient.*", "google_auth_oauthlib.*"]
 ignore_missing_imports = true
 disallow_untyped_calls = false
+
+[[tool.mypy.overrides]]
+module = ["chitti.google_provider", "chitti.google_oauth"]
+disallow_untyped_calls = false
