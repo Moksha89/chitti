@@ -132,6 +132,12 @@ def test_runner_access_follows_newly_imported_module(tmp_path, monkeypatch) -> N
     }
 
 
+def test_runner_access_derives_preview_cleanup_grant_from_reachable_runner_code() -> None:
+    grants = derived_grants(runner_source_texts(), {"previews"})
+
+    assert grants["previews"] == {"INSERT", "SELECT"}
+
+
 def test_runner_access_rejects_derived_application_only_write() -> None:
     with pytest.raises(
         SystemExit, match="would widen application-only writes on decisions"

@@ -83,6 +83,9 @@ def test_poster_prompts_require_brand_and_honest_visual_review() -> None:
     assert "device scale 1" in prompt
     assert "does not need a route argument" in prompt
     assert "do not raise the scale" in prompt
+    assert "between 64 and 1024 pixels" in prompt
+    assert "1080x1350" in prompt
+    assert "useful source aspect ratio" in prompt
     assert "visual quality was not assessed" in review
 
 

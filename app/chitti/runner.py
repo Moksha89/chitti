@@ -31,6 +31,7 @@ from .provider import (
 )
 from .reminders import sweep_reminders
 from .run_status import TERMINAL_RUN_STATUSES
+from .runner_access import runner_sql
 from .runner_health import record_runner_health_failure, record_runner_health_success
 from .runtime_identity import write_loaded_code_identity
 from .settings import Settings, get_settings
@@ -100,7 +101,7 @@ async def next_queued_run(
 ) -> Mapping[str, object] | None:
     async with database.sessions() as session:
         result = await session.execute(
-            text(
+            runner_sql(text(
                 "SELECT r.id, r.revision_id, r.limits "
                 "FROM worker_runs r "
                 "JOIN LATERAL ("
@@ -109,25 +110,25 @@ async def next_queued_run(
                 ") latest ON latest.status = 'queued' "
                 "ORDER BY r.id "
                 "LIMIT 1 FOR UPDATE OF r SKIP LOCKED"
-            )
+            ))
         )
         row = result.mappings().one_or_none()
         if row is None:
             return None
         await session.execute(
-            text(
+            runner_sql(text(
                 "INSERT INTO worker_run_events (run_id, status, detail) "
                 "VALUES (:run_id, 'running', 'claimed by host runner')"
-            ),
+            )),
             {"run_id": int(row["id"])},
         )
         await session.execute(
-            text(
+            runner_sql(text(
                 "INSERT INTO worker_run_heartbeats (run_id, runner_id, heartbeat_at) "
                 "VALUES (:run_id, :runner_id, now()) "
                 "ON CONFLICT (run_id) DO UPDATE SET "
                 "runner_id = EXCLUDED.runner_id, heartbeat_at = EXCLUDED.heartbeat_at"
-            ),
+            )),
             {"run_id": int(row["id"]), "runner_id": runner_id},
         )
         await session.commit()
@@ -139,11 +140,11 @@ async def record_run_heartbeat(
 ) -> None:
     async with database.sessions() as session:
         await session.execute(
-            text(
+            runner_sql(text(
                 "UPDATE worker_run_heartbeats "
                 "SET runner_id = :runner_id, heartbeat_at = now() "
                 "WHERE run_id = :run_id"
-            ),
+            )),
             {"run_id": run_id, "runner_id": runner_id},
         )
         await session.commit()
@@ -168,7 +169,7 @@ async def reconcile_interrupted_runs(
     interrupted: list[int] = []
     async with database.sessions() as session:
         result = await session.execute(
-            text(
+            runner_sql(text(
                 "SELECT r.id, latest.status, heartbeat.run_id AS heartbeat_run_id "
                 "FROM worker_runs r "
                 "JOIN LATERAL ("
@@ -179,7 +180,7 @@ async def reconcile_interrupted_runs(
                 "ON heartbeat.run_id = r.id "
                 "WHERE heartbeat.heartbeat_at IS NULL OR heartbeat.heartbeat_at < :cutoff "
                 "ORDER BY r.id FOR UPDATE OF r SKIP LOCKED"
-            ),
+            )),
             {"cutoff": cutoff},
         )
         for row in result.mappings():
@@ -192,14 +193,14 @@ async def reconcile_interrupted_runs(
                 else "interrupted by runner restart; execution heartbeat expired"
             )
             await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO worker_run_events (run_id, status, detail) "
                     "VALUES (:run_id, 'interrupted', :detail)"
-                ),
+                )),
                 {"run_id": run_id, "detail": detail},
             )
             await session.execute(
-                text("DELETE FROM worker_run_heartbeats WHERE run_id = :run_id"),
+                runner_sql(text("DELETE FROM worker_run_heartbeats WHERE run_id = :run_id")),
                 {"run_id": run_id},
             )
             interrupted.append(run_id)
@@ -210,7 +211,7 @@ async def reconcile_interrupted_runs(
 async def reconcile_cancelled_run(database: Database) -> int | None:
     async with database.sessions() as session:
         result = await session.execute(
-            text(
+            runner_sql(text(
                 "SELECT r.id "
                 "FROM worker_runs r "
                 "JOIN LATERAL ("
@@ -224,17 +225,17 @@ async def reconcile_cancelled_run(database: Database) -> int | None:
                 ") "
                 "ORDER BY r.id "
                 "LIMIT 1 FOR UPDATE OF r SKIP LOCKED"
-            )
+            ))
         )
         row = result.mappings().one_or_none()
         if row is None:
             return None
         run_id = int(row["id"])
         await session.execute(
-            text(
+            runner_sql(text(
                 "INSERT INTO worker_run_events (run_id, status, detail) "
                 "VALUES (:run_id, 'cancelled', 'cancelled before it started')"
-            ),
+            )),
             {"run_id": run_id},
         )
         await session.commit()
@@ -244,12 +245,12 @@ async def reconcile_cancelled_run(database: Database) -> int | None:
 async def cancellation_requested(database: Database, run_id: int) -> bool:
     async with database.sessions() as session:
         result = await session.execute(
-            text(
+            runner_sql(text(
                 "SELECT EXISTS ("
                 "  SELECT 1 FROM worker_run_events "
                 "  WHERE run_id = :run_id AND status = 'cancel_requested'"
                 ")"
-            ),
+            )),
             {"run_id": run_id},
         )
         return bool(result.scalar_one())
@@ -258,10 +259,10 @@ async def cancellation_requested(database: Database, run_id: int) -> bool:
 async def record_event(database: Database, run_id: int, status: str, detail: str) -> None:
     async with database.sessions() as session:
         await session.execute(
-            text(
+            runner_sql(text(
                 "INSERT INTO worker_run_events (run_id, status, detail) "
                 "VALUES (:run_id, :status, :detail)"
-            ),
+            )),
             {"run_id": run_id, "status": status, "detail": detail},
         )
         await session.commit()
@@ -270,10 +271,10 @@ async def record_event(database: Database, run_id: int, status: str, detail: str
 async def latest_status(database: Database, run_id: int) -> str | None:
     async with database.sessions() as session:
         result = await session.execute(
-            text(
+            runner_sql(text(
                 "SELECT status FROM worker_run_events "
                 "WHERE run_id = :run_id ORDER BY id DESC LIMIT 1"
-            ),
+            )),
             {"run_id": run_id},
         )
         status = result.scalar_one_or_none()
@@ -293,32 +294,32 @@ async def record_cancelled_if_requested(database: Database, run_id: int) -> bool
 async def trim_payloads(database: Database) -> None:
     async with database.sessions() as session:
         policy = await session.execute(
-            text("SELECT max_payload_bytes FROM worker_retention_policy WHERE id = 1")
+            runner_sql(text("SELECT max_payload_bytes FROM worker_retention_policy WHERE id = 1"))
         )
         maximum = int(policy.scalar_one())
         while True:
             result = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT COALESCE(SUM(octet_length(content)), 0) "
                     "FROM worker_artifact_payloads"
-                )
+                ))
             )
             total = int(result.scalar_one())
             if total <= maximum:
                 break
             oldest = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT artifact_id FROM worker_artifact_payloads "
                     "ORDER BY created_at, artifact_id LIMIT 1"
-                )
+                ))
             )
             artifact_id = oldest.scalar_one_or_none()
             if artifact_id is None:
                 break
             await session.execute(
-                text(
+                runner_sql(text(
                     "DELETE FROM worker_artifact_payloads WHERE artifact_id = :artifact_id"
-                ),
+                )),
                 {"artifact_id": int(artifact_id)},
             )
         await session.commit()
@@ -330,7 +331,7 @@ async def publish_approved_previews(database: Database, settings: Settings) -> N
     await _evict_expired_preview_directories(database, preview_root)
     async with database.sessions() as session:
         rows = await session.execute(
-            text(
+            runner_sql(text(
                 "SELECT a.id AS approval_id, a.run_id "
                 "FROM promotion_approvals a "
                 "LEFT JOIN previews p ON p.run_id = a.run_id "
@@ -341,7 +342,7 @@ async def publish_approved_previews(database: Database, settings: Settings) -> N
                 "  ORDER BY id DESC LIMIT 1"
                 ") latest ON true "
                 "WHERE a.decision = 'approved' AND p.run_id IS NULL"
-            )
+            ))
         )
         approvals = list(rows.mappings())
     for row in approvals:
@@ -381,12 +382,12 @@ async def _record_preview_event(
         bounded_detail = detail[:2000]
         async with database.sessions() as session:
             latest = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT status, detail FROM worker_run_events "
                     "WHERE run_id = :run_id "
                     "AND status IN ('preview_failed', 'preview_blocked') "
                     "ORDER BY id DESC LIMIT 1"
-                ),
+                )),
                 {"run_id": run_id},
             )
             previous = latest.mappings().one_or_none()
@@ -397,10 +398,10 @@ async def _record_preview_event(
             ):
                 return
             await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO worker_run_events (run_id, status, detail) "
                     "VALUES (:run_id, :status, :detail)"
-                ),
+                )),
                 {"run_id": run_id, "status": status, "detail": bounded_detail},
             )
             await session.commit()
@@ -411,7 +412,7 @@ async def _record_preview_event(
 async def _evict_expired_preview_directories(database: Database, preview_root: Path) -> None:
     async with database.sessions() as session:
         result = await session.execute(
-            text("SELECT preview_id FROM previews WHERE expires_at <= now()")
+            runner_sql(text("SELECT preview_id FROM previews WHERE expires_at <= now()"))
         )
         expired = [str(row.preview_id) for row in result]
     for identifier in expired:
@@ -426,7 +427,7 @@ async def _publish_one_preview(
 ) -> int:
     async with database.sessions() as session:
         result = await session.execute(
-            text(
+            runner_sql(text(
                 "SELECT a.id AS approval_id, a.run_id, a.manifest_id, "
                 "a.revision_content_hash, a.reviewer_artifact_id, a.reviewer_sha256, "
                 "a.diff_artifact_id, a.diff_sha256, a.manifest_digest, "
@@ -434,15 +435,15 @@ async def _publish_one_preview(
                 "m.manifest, m.digest, m.staging_path, m.total_bytes, m.file_count "
                 "FROM promotion_approvals a JOIN export_manifests m "
                 "ON m.id = a.manifest_id WHERE a.id = :approval_id"
-            ),
+            )),
             {"approval_id": int(cast(int, approval["approval_id"]))},
         )
         row = result.mappings().one()
         existing = await session.execute(
-            text(
+            runner_sql(text(
                 "SELECT COALESCE(SUM(total_bytes), 0) AS total, COUNT(*) AS count "
                 "FROM previews WHERE expires_at > now()"
-            )
+            ))
         )
         totals = existing.mappings().one()
         total_bytes = int(totals["total"])
@@ -461,17 +462,17 @@ async def _publish_one_preview(
         if total_bytes + manifest.total_bytes > int(settings.preview_max_bytes):
             raise PreviewBlockedError("preview size quota exhausted")
         reviewer = await session.execute(
-            text(
+            runner_sql(text(
                 "SELECT sha256 FROM worker_artifacts "
                 "WHERE id = :id AND run_id = :run_id"
-            ),
+            )),
             {"id": row["reviewer_artifact_id"], "run_id": row["run_id"]},
         )
         diff = await session.execute(
-            text(
+            runner_sql(text(
                 "SELECT sha256 FROM worker_artifacts "
                 "WHERE id = :id AND run_id = :run_id"
-            ),
+            )),
             {"id": row["diff_artifact_id"], "run_id": row["run_id"]},
         )
         if (
@@ -495,13 +496,13 @@ async def _publish_one_preview(
                 hours=int(settings.preview_ttl_hours)
             )
             await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO previews "
                     "(preview_id, expires_at, run_id, manifest_id, approval_id, "
                     "total_bytes, file_count) VALUES "
                     "(:preview_id, :expires_at, :run_id, :manifest_id, "
                     ":approval_id, :total_bytes, :file_count)"
-                ),
+                )),
                 {
                     "preview_id": identifier,
                     "expires_at": expires_at,
@@ -599,7 +600,7 @@ async def execute_run(
                 await heartbeat_task
             async with database.sessions() as session:
                 await session.execute(
-                    text("DELETE FROM worker_run_heartbeats WHERE run_id = :run_id"),
+                    runner_sql(text("DELETE FROM worker_run_heartbeats WHERE run_id = :run_id")),
                     {"run_id": run_id},
                 )
                 await session.commit()
