@@ -4,6 +4,7 @@ asyncpg==0.30.0
 cryptography==44.0.2
 fastapi==0.115.11
 google-api-python-client==2.169.0
+google-api-python-client-stubs==1.39.0
 google-auth==2.38.0
 google-auth-oauthlib==1.2.1
 httpx==0.28.1

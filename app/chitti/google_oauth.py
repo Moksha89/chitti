@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import importlib
 import secrets
 import time
-from typing import Any, cast
+from typing import Any
+
+from google_auth_oauthlib.flow import Flow  # type: ignore[import-untyped]
 
 from .google_provider import GOOGLE_SCOPES
 from .settings import Settings
@@ -26,11 +27,7 @@ class OAuthStateStore:
 
 
 def authorization_url(settings: Settings, state: str) -> str:
-    try:
-        flow_type = cast(Any, importlib.import_module("google_auth_oauthlib.flow").Flow)
-    except ImportError as exc:
-        raise RuntimeError("Google OAuth libraries are not installed") from exc
-    flow = flow_type.from_client_config(
+    flow = Flow.from_client_config(
         {
             "web": {
                 "client_id": settings.google_client_id,
@@ -53,11 +50,7 @@ def authorization_url(settings: Settings, state: str) -> str:
 
 
 def exchange_code(settings: Settings, code: str) -> dict[str, Any]:
-    try:
-        flow_type = cast(Any, importlib.import_module("google_auth_oauthlib.flow").Flow)
-    except ImportError as exc:
-        raise RuntimeError("Google OAuth libraries are not installed") from exc
-    flow = flow_type.from_client_config(
+    flow = Flow.from_client_config(
         {
             "web": {
                 "client_id": settings.google_client_id,

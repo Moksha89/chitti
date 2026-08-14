@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import base64
-import importlib
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, cast
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
 GOOGLE_SCOPES = (
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -62,18 +65,7 @@ class GoogleReadProvider(Protocol):
 
 class GoogleApiProvider:
     def __init__(self, client_config: dict[str, Any], refresh_token: str) -> None:
-        try:
-            credentials_type = cast(
-                Any,
-                importlib.import_module("google.oauth2.credentials").Credentials,
-            )
-            build = cast(
-                Any,
-                importlib.import_module("googleapiclient.discovery").build,
-            )
-        except ImportError as exc:
-            raise GoogleProviderError("Google client libraries are not installed") from exc
-        self.credentials = credentials_type(
+        self.credentials = Credentials(
             token=None,
             refresh_token=refresh_token,
             token_uri="https://oauth2.googleapis.com/token",
@@ -96,9 +88,15 @@ class GoogleApiProvider:
     ) -> tuple[str, list[GmailMessage]]:
         try:
             if history_id:
-                response = self.gmail.users().history().list(
-                    userId="me", startHistoryId=history_id, historyTypes=["messageAdded"]
-                ).execute()
+                response = cast(
+                    dict[str, Any],
+                    self.gmail.users()
+                    .history()
+                    .list(
+                        userId="me", startHistoryId=history_id, historyTypes=["messageAdded"]
+                    )
+                    .execute(),
+                )
                 if response.get("historyId") is None and response.get("history") is None:
                     raise GoogleCursorInvalid("Gmail history cursor is invalid")
                 message_ids = [
@@ -109,9 +107,12 @@ class GoogleApiProvider:
                 newest = str(response.get("historyId", history_id))
             else:
                 query = f"after:{int(after.timestamp())}" if after else None
-                response = self.gmail.users().messages().list(
-                    userId="me", q=query, maxResults=limit
-                ).execute()
+                response = cast(
+                    dict[str, Any],
+                    self.gmail.users().messages().list(
+                        userId="me", q=query, maxResults=limit
+                    ).execute(),
+                )
                 message_ids = [item["id"] for item in response.get("messages", [])][:limit]
                 profile = self.gmail.users().getProfile(userId="me").execute()
                 newest = str(profile.get("historyId", ""))
@@ -126,7 +127,13 @@ class GoogleApiProvider:
             raise GoogleProviderError("Gmail synchronization failed") from exc
 
     def _message(self, message_id: str) -> GmailMessage:
-        raw = self.gmail.users().messages().get(userId="me", id=message_id, format="full").execute()
+        raw = cast(
+            dict[str, Any],
+            self.gmail.users()
+            .messages()
+            .get(userId="me", id=message_id, format="full")
+            .execute(),
+        )
         headers = {
             str(item.get("name", "")).lower(): str(item.get("value", ""))
             for item in raw.get("payload", {}).get("headers", [])
@@ -158,7 +165,9 @@ class GoogleApiProvider:
             else:
                 params["timeMin"] = time_min.isoformat()
                 params["timeMax"] = time_max.isoformat()
-            response = self.calendar.events().list(**params).execute()
+            response = cast(
+                dict[str, Any], self.calendar.events().list(**params).execute()
+            )
             events = [
                 CalendarEvent(
                     calendar_id="primary",
@@ -182,11 +191,7 @@ class GoogleApiProvider:
 
     def revoke(self) -> None:
         try:
-            request_type = cast(
-                Any,
-                importlib.import_module("google.auth.transport.requests").Request,
-            )
-            response = request_type().session.post(
+            response = Request().session.post(
                 "https://oauth2.googleapis.com/revoke",
                 data={"token": self.credentials.refresh_token},
                 timeout=20,
