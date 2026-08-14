@@ -318,7 +318,79 @@ def test_agent_completion_retries_truncated_body_then_succeeds(monkeypatch) -> N
     assert completion.retry_failures == ("malformed response",)
 
 
-def test_agent_completion_does_not_retry_4xx(monkeypatch) -> None:
+def test_agent_completion_retries_408(monkeypatch) -> None:
+    calls = 0
+
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(
+                    408, request=httpx.Request("POST", "http://gateway")
+                )
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", "http://gateway"),
+                json={
+                    "choices": [{"message": {"content": "done"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    async def no_sleep(*_args) -> None:
+        return None
+
+    monkeypatch.setattr("chitti.provider.asyncio.sleep", no_sleep)
+    completion = asyncio.run(
+        LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+            [{"role": "user", "content": "work"}], "coder"
+        )
+    )
+    assert calls == 2
+    assert completion.retry_failures == ("http 408",)
+
+
+def test_agent_completion_retries_429_and_honors_retry_after(monkeypatch) -> None:
+    calls = 0
+    delays = []
+
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(
+                    429,
+                    request=httpx.Request("POST", "http://gateway"),
+                    headers={"Retry-After": "7"},
+                )
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", "http://gateway"),
+                json={
+                    "choices": [{"message": {"content": "done"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+
+    async def record_sleep(delay) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("chitti.provider.asyncio.sleep", record_sleep)
+    asyncio.run(
+        LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+            [{"role": "user", "content": "work"}], "coder"
+        )
+    )
+    assert calls == 2
+    assert delays == [7.0]
+
+
+def test_agent_completion_does_not_retry_other_4xx(monkeypatch) -> None:
     calls = 0
 
     class Client(_Client):
@@ -326,17 +398,61 @@ def test_agent_completion_does_not_retry_4xx(monkeypatch) -> None:
             nonlocal calls
             calls += 1
             return httpx.Response(
-                429, request=httpx.Request("POST", "http://gateway")
+                400, request=httpx.Request("POST", "http://gateway")
             )
 
     monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
-    with pytest.raises(Exception, match="HTTP 429"):
+    with pytest.raises(Exception, match="HTTP 400"):
         asyncio.run(
             LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
                 [{"role": "user", "content": "work"}], "coder"
             )
         )
     assert calls == 1
+
+
+def test_agent_completion_preserves_mixed_failure_evidence_and_usage(monkeypatch) -> None:
+    responses = [
+        httpx.Response(
+            503,
+            request=httpx.Request("POST", "http://gateway"),
+            json={
+                "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10},
+                "cost": 0.004,
+            },
+        ),
+        httpx.Response(
+            408, request=httpx.Request("POST", "http://gateway")
+        ),
+        httpx.Response(
+            400, request=httpx.Request("POST", "http://gateway")
+        ),
+    ]
+
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            return responses.pop(0)
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+
+    async def no_sleep(*_args) -> None:
+        return None
+
+    monkeypatch.setattr("chitti.provider.asyncio.sleep", no_sleep)
+    with pytest.raises(ModelProviderError, match="request failed") as raised:
+        asyncio.run(
+            LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+                [{"role": "user", "content": "work"}], "coder"
+            )
+        )
+    error = raised.value
+    assert error.failure_class == "http 4xx"
+    assert error.attempts == 3
+    assert error.retry_failures == ("http 5xx", "http 408", "http 4xx")
+    assert error.prompt_tokens == 4
+    assert error.completion_tokens == 6
+    assert error.total_tokens == 10
+    assert error.cost_usd == 0.004
 
 
 def test_agent_completion_does_not_retry_policy_refusal(monkeypatch) -> None:
