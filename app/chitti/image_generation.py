@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import colorsys
 import hashlib
 import json
 import re
 import time
 import urllib.error
 import urllib.request
-from collections import deque
 from collections.abc import Mapping
 from io import BytesIO
 from pathlib import Path
@@ -30,6 +30,21 @@ RUNPOD_POLL_INTERVAL_SECONDS = 5
 # well inside the runner's two-hour run deadline.
 RUNPOD_POLL_TIMEOUT_SECONDS = 600
 RUNPOD_PENDING_STATUSES = frozenset({"IN_QUEUE", "IN_PROGRESS"})
+CUTOUT_KEY_RGB = (255, 0, 255)
+CUTOUT_KEY_HUE = colorsys.rgb_to_hsv(*(channel / 255 for channel in CUTOUT_KEY_RGB))[0]
+CUTOUT_KEY_HUE_INNER = 0.045
+CUTOUT_KEY_HUE_OUTER = 0.115
+CUTOUT_MIN_KEY_FRACTION = 0.20
+CUTOUT_MAX_SUBJECT_AREA = 0.90
+CUTOUT_PROMPT_SUFFIX = (
+    " Place the subject on a solid vivid magenta chroma-key background (#FF00FF) "
+    "that fills the entire frame; keep the background flat and uniform with no "
+    "gradient, vignette, texture, scenery, floor, shadows, or extra objects."
+)
+CUTOUT_NEGATIVE_SUFFIX = (
+    " gradient background, vignette, textured background, scenery, floor, shadows, "
+    "extra objects, purple background, pink background"
+)
 
 
 class ImageManifestRefused(RuntimeError):
@@ -77,9 +92,7 @@ class ImageProviderFailure(RuntimeError):
 def _cutout_image(
     raw: bytes,
     *,
-    tolerance: int = 24,
     feather_radius: float = 1.25,
-    border_width: int = 2,
 ) -> tuple[bytes, dict[str, object]]:
     try:
         image = Image.open(BytesIO(raw)).convert("RGBA")
@@ -87,105 +100,91 @@ def _cutout_image(
         raise ImageManifestRefused(f"cutout asset is not a readable image: {exc}") from exc
     width, height = image.size
     pixels = cast(Any, image.load())
-    border = [
-        pixels[x, y][:3]
-        for x in range(width)
-        for y in range(height)
-        if (x < border_width or x >= width - border_width)
-        and (y < border_width or y >= height - border_width)
-    ]
-    background = tuple(
-        sorted(channel)[len(channel) // 2]
-        for channel in zip(*border, strict=True)
-    )
-    if any(
-        max(abs(pixel[channel] - background[channel]) for channel in range(3))
-        > tolerance
-        for pixel in border
-    ):
-        raise ImageManifestRefused(
-            "cutout asset background is not near-uniform along its border"
-        )
-
-    def near_background(x: int, y: int) -> bool:
-        pixel = pixels[x, y][:3]
-        return bool(
-            max(
-                abs(pixel[channel] - background[channel])
-                for channel in range(3)
-            )
-            <= tolerance
-        )
-
-    background_pixels = bytearray(width * height)
-    queued = bytearray(width * height)
-    pending: deque[tuple[int, int]] = deque()
-    for x in range(width):
-        for y in (*range(border_width), *range(height - border_width, height)):
-            index = y * width + x
-            if not queued[index]:
-                queued[index] = 1
-                pending.append((x, y))
-    for y in range(height):
-        for x in (*range(border_width), *range(width - border_width, width)):
-            index = y * width + x
-            if not queued[index]:
-                queued[index] = 1
-                pending.append((x, y))
-    while pending:
-        x, y = pending.popleft()
-        index = y * width + x
-        if not near_background(x, y):
-            continue
-        background_pixels[index] = 1
-        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
-            if 0 <= nx < width and 0 <= ny < height:
-                neighbor_index = ny * width + nx
-                if not queued[neighbor_index]:
-                    queued[neighbor_index] = 1
-                    pending.append((nx, ny))
-
-    # Enclosed holes and background-coloured pockets are still background.
+    alpha = Image.new("L", (width, height), 0)
+    alpha_pixels = cast(Any, alpha.load())
+    key_count = 0
     for y in range(height):
         for x in range(width):
-            index = y * width + x
-            if not background_pixels[index] and near_background(x, y):
-                background_pixels[index] = 1
+            red, green, blue = pixels[x, y][:3]
+            hue, saturation, _value = colorsys.rgb_to_hsv(
+                red / 255, green / 255, blue / 255
+            )
+            hue_distance = abs(hue - CUTOUT_KEY_HUE)
+            hue_distance = min(hue_distance, 1 - hue_distance)
+            alpha_pixels[x, y] = 255
+            if saturation < 0.22:
+                continue
+            if hue_distance <= CUTOUT_KEY_HUE_OUTER:
+                key_count += 1
+                if hue_distance <= CUTOUT_KEY_HUE_INNER:
+                    alpha_pixels[x, y] = 0
+                else:
+                    alpha_pixels[x, y] = int(
+                        255
+                        * (hue_distance - CUTOUT_KEY_HUE_INNER)
+                        / (CUTOUT_KEY_HUE_OUTER - CUTOUT_KEY_HUE_INNER)
+                    )
+    key_fraction = key_count / (width * height)
+    if key_fraction < CUTOUT_MIN_KEY_FRACTION:
+        raise ImageManifestRefused(
+            "cutout provider ignored the chroma-key instruction: keyed area was "
+            f"only {key_fraction:.1%}"
+        )
 
+    alpha = alpha.filter(ImageFilter.GaussianBlur(radius=feather_radius))
+    output = image.copy()
+    output_pixels = cast(Any, output.load())
+    for y in range(height):
+        for x in range(width):
+            red, green, blue, _ = output_pixels[x, y]
+            edge_alpha = alpha_pixels[x, y] / 255
+            spill = max(0, min(red, blue) - green)
+            despill = int(spill * (1 - edge_alpha) * 0.7)
+            output_pixels[x, y] = (
+                max(0, red - despill),
+                green,
+                max(0, blue - despill),
+                alpha.getpixel((x, y)),
+            )
+    output.putalpha(alpha)
     foreground = [
         (x, y)
         for y in range(height)
         for x in range(width)
-        if not background_pixels[y * width + x]
+        if alpha_pixels[x, y] > 128
     ]
     if not foreground:
-        raise ImageManifestRefused("cutout asset contains no subject after background removal")
+        raise ImageManifestRefused(
+            "cutout provider ignored the chroma-key instruction: no subject remained"
+        )
     min_x = min(x for x, _ in foreground)
     max_x = max(x for x, _ in foreground)
     min_y = min(y for _, y in foreground)
     max_y = max(y for _, y in foreground)
     subject_area = len(foreground) / (width * height)
-    if subject_area < 0.005 or subject_area > 0.95:
+    if subject_area < 0.005 or subject_area > CUTOUT_MAX_SUBJECT_AREA:
         raise ImageManifestRefused(
-            "cutout asset subject mask is not safely separable from its background"
+            "cutout provider returned an implausible subject area after chroma-key removal"
         )
-
-    alpha = Image.new("L", (width, height), 0)
-    alpha_pixels = cast(Any, alpha.load())
-    for x, y in foreground:
-        alpha_pixels[x, y] = 255
-    output = image.copy()
-    output.putalpha(alpha.filter(ImageFilter.GaussianBlur(radius=feather_radius)))
     buffer = BytesIO()
     output.save(buffer, format="PNG")
     return buffer.getvalue(), {
-        "tolerance": tolerance,
+        "key_rgb": list(CUTOUT_KEY_RGB),
+        "key_hue": CUTOUT_KEY_HUE,
+        "key_hue_inner": CUTOUT_KEY_HUE_INNER,
+        "key_hue_outer": CUTOUT_KEY_HUE_OUTER,
+        "key_fraction": key_fraction,
         "feather_radius": feather_radius,
-        "border_width": border_width,
-        "background_rgb": background,
+        "despill_factor": 0.7,
         "subject_bbox": [min_x, min_y, max_x, max_y],
         "subject_area": subject_area,
     }
+
+
+def _cutout_prompts(item: Mapping[str, Any]) -> tuple[str, str]:
+    prompt = str(item.get("prompt", "")).strip() + CUTOUT_PROMPT_SUFFIX
+    negative = (str(item.get("negative_prompt", "")).strip() + CUTOUT_NEGATIVE_SUFFIX).strip()
+    return prompt, negative
 
 
 def _safe_value(value: object) -> str | None:
@@ -454,6 +453,10 @@ async def generate_manifest_images(
             source_raw = source.read_bytes()
             source_digest = hashlib.sha256(source_raw).hexdigest()
         request_item = dict(item)
+        if item.get("cutout", False):
+            prompt, negative = _cutout_prompts(item)
+            request_item["prompt"] = prompt
+            request_item["negative_prompt"] = negative
         if item.get("seed") is None:
             seed_digest = _request_digest(request_item, source_digest)
             seed = int(seed_digest[:16], 16)
@@ -496,8 +499,8 @@ async def generate_manifest_images(
                         {
                             "run_id": run_id,
                             "digest": digest,
-                            "prompt": item["prompt"],
-                            "negative": item.get("negative_prompt", ""),
+                            "prompt": request_item["prompt"],
+                            "negative": request_item.get("negative_prompt", ""),
                             "parameters": json.dumps(
                                 cached_parameters
                                 if isinstance(cached_parameters, dict)
@@ -601,8 +604,8 @@ async def generate_manifest_images(
                 {
                     "run_id": run_id,
                     "digest": digest,
-                    "prompt": item["prompt"],
-                    "negative": item.get("negative_prompt", ""),
+                    "prompt": request_item["prompt"],
+                    "negative": request_item.get("negative_prompt", ""),
                     "parameters": json.dumps(
                         {
                             **dict(request_item),
