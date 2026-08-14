@@ -98,7 +98,11 @@ def test_gateway_preflight_uses_models_endpoint_and_both_routes(monkeypatch) -> 
     monkeypatch.setattr(
         "chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client()
     )
-    asyncio.run(LiteLLMProvider("http://127.0.0.1:4000", "configured").validate_gateway())
+    asyncio.run(
+        LiteLLMProvider("http://127.0.0.1:4000", "configured").validate_gateway(
+            probe_routes=True
+        )
+    )
 
     assert calls[0] == (
         "http://127.0.0.1:4000/v1/models",

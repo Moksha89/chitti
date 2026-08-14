@@ -6,6 +6,6 @@ TERMINAL_RUN_STATUSES = frozenset(
         "interrupted",
         "preview_failed",
         "preview_blocked",
-        "visual-review-inconclusive",
+        "visual_review_inconclusive",
     }
 )

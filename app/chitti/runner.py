@@ -588,7 +588,7 @@ async def execute_run(
             await record_event(database, run_id, "failed", str(exc))
     except VisualReviewInconclusive as exc:
         if not await record_cancelled_if_requested(database, run_id):
-            await record_event(database, run_id, "visual-review-inconclusive", str(exc))
+            await record_event(database, run_id, "visual_review_inconclusive", str(exc))
     except Exception as exc:
         if not await record_cancelled_if_requested(database, run_id):
             await record_event(database, run_id, "failed", str(exc)[:2000])
@@ -630,7 +630,7 @@ async def run_forever() -> None:
     )
     try:
         try:
-            await provider.validate_gateway()
+            await provider.validate_gateway(probe_routes=True)
         except GatewayValidationError as exc:
             logger.error("gateway startup preflight failed: %s", exc)
         await dispatcher.cleanup_stale_workspaces()

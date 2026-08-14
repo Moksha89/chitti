@@ -87,7 +87,7 @@ class ModelToolCall:
 
 
 class ModelProvider(Protocol):
-    async def validate_gateway(self) -> None: ...
+    async def validate_gateway(self, probe_routes: bool = False) -> None: ...
 
     async def chat(self, system: str, messages: list[dict[str, object]], role: str) -> str: ...
 
@@ -182,7 +182,7 @@ class LiteLLMProvider:
         self.url = self.base_url + "/v1/chat/completions"
         self.api_key = api_key
 
-    async def validate_gateway(self) -> None:
+    async def validate_gateway(self, probe_routes: bool = False) -> None:
         if not self.api_key.strip():
             raise GatewayMisconfigurationError("gateway credential is missing")
         try:
@@ -221,6 +221,8 @@ class LiteLLMProvider:
             raise GatewayMisconfigurationError(
                 f"gateway routes unavailable: {', '.join(missing)}"
             )
+        if not probe_routes:
+            return
         for route in sorted(REQUIRED_GATEWAY_ROUTES):
             try:
                 completion = await self.agent_completion(
@@ -451,7 +453,7 @@ class LiteLLMProvider:
 
 
 class FakeProvider:
-    async def validate_gateway(self) -> None:
+    async def validate_gateway(self, probe_routes: bool = False) -> None:
         return
 
     async def chat(self, system: str, messages: list[dict[str, object]], role: str) -> str:
