@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import colorsys
 import hashlib
 import json
+import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -14,6 +15,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
+import onnxruntime
 from PIL import Image, ImageFilter
 from sqlalchemy import text
 
@@ -30,21 +33,12 @@ RUNPOD_POLL_INTERVAL_SECONDS = 5
 # well inside the runner's two-hour run deadline.
 RUNPOD_POLL_TIMEOUT_SECONDS = 600
 RUNPOD_PENDING_STATUSES = frozenset({"IN_QUEUE", "IN_PROGRESS"})
-CUTOUT_KEY_RGB = (255, 0, 255)
-CUTOUT_KEY_HUE = colorsys.rgb_to_hsv(*(channel / 255 for channel in CUTOUT_KEY_RGB))[0]
-CUTOUT_KEY_HUE_INNER = 0.045
-CUTOUT_KEY_HUE_OUTER = 0.115
-CUTOUT_MIN_KEY_FRACTION = 0.20
-CUTOUT_MAX_SUBJECT_AREA = 0.90
-CUTOUT_PROMPT_SUFFIX = (
-    " Place the subject on a solid vivid magenta chroma-key background (#FF00FF) "
-    "that fills the entire frame; keep the background flat and uniform with no "
-    "gradient, vignette, texture, scenery, floor, shadows, or extra objects."
-)
-CUTOUT_NEGATIVE_SUFFIX = (
-    " gradient background, vignette, textured background, scenery, floor, shadows, "
-    "extra objects, purple background, pink background"
-)
+MATTE_MODEL_PATH = Path(os.getenv("CHITTI_MATTE_MODEL_PATH", "/app/models/u2net.onnx"))
+MATTE_INPUT_SIZE = 320
+MATTE_MIN_SUBJECT_AREA = 0.005
+MATTE_MAX_SUBJECT_AREA = 0.95
+_matte_session: onnxruntime.InferenceSession | None = None
+_matte_lock = threading.Lock()
 
 
 class ImageManifestRefused(RuntimeError):
@@ -99,92 +93,68 @@ def _cutout_image(
     except Exception as exc:
         raise ImageManifestRefused(f"cutout asset is not a readable image: {exc}") from exc
     width, height = image.size
-    pixels = cast(Any, image.load())
-    alpha = Image.new("L", (width, height), 0)
-    alpha_pixels = cast(Any, alpha.load())
-    key_count = 0
-    for y in range(height):
-        for x in range(width):
-            red, green, blue = pixels[x, y][:3]
-            hue, saturation, _value = colorsys.rgb_to_hsv(
-                red / 255, green / 255, blue / 255
+    global _matte_session
+    with _matte_lock:
+        if _matte_session is None:
+            if not MATTE_MODEL_PATH.is_file():
+                raise ImageManifestRefused(
+                    f"matting model is unavailable at {MATTE_MODEL_PATH}"
+                )
+            _matte_session = onnxruntime.InferenceSession(
+                str(MATTE_MODEL_PATH), providers=["CPUExecutionProvider"]
             )
-            hue_distance = abs(hue - CUTOUT_KEY_HUE)
-            hue_distance = min(hue_distance, 1 - hue_distance)
-            alpha_pixels[x, y] = 255
-            if saturation < 0.22:
-                continue
-            if hue_distance <= CUTOUT_KEY_HUE_OUTER:
-                key_count += 1
-                if hue_distance <= CUTOUT_KEY_HUE_INNER:
-                    alpha_pixels[x, y] = 0
-                else:
-                    alpha_pixels[x, y] = int(
-                        255
-                        * (hue_distance - CUTOUT_KEY_HUE_INNER)
-                        / (CUTOUT_KEY_HUE_OUTER - CUTOUT_KEY_HUE_INNER)
-                    )
-    key_fraction = key_count / (width * height)
-    if key_fraction < CUTOUT_MIN_KEY_FRACTION:
-        raise ImageManifestRefused(
-            "cutout provider ignored the chroma-key instruction: keyed area was "
-            f"only {key_fraction:.1%}"
-        )
-
+        session = _matte_session
+    resized = image.convert("RGB").resize(
+        (MATTE_INPUT_SIZE, MATTE_INPUT_SIZE), Image.Resampling.BILINEAR
+    )
+    source: Any = np.asarray(resized, dtype=np.float32) / 255.0
+    source = (source - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array(
+        [0.229, 0.224, 0.225], dtype=np.float32
+    )
+    tensor = np.transpose(source, (2, 0, 1))[None, ...]
+    mask = np.asarray(
+        session.run(None, {session.get_inputs()[0].name: tensor})[0][0, 0],
+        dtype=np.float32,
+    )
+    mask = np.clip(mask, 0, 1)
+    mask = (mask - mask.min()) / max(float(mask.max() - mask.min()), 1e-6)
+    alpha = Image.fromarray(np.uint8(mask * 255)).resize(
+        (width, height), Image.Resampling.BILINEAR
+    )
     alpha = alpha.filter(ImageFilter.GaussianBlur(radius=feather_radius))
-    output = image.copy()
-    output_pixels = cast(Any, output.load())
-    for y in range(height):
-        for x in range(width):
-            red, green, blue, _ = output_pixels[x, y]
-            edge_alpha = alpha_pixels[x, y] / 255
-            spill = max(0, min(red, blue) - green)
-            despill = int(spill * (1 - edge_alpha) * 0.7)
-            output_pixels[x, y] = (
-                max(0, red - despill),
-                green,
-                max(0, blue - despill),
-                alpha.getpixel((x, y)),
-            )
-    output.putalpha(alpha)
+    alpha_pixels = cast(Any, alpha.load())
     foreground = [
         (x, y)
         for y in range(height)
         for x in range(width)
         if alpha_pixels[x, y] > 128
     ]
-    if not foreground:
+    subject_area = len(foreground) / (width * height)
+    if not foreground or not (
+        MATTE_MIN_SUBJECT_AREA <= subject_area <= MATTE_MAX_SUBJECT_AREA
+    ):
         raise ImageManifestRefused(
-            "cutout provider ignored the chroma-key instruction: no subject remained"
+            "matting model produced an implausible subject area: "
+            f"{subject_area:.1%}"
         )
     min_x = min(x for x, _ in foreground)
     max_x = max(x for x, _ in foreground)
     min_y = min(y for _, y in foreground)
     max_y = max(y for _, y in foreground)
     subject_area = len(foreground) / (width * height)
-    if subject_area < 0.005 or subject_area > CUTOUT_MAX_SUBJECT_AREA:
-        raise ImageManifestRefused(
-            "cutout provider returned an implausible subject area after chroma-key removal"
-        )
+    output = image.copy()
+    output.putalpha(alpha)
     buffer = BytesIO()
     output.save(buffer, format="PNG")
     return buffer.getvalue(), {
-        "key_rgb": list(CUTOUT_KEY_RGB),
-        "key_hue": CUTOUT_KEY_HUE,
-        "key_hue_inner": CUTOUT_KEY_HUE_INNER,
-        "key_hue_outer": CUTOUT_KEY_HUE_OUTER,
-        "key_fraction": key_fraction,
+        "model": "U-2-Net",
+        "model_license": "Apache-2.0",
+        "model_path": str(MATTE_MODEL_PATH),
+        "model_input_size": MATTE_INPUT_SIZE,
         "feather_radius": feather_radius,
-        "despill_factor": 0.7,
         "subject_bbox": [min_x, min_y, max_x, max_y],
         "subject_area": subject_area,
     }
-
-
-def _cutout_prompts(item: Mapping[str, Any]) -> tuple[str, str]:
-    prompt = str(item.get("prompt", "")).strip() + CUTOUT_PROMPT_SUFFIX
-    negative = (str(item.get("negative_prompt", "")).strip() + CUTOUT_NEGATIVE_SUFFIX).strip()
-    return prompt, negative
 
 
 def _safe_value(value: object) -> str | None:
@@ -453,10 +423,6 @@ async def generate_manifest_images(
             source_raw = source.read_bytes()
             source_digest = hashlib.sha256(source_raw).hexdigest()
         request_item = dict(item)
-        if item.get("cutout", False):
-            prompt, negative = _cutout_prompts(item)
-            request_item["prompt"] = prompt
-            request_item["negative_prompt"] = negative
         if item.get("seed") is None:
             seed_digest = _request_digest(request_item, source_digest)
             seed = int(seed_digest[:16], 16)

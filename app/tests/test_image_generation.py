@@ -6,8 +6,10 @@ import hashlib
 import io
 import json
 import urllib.error
+from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import chitti.image_generation as module
@@ -17,7 +19,6 @@ from chitti.image_generation import (
     ImageProviderFailure,
     _call_runpod,
     _cutout_image,
-    _cutout_prompts,
     _request_digest,
     _request_payload,
     generate_manifest_images,
@@ -206,16 +207,6 @@ def test_omitted_seed_is_deterministic() -> None:
     assert _request_digest(item, "") == _request_digest(item, "")
 
 
-def test_cutout_prompt_is_host_augmented() -> None:
-    prompt, negative = _cutout_prompts(
-        {"prompt": "rim-lit batsman", "negative_prompt": "logos"}
-    )
-    assert "#FF00FF" in prompt
-    assert "solid vivid magenta chroma-key background" in prompt
-    assert "gradient background" in negative
-    assert negative.startswith("logos")
-
-
 def test_cache_hit_reuses_image_without_external_call(monkeypatch, tmp_path) -> None:
     import chitti.image_generation as module
 
@@ -315,10 +306,29 @@ def test_malformed_manifest_is_repairable(monkeypatch, tmp_path) -> None:
         asyncio.run(generate_manifest_images(None, 1, tmp_path, SimpleNamespace(image_request_count=6, image_spend_usd=0.05)))
 
 
-def test_cutout_removes_chroma_background_and_records_parameters() -> None:
+class _FakeMatteSession:
+    class Input:
+        name = "input"
+
+    def get_inputs(self):
+        return [self.Input()]
+
+    def run(self, _outputs, _inputs):
+        mask = np.zeros((1, 1, 320, 320), dtype=np.float32)
+        mask[:, :, 80:240, 80:240] = 1
+        return [mask]
+
+
+def _use_fake_matte(monkeypatch) -> None:
+    monkeypatch.setattr(module, "MATTE_MODEL_PATH", Path("/fake/u2net.onnx"))
+    monkeypatch.setattr(module, "_matte_session", _FakeMatteSession())
+
+
+def test_cutout_mattes_subject_and_records_parameters(monkeypatch) -> None:
     from PIL import Image
 
-    image = Image.new("RGB", (20, 20), (255, 0, 255))
+    _use_fake_matte(monkeypatch)
+    image = Image.new("RGB", (20, 20), (230, 230, 230))
     for x in range(7, 13):
         for y in range(5, 15):
             image.putpixel((x, y), (20, 80, 180))
@@ -329,43 +339,49 @@ def test_cutout_removes_chroma_background_and_records_parameters() -> None:
     assert result.mode == "RGBA"
     assert result.getpixel((0, 0))[3] == 0
     assert result.getpixel((10, 10))[3] > 0
-    assert parameters["key_rgb"] == [255, 0, 255]
-    assert parameters["key_fraction"] > 0.5
-    assert parameters["subject_bbox"] == [7, 5, 12, 14]
+    assert parameters["model"] == "U-2-Net"
+    assert parameters["model_license"] == "Apache-2.0"
+    assert parameters["subject_area"] > 0.2
+    assert parameters["subject_bbox"]
     assert hashlib.sha256(transformed).hexdigest()
 
 
-def test_cutout_refuses_when_provider_ignores_key_instruction() -> None:
+def test_cutout_refuses_implausible_matte(monkeypatch) -> None:
     from PIL import Image
 
+    _use_fake_matte(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "_matte_session",
+        SimpleNamespace(
+            get_inputs=lambda: [SimpleNamespace(name="input")],
+            run=lambda _outputs, _inputs: [np.ones((1, 1, 320, 320), dtype=np.float32)],
+        ),
+    )
     image = Image.new("RGB", (20, 20), (230, 230, 230))
     source = io.BytesIO()
     image.save(source, format="PNG")
-    with pytest.raises(ImageManifestRefused, match="ignored the chroma-key instruction"):
+    with pytest.raises(ImageManifestRefused, match="implausible subject area"):
         _cutout_image(source.getvalue())
 
 
-def test_cutout_allows_edge_touching_subject_and_enclosed_background() -> None:
+def test_cutout_feathers_matte_boundary(monkeypatch) -> None:
     from PIL import Image
 
-    image = Image.new("RGB", (20, 20), (255, 0, 255))
-    for x in range(7, 13):
-        for y in range(5, 20):
-            image.putpixel((x, y), (20, 80, 180))
-    for x in range(9, 11):
-        for y in range(8, 11):
-            image.putpixel((x, y), (255, 0, 255))
+    _use_fake_matte(monkeypatch)
+    image = Image.new("RGB", (20, 20), (20, 80, 180))
     source = io.BytesIO()
     image.save(source, format="PNG")
     transformed, _parameters = _cutout_image(source.getvalue())
     result = Image.open(io.BytesIO(transformed))
-    assert result.getpixel((10, 19))[3] > 0
-    assert result.getpixel((10, 9))[3] < 255
+    assert result.getpixel((0, 0))[3] == 0
+    assert 0 < result.getpixel((5, 10))[3] < 255
 
 
 def test_manifest_cutout_persists_transformed_provenance(monkeypatch, tmp_path) -> None:
     from PIL import Image
 
+    _use_fake_matte(monkeypatch)
     image = Image.new("RGB", (64, 64), (255, 0, 255))
     for x in range(25, 39):
         for y in range(15, 49):
@@ -467,7 +483,7 @@ def test_manifest_cutout_persists_transformed_provenance(monkeypatch, tmp_path) 
     assert "resolved manifest" in detail
     assert resolved["images"][0]["cutout_applied"] is True
     assert parameters["cutout_applied"] is True
-    assert parameters["cutout_parameters"]["key_rgb"] == [255, 0, 255]
+    assert parameters["cutout_parameters"]["model"] == "U-2-Net"
     assert parameters["written_sha256"] == hashlib.sha256(written).hexdigest()
     assert resolved["images"][0]["sha256"] == hashlib.sha256(written).hexdigest()
 
