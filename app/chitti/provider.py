@@ -1,7 +1,8 @@
+import asyncio
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Protocol, cast
 
@@ -26,6 +27,8 @@ VISION_INPUT_COST_PER_TOKEN = 0.00000004
 VISION_OUTPUT_COST_PER_TOKEN = 0.0000004
 MODEL_GATEWAY_TIMEOUT_SECONDS = 600
 MODEL_CLIENT_TIMEOUT_SECONDS = 660
+MODEL_CALL_MAX_ATTEMPTS = 3
+MODEL_CALL_RETRY_BACKOFF_SECONDS = 1.0
 
 
 class GatewayValidationError(RuntimeError):
@@ -52,8 +55,71 @@ class PlannerBrandProfile(Protocol):
     updated_at: datetime
 
 
-class ModelTransportError(RuntimeError):
+class ModelProviderError(RuntimeError):
+    """A model provider request failed with durable retry diagnostics."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_class: str,
+        attempts: int = 1,
+        retry_failures: tuple[str, ...] = (),
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        cost_usd: float = 0.0,
+    ) -> None:
+        self.failure_class = failure_class
+        self.attempts = attempts
+        self.retry_failures = retry_failures
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = total_tokens
+        self.cost_usd = cost_usd
+        super().__init__(message)
+
+
+class ModelTransportError(ModelProviderError):
     """The model gateway could not complete a request over the network."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int = 1,
+        retry_failures: tuple[str, ...] = (),
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        cost_usd: float = 0.0,
+    ) -> None:
+        super().__init__(
+            message,
+            failure_class="transport failure",
+            attempts=attempts,
+            retry_failures=retry_failures,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            cost_usd=cost_usd,
+        )
+
+
+class ModelHttpError(ModelProviderError):
+    """The model gateway returned a non-success HTTP response."""
+
+
+class ModelPolicyRefusal(ModelProviderError):
+    """The model gateway returned a content-policy refusal."""
+
+
+class ModelLimitRefusal(ModelProviderError):
+    """The model gateway refused a request because of a budget or limit."""
+
+
+class ModelCostConfigurationError(ModelProviderError):
+    """The model response has unusable cost data."""
 
 
 @dataclass(frozen=True)
@@ -77,6 +143,12 @@ class ModelCompletion:
     finish_reason: str | None = None
     message_fields: tuple[str, ...] = ()
     tool_calls: tuple["ModelToolCall", ...] = ()
+    attempts: int = 1
+    retry_failures: tuple[str, ...] = ()
+    retry_prompt_tokens: int = 0
+    retry_completion_tokens: int = 0
+    retry_total_tokens: int = 0
+    retry_cost_usd: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -176,6 +248,29 @@ def _json_payload(text: str) -> object:
         return []
 
 
+def _response_usage(response: httpx.Response) -> tuple[int, int, int, float]:
+    try:
+        body = response.json()
+    except (TypeError, ValueError):
+        return 0, 0, 0, 0.0
+    if not isinstance(body, dict):
+        return 0, 0, 0, 0.0
+    usage = body.get("usage")
+    if not isinstance(usage, dict):
+        return 0, 0, 0, 0.0
+    prompt_tokens = int(usage.get("prompt_tokens", 0))
+    completion_tokens = int(usage.get("completion_tokens", 0))
+    total_tokens = int(
+        usage.get("total_tokens", prompt_tokens + completion_tokens)
+    )
+    raw_cost = body.get("cost", response.headers.get("x-litellm-response-cost"))
+    try:
+        cost = float(raw_cost or 0.0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    return prompt_tokens, completion_tokens, total_tokens, cost
+
+
 class LiteLLMProvider:
     def __init__(self, base_url: str, api_key: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -264,6 +359,84 @@ class LiteLLMProvider:
             request["tools"] = tools
         if tool_choice is not None:
             request["tool_choice"] = tool_choice
+        retry_failures: list[str] = []
+        retry_prompt_tokens = 0
+        retry_completion_tokens = 0
+        retry_total_tokens = 0
+        retry_cost_usd = 0.0
+        for attempt in range(1, MODEL_CALL_MAX_ATTEMPTS + 1):
+            last_failure: ModelProviderError | None = None
+            try:
+                completion = await self._agent_completion_once(request, role)
+            except (
+                ModelPolicyRefusal,
+                ModelLimitRefusal,
+                ModelCostConfigurationError,
+            ):
+                raise
+            except ModelHttpError as exc:
+                if exc.failure_class == "http 4xx":
+                    raise
+                last_failure = exc
+                retry_failures.append(exc.failure_class)
+                if attempt == MODEL_CALL_MAX_ATTEMPTS:
+                    raise ModelProviderError(
+                        "model provider retries exhausted",
+                        failure_class=exc.failure_class,
+                        attempts=attempt,
+                        retry_failures=tuple(retry_failures),
+                        prompt_tokens=retry_prompt_tokens + exc.prompt_tokens,
+                        completion_tokens=(
+                            retry_completion_tokens + exc.completion_tokens
+                        ),
+                        total_tokens=retry_total_tokens + exc.total_tokens,
+                        cost_usd=retry_cost_usd + exc.cost_usd,
+                    ) from exc
+            except ModelProviderError as exc:
+                last_failure = exc
+                retry_failures.append(exc.failure_class)
+                if attempt == MODEL_CALL_MAX_ATTEMPTS:
+                    raise ModelProviderError(
+                        "model provider retries exhausted",
+                        failure_class=exc.failure_class,
+                        attempts=attempt,
+                        retry_failures=tuple(retry_failures),
+                        prompt_tokens=retry_prompt_tokens + exc.prompt_tokens,
+                        completion_tokens=(
+                            retry_completion_tokens + exc.completion_tokens
+                        ),
+                        total_tokens=retry_total_tokens + exc.total_tokens,
+                        cost_usd=retry_cost_usd + exc.cost_usd,
+                    ) from exc
+            else:
+                if attempt == 1:
+                    return completion
+                return replace(
+                    completion,
+                    prompt_tokens=completion.prompt_tokens + retry_prompt_tokens,
+                    completion_tokens=(
+                        completion.completion_tokens + retry_completion_tokens
+                    ),
+                    total_tokens=completion.total_tokens + retry_total_tokens,
+                    cost_usd=completion.cost_usd + retry_cost_usd,
+                    attempts=attempt,
+                    retry_failures=tuple(retry_failures),
+                    retry_prompt_tokens=retry_prompt_tokens,
+                    retry_completion_tokens=retry_completion_tokens,
+                    retry_total_tokens=retry_total_tokens,
+                    retry_cost_usd=retry_cost_usd,
+                )
+            assert last_failure is not None
+            retry_prompt_tokens += last_failure.prompt_tokens
+            retry_completion_tokens += last_failure.completion_tokens
+            retry_total_tokens += last_failure.total_tokens
+            retry_cost_usd += last_failure.cost_usd
+            await asyncio.sleep(MODEL_CALL_RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1))
+        raise AssertionError("model completion retry loop did not return")
+
+    async def _agent_completion_once(
+        self, request: dict[str, object], role: str
+    ) -> ModelCompletion:
         try:
             async with httpx.AsyncClient(timeout=MODEL_CLIENT_TIMEOUT_SECONDS) as client:
                 response = await client.post(
@@ -281,62 +454,126 @@ class LiteLLMProvider:
             raise
         except Exception as exc:
             raise ModelTransportError("gateway transport request failed") from exc
+        if 400 <= response.status_code < 500:
+            raise ModelHttpError(
+                f"gateway returned HTTP {response.status_code}",
+                failure_class="http 4xx",
+            )
+        if response.status_code >= 500:
+            prompt_tokens, completion_tokens, total_tokens, cost_usd = (
+                _response_usage(response)
+            )
+            raise ModelHttpError(
+                f"gateway returned HTTP {response.status_code}",
+                failure_class="http 5xx",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cost_usd=cost_usd,
+            )
         response.raise_for_status()
-        body = response.json()
-        choice = body["choices"][0]
-        message = choice.get("message") or {}
-        if not isinstance(message, dict):
-            message = {}
-        content = message.get("content")
-        native_tool_calls = _extract_tool_calls(message)
-        usage = body.get("usage") or {}
-        prompt_tokens = int(usage.get("prompt_tokens", 0))
-        completion_tokens = int(usage.get("completion_tokens", 0))
-        total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens))
-        completion_details = usage.get("completion_tokens_details") or {}
-        reasoning_tokens = (
-            int(completion_details.get("reasoning_tokens", 0))
-            if isinstance(completion_details, dict)
-            else 0
-        )
-        raw_cost = body.get("cost", response.headers.get("x-litellm-response-cost"))
-        if raw_cost is None:
-            if role != VISION_ROUTE:
-                cost = 0.0
-            elif prompt_tokens + completion_tokens < 1:
-                raise ModelTransportError(
-                    "gateway response did not include usable model cost"
+        try:
+            body = response.json()
+            error = body.get("error")
+            if isinstance(error, dict):
+                error_class = " ".join(
+                    str(error.get(field, "")).lower()
+                    for field in ("code", "type", "message")
                 )
+                if "policy" in error_class or "safety" in error_class:
+                    raise ModelPolicyRefusal(
+                        "model provider returned a content-policy refusal",
+                        failure_class="policy refusal",
+                    )
+                if any(
+                    marker in error_class
+                    for marker in ("budget", "limit", "quota")
+                ):
+                    raise ModelLimitRefusal(
+                        "model provider returned a budget or limit refusal",
+                        failure_class="budget or limit refusal",
+                    )
+            choice = body["choices"][0]
+            message = choice.get("message") or {}
+            if not isinstance(message, dict):
+                raise TypeError("model message was not an object")
+            refusal = message.get("refusal")
+            if refusal:
+                raise ModelPolicyRefusal(
+                    "model provider returned a content-policy refusal",
+                    failure_class="policy refusal",
+                )
+            content = message.get("content")
+            native_tool_calls = _extract_tool_calls(message)
+            usage = body.get("usage") or {}
+            prompt_tokens = int(usage.get("prompt_tokens", 0))
+            completion_tokens = int(usage.get("completion_tokens", 0))
+            total_tokens = int(
+                usage.get("total_tokens", prompt_tokens + completion_tokens)
+            )
+            completion_details = usage.get("completion_tokens_details") or {}
+            reasoning_tokens = (
+                int(completion_details.get("reasoning_tokens", 0))
+                if isinstance(completion_details, dict)
+                else 0
+            )
+            raw_cost = body.get("cost", response.headers.get("x-litellm-response-cost"))
+            if raw_cost is None:
+                if role != VISION_ROUTE:
+                    cost = 0.0
+                elif prompt_tokens + completion_tokens < 1:
+                    raise ModelCostConfigurationError(
+                        "gateway response did not include usable model cost",
+                        failure_class="cost configuration",
+                    )
+                else:
+                    cost = (
+                        prompt_tokens * VISION_INPUT_COST_PER_TOKEN
+                        + completion_tokens * VISION_OUTPUT_COST_PER_TOKEN
+                    )
             else:
-                cost = (
-                    prompt_tokens * VISION_INPUT_COST_PER_TOKEN
-                    + completion_tokens * VISION_OUTPUT_COST_PER_TOKEN
+                try:
+                    cost = float(raw_cost)
+                except (TypeError, ValueError) as exc:
+                    raise ModelCostConfigurationError(
+                        "gateway response contained invalid model cost",
+                        failure_class="cost configuration",
+                    ) from exc
+            if role == VISION_ROUTE and cost <= 0:
+                raise ModelCostConfigurationError(
+                    "vision response did not include usable model cost",
+                    failure_class="cost configuration",
                 )
-        else:
-            try:
-                cost = float(raw_cost)
-            except (TypeError, ValueError) as exc:
-                raise ModelTransportError(
-                    "gateway response contained invalid model cost"
-                ) from exc
-        if role == VISION_ROUTE and cost <= 0:
-            raise ModelTransportError("vision response did not include usable model cost")
-        return ModelCompletion(
-            content=content if isinstance(content, str) else "",
-            model=str(body.get("model", role)),
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            cost_usd=float(cost or 0.0),
-            reasoning_tokens=reasoning_tokens,
-            finish_reason=(
-                str(choice["finish_reason"])
-                if choice.get("finish_reason") is not None
-                else None
-            ),
-            message_fields=_diagnostic_message_fields(message),
-            tool_calls=native_tool_calls,
-        )
+            return ModelCompletion(
+                content=content if isinstance(content, str) else "",
+                model=str(body.get("model", role)),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cost_usd=float(cost or 0.0),
+                reasoning_tokens=reasoning_tokens,
+                finish_reason=(
+                    str(choice["finish_reason"])
+                    if choice.get("finish_reason") is not None
+                    else None
+                ),
+                message_fields=_diagnostic_message_fields(message),
+                tool_calls=native_tool_calls,
+            )
+        except ModelPolicyRefusal:
+            raise
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            prompt_tokens, completion_tokens, total_tokens, cost_usd = (
+                _response_usage(response)
+            )
+            raise ModelProviderError(
+                "gateway returned a malformed response",
+                failure_class="malformed response",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cost_usd=cost_usd,
+            ) from exc
 
     async def chat(self, system: str, messages: list[dict[str, object]], role: str) -> str:
         return await self._completion([{"role": "system", "content": system}, *messages], role)

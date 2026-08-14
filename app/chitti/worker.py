@@ -50,6 +50,7 @@ from .provider import (
     VISION_ROUTE,
     ModelCompletion,
     ModelProvider,
+    ModelProviderError,
     ModelToolCall,
     ModelTransportError,
 )
@@ -113,9 +114,53 @@ class GateEvidenceContradiction(ModelProgressError):
 
 
 def _model_call_failure_detail(route: str, exc: Exception) -> str:
-    if isinstance(exc, ModelTransportError):
-        return f"model transport failure on route {route}: {exc}"
+    if isinstance(exc, ModelProviderError):
+        retry_detail = (
+            f" retry_failures={','.join(exc.retry_failures)}"
+            if exc.retry_failures
+            else ""
+        )
+        return (
+            f"model provider failure on route {route}: "
+            f"class={exc.failure_class} attempts={exc.attempts}{retry_detail}: {exc}"
+        )
     return f"model response processing failed on route {route}: {exc}"
+
+
+def _retry_evidence(
+    attempts: int,
+    failures: tuple[str, ...],
+    total_tokens: int = 0,
+) -> tuple[str, ...]:
+    if attempts <= 1:
+        return ()
+    evidence = (f"retry_attempts={attempts}",) + tuple(
+        f"retry_failure={failure_class}" for failure_class in failures
+    )
+    if total_tokens:
+        evidence += (f"retry_total_tokens={total_tokens}",)
+    return evidence
+
+
+def _model_failure_completion(route: str, exc: Exception) -> ModelCompletion:
+    provider = exc if isinstance(exc, ModelProviderError) else None
+    return ModelCompletion(
+        content=_model_call_failure_detail(route, exc)[:1000],
+        model=route,
+        prompt_tokens=provider.prompt_tokens if provider else 0,
+        completion_tokens=provider.completion_tokens if provider else 0,
+        total_tokens=provider.total_tokens if provider else 0,
+        cost_usd=provider.cost_usd if provider else 0.0,
+        message_fields=(
+            _retry_evidence(
+                provider.attempts,
+                provider.retry_failures,
+                provider.total_tokens,
+            )
+            if provider
+            else ()
+        ),
+    )
 
 
 def _progress_counters(
@@ -820,14 +865,11 @@ class DockerSandboxDispatcher:
                     if self._is_cancelled(run_id):
                         raise RunCancelled from exc
                     detail = _model_call_failure_detail(route, exc)
-                    failure = ModelCompletion(
-                        content=detail[:1000],
-                        model=route,
-                        prompt_tokens=0,
-                        completion_tokens=0,
-                        total_tokens=0,
-                        cost_usd=0.0,
-                    )
+                    failure = _model_failure_completion(route, exc)
+                    if isinstance(exc, ModelProviderError):
+                        calls += exc.attempts
+                        spent += exc.cost_usd
+                        spent_tokens += exc.total_tokens
                     await self._record_model_call(
                         run_id, task.id, iteration, route, failure,
                         prompt=json.dumps(messages, separators=(",", ":")),
@@ -1915,7 +1957,14 @@ class DockerSandboxDispatcher:
                     "reasoning_tokens": completion.reasoning_tokens,
                     "cost_usd": completion.cost_usd,
                     "finish_reason": completion.finish_reason,
-                    "message_fields": json.dumps(completion.message_fields),
+                    "message_fields": json.dumps(
+                        completion.message_fields
+                        + _retry_evidence(
+                            completion.attempts,
+                            completion.retry_failures,
+                            completion.retry_total_tokens,
+                        )
+                    ),
                 },
             )
             call_id = int(result.scalar_one())
