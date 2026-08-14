@@ -101,7 +101,7 @@ def test_run_budget_failure_names_the_exhausted_budget(budget: str) -> None:
 
 
 def test_model_call_failure_detail_distinguishes_transport_and_response_errors() -> None:
-    from chitti.provider import ModelTransportError
+    from chitti.provider import ModelProviderError, ModelTransportError
 
     assert "transport failure" in _model_call_failure_detail(
         "coder", ModelTransportError("gateway request timed out")
@@ -109,6 +109,17 @@ def test_model_call_failure_detail_distinguishes_transport_and_response_errors()
     assert "response processing failed" in _model_call_failure_detail(
         "coder", ValueError("invalid model response")
     )
+    detail = _model_call_failure_detail(
+        "coder",
+        ModelProviderError(
+            "model provider retries exhausted",
+            failure_class="malformed response",
+            attempts=3,
+            retry_failures=("malformed response",) * 3,
+        ),
+    )
+    assert "class=malformed response attempts=3" in detail
+    assert "retry_failures=malformed response,malformed response,malformed response" in detail
 
 
 def test_inspection_does_not_clear_stall_but_write_progress_does() -> None:

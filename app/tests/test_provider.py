@@ -6,6 +6,7 @@ import pytest
 
 from chitti.provider import (
     CODER_MAX_OUTPUT_TOKENS,
+    MODEL_CALL_MAX_ATTEMPTS,
     MODEL_CLIENT_TIMEOUT_SECONDS,
     MODEL_GATEWAY_TIMEOUT_SECONDS,
     REVIEWER_MAX_OUTPUT_TOKENS,
@@ -14,8 +15,8 @@ from chitti.provider import (
     GatewayMisconfigurationError,
     GatewayTransientError,
     LiteLLMProvider,
+    ModelProviderError,
     ModelToolCall,
-    ModelTransportError,
     _diagnostic_message_fields,
 )
 
@@ -222,12 +223,197 @@ def test_agent_completion_distinguishes_transport_timeout(monkeypatch) -> None:
 
     monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
 
-    with pytest.raises(ModelTransportError, match="gateway request timed out"):
+    with pytest.raises(ModelProviderError, match="retries exhausted") as raised:
         asyncio.run(
             LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
                 [{"role": "user", "content": "work"}], "coder"
             )
         )
+    assert raised.value.failure_class == "transport failure"
+    assert raised.value.attempts == MODEL_CALL_MAX_ATTEMPTS
+
+
+def test_agent_completion_retries_5xx_then_succeeds(monkeypatch) -> None:
+    responses = [
+        httpx.Response(
+            503,
+            request=httpx.Request("POST", "http://gateway"),
+            json={
+                "error": "upstream overload",
+                "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10},
+                "cost": 0.004,
+            },
+        ),
+        httpx.Response(
+            200,
+            request=httpx.Request("POST", "http://gateway"),
+            json={
+                "model": "coder",
+                "choices": [{"message": {"content": "done"}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            },
+        ),
+    ]
+    calls = 0
+
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return responses.pop(0)
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    async def no_sleep(*_args) -> None:
+        return None
+
+    monkeypatch.setattr("chitti.provider.asyncio.sleep", no_sleep)
+    completion = asyncio.run(
+        LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+            [{"role": "user", "content": "work"}], "coder"
+        )
+    )
+
+    assert calls == 2
+    assert completion.attempts == 2
+    assert completion.retry_failures == ("http 5xx",)
+    assert completion.total_tokens == 15
+    assert completion.retry_total_tokens == 10
+    assert completion.retry_cost_usd == 0.004
+
+
+def test_agent_completion_retries_truncated_body_then_succeeds(monkeypatch) -> None:
+    responses = [
+        httpx.Response(
+            200,
+            request=httpx.Request("POST", "http://gateway"),
+            content=b'{"choices":[{"message":{"content":"truncated',
+        ),
+        httpx.Response(
+            200,
+            request=httpx.Request("POST", "http://gateway"),
+            json={
+                "choices": [{"message": {"content": "done"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        ),
+    ]
+
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            return responses.pop(0)
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    async def no_sleep(*_args) -> None:
+        return None
+
+    monkeypatch.setattr("chitti.provider.asyncio.sleep", no_sleep)
+    completion = asyncio.run(
+        LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+            [{"role": "user", "content": "work"}], "coder"
+        )
+    )
+
+    assert completion.attempts == 2
+    assert completion.retry_failures == ("malformed response",)
+
+
+def test_agent_completion_does_not_retry_4xx(monkeypatch) -> None:
+    calls = 0
+
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                429, request=httpx.Request("POST", "http://gateway")
+            )
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    with pytest.raises(Exception, match="HTTP 429"):
+        asyncio.run(
+            LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+                [{"role": "user", "content": "work"}], "coder"
+            )
+        )
+    assert calls == 1
+
+
+def test_agent_completion_does_not_retry_policy_refusal(monkeypatch) -> None:
+    calls = 0
+
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", "http://gateway"),
+                json={
+                    "choices": [
+                        {"message": {"content": "", "refusal": "policy refusal"}}
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    with pytest.raises(Exception, match="content-policy refusal"):
+        asyncio.run(
+            LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+                [{"role": "user", "content": "work"}], "coder"
+            )
+        )
+    assert calls == 1
+
+
+def test_agent_completion_does_not_retry_budget_refusal(monkeypatch) -> None:
+    calls = 0
+
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", "http://gateway"),
+                json={
+                    "error": {
+                        "type": "budget_exceeded",
+                        "message": "model budget limit reached",
+                    }
+                },
+            )
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    with pytest.raises(Exception, match="budget or limit refusal"):
+        asyncio.run(
+            LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+                [{"role": "user", "content": "work"}], "coder"
+            )
+        )
+    assert calls == 1
+
+
+def test_agent_completion_exhausted_retries_name_class_and_attempts(monkeypatch) -> None:
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            return httpx.Response(503, request=httpx.Request("POST", "http://gateway"))
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    async def no_sleep(*_args) -> None:
+        return None
+
+    monkeypatch.setattr("chitti.provider.asyncio.sleep", no_sleep)
+    with pytest.raises(Exception, match="retries exhausted") as raised:
+        asyncio.run(
+            LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+                [{"role": "user", "content": "work"}], "coder"
+            )
+        )
+    error = raised.value
+    assert error.failure_class == "http 5xx"
+    assert error.attempts == MODEL_CALL_MAX_ATTEMPTS
+    assert error.retry_failures == ("http 5xx",) * MODEL_CALL_MAX_ATTEMPTS
 
 
 def test_gateway_config_has_bounded_single_attempt_timeout() -> None:
@@ -302,7 +488,7 @@ def test_vision_completion_missing_cost_fails_closed(monkeypatch) -> None:
         "chitti.provider.httpx.AsyncClient",
         lambda **_kwargs: _Client(response=response),
     )
-    with pytest.raises(ModelTransportError, match="usable model cost"):
+    with pytest.raises(ModelProviderError, match="retries exhausted"):
         asyncio.run(
             LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
                 [{"role": "user", "content": "inspect"}],

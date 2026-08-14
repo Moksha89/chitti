@@ -50,6 +50,7 @@ from .provider import (
     VISION_ROUTE,
     ModelCompletion,
     ModelProvider,
+    ModelProviderError,
     ModelToolCall,
     ModelTransportError,
 )
@@ -113,6 +114,16 @@ class GateEvidenceContradiction(ModelProgressError):
 
 
 def _model_call_failure_detail(route: str, exc: Exception) -> str:
+    if isinstance(exc, ModelProviderError):
+        retry_detail = (
+            f" retry_failures={','.join(exc.retry_failures)}"
+            if exc.retry_failures
+            else ""
+        )
+        return (
+            f"model provider failure on route {route}: "
+            f"class={exc.failure_class} attempts={exc.attempts}{retry_detail}: {exc}"
+        )
     if isinstance(exc, ModelTransportError):
         return f"model transport failure on route {route}: {exc}"
     return f"model response processing failed on route {route}: {exc}"
@@ -820,6 +831,20 @@ class DockerSandboxDispatcher:
                     if self._is_cancelled(run_id):
                         raise RunCancelled from exc
                     detail = _model_call_failure_detail(route, exc)
+                    failure_fields = (
+                        (f"retry_attempts={exc.attempts}",)
+                        + tuple(
+                            f"retry_failure={failure_class}"
+                            for failure_class in exc.retry_failures
+                        )
+                        + (
+                            (f"retry_total_tokens={exc.total_tokens}",)
+                            if exc.total_tokens
+                            else ()
+                        )
+                        if isinstance(exc, ModelProviderError)
+                        else ()
+                    )
                     failure = ModelCompletion(
                         content=detail[:1000],
                         model=route,
@@ -827,6 +852,7 @@ class DockerSandboxDispatcher:
                         completion_tokens=0,
                         total_tokens=0,
                         cost_usd=0.0,
+                        message_fields=failure_fields,
                     )
                     await self._record_model_call(
                         run_id, task.id, iteration, route, failure,
@@ -1915,7 +1941,21 @@ class DockerSandboxDispatcher:
                     "reasoning_tokens": completion.reasoning_tokens,
                     "cost_usd": completion.cost_usd,
                     "finish_reason": completion.finish_reason,
-                    "message_fields": json.dumps(completion.message_fields),
+                    "message_fields": json.dumps(
+                        completion.message_fields
+                        + ((f"retry_attempts={completion.attempts}",)
+                           + tuple(
+                               f"retry_failure={failure_class}"
+                               for failure_class in completion.retry_failures
+                           )
+                           + (
+                               (f"retry_total_tokens={completion.retry_total_tokens}",)
+                               if completion.retry_total_tokens
+                               else ()
+                           )
+                           if completion.attempts > 1
+                           else ())
+                    ),
                 },
             )
             call_id = int(result.scalar_one())
