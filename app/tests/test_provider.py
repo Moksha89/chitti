@@ -9,6 +9,7 @@ from chitti.provider import (
     MODEL_CLIENT_TIMEOUT_SECONDS,
     MODEL_GATEWAY_TIMEOUT_SECONDS,
     REVIEWER_MAX_OUTPUT_TOKENS,
+    VISION_ROUTE,
     FakeProvider,
     GatewayMisconfigurationError,
     GatewayTransientError,
@@ -69,7 +70,19 @@ def test_gateway_preflight_distinguishes_transient_failure(monkeypatch) -> None:
 def test_gateway_preflight_uses_models_endpoint_and_both_routes(monkeypatch) -> None:
     response = httpx.Response(
         200,
-        json={"data": [{"id": "coder"}, {"id": "reviewer"}]},
+        request=httpx.Request("POST", "http://127.0.0.1:4000/v1/chat/completions"),
+        json={
+            "data": [
+                {"id": "chitti-chat"},
+                {"id": "planner"},
+                {"id": "coder"},
+                {"id": "reviewer"},
+                {"id": "bulk"},
+                {"id": VISION_ROUTE},
+            ],
+            "choices": [{"message": {"content": "OK"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
     )
     calls = []
 
@@ -78,16 +91,24 @@ def test_gateway_preflight_uses_models_endpoint_and_both_routes(monkeypatch) -> 
             calls.append((url, kwargs))
             return response
 
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return response
+
     monkeypatch.setattr(
         "chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client()
     )
     asyncio.run(LiteLLMProvider("http://127.0.0.1:4000", "configured").validate_gateway())
 
-    assert calls == [
-        (
-            "http://127.0.0.1:4000/v1/models",
-            {"headers": {"Authorization": "Bearer configured"}},
-        )
+    assert calls[0] == (
+        "http://127.0.0.1:4000/v1/models",
+        {"headers": {"Authorization": "Bearer configured"}},
+    )
+    assert [call[1]["json"]["model"] for call in calls[1:]] == [
+        "bulk",
+        "coder",
+        "reviewer",
+        "vision",
     ]
 
 
@@ -261,6 +282,29 @@ def test_diagnostic_fields_ignore_structural_and_empty_message_values() -> None:
             "reasoning_content": "useful hidden text",
         }
     ) == ("reasoning_content",)
+
+
+def test_vision_completion_missing_cost_fails_closed(monkeypatch) -> None:
+    response = httpx.Response(
+        200,
+        request=httpx.Request("POST", "http://127.0.0.1:4000/v1/chat/completions"),
+        json={
+            "model": "openai/glm-4.6v-flashx",
+            "choices": [{"message": {"content": "{}"}}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        },
+    )
+    monkeypatch.setattr(
+        "chitti.provider.httpx.AsyncClient",
+        lambda **_kwargs: _Client(response=response),
+    )
+    with pytest.raises(ModelTransportError, match="usable model cost"):
+        asyncio.run(
+            LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+                [{"role": "user", "content": "inspect"}],
+                VISION_ROUTE,
+            )
+        )
 
 
 def test_fake_provider_emits_native_completion_tool_call() -> None:

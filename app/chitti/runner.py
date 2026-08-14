@@ -38,6 +38,7 @@ from .worker import (
     DockerSandboxDispatcher,
     RunBudgetExceeded,
     RunCancelled,
+    VisualReviewInconclusive,
     WorkerLimits,
     approved_revision,
 )
@@ -585,6 +586,9 @@ async def execute_run(
     except RunBudgetExceeded as exc:
         if not await record_cancelled_if_requested(database, run_id):
             await record_event(database, run_id, "failed", str(exc))
+    except VisualReviewInconclusive as exc:
+        if not await record_cancelled_if_requested(database, run_id):
+            await record_event(database, run_id, "visual-review-inconclusive", str(exc))
     except Exception as exc:
         if not await record_cancelled_if_requested(database, run_id):
             await record_event(database, run_id, "failed", str(exc)[:2000])

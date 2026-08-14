@@ -153,15 +153,16 @@ immutable `worker_runs.limits` JSON:
 - 2 MiB total model-authored writes;
 - 7,200 seconds overall run wall-clock, separate from each Docker operation's
   900-second timeout and the 600-second model gateway request timeout;
-- $0.75 loop-side spend cap, with the `coder` and `reviewer` LiteLLM routes
+- $0.75 loop-side spend cap, with the `coder`, `reviewer`, and `vision` LiteLLM
+  routes
   capped at $5/day and $1/day respectively at the gateway. The loop-side cap
   means one run can never spend more than $0.75, so $0.75 is the worst-case
   cost of one run; daily route caps are an additional bad-day guard.
 
 Only the host runner constructs model prompts and holds the LiteLLM credential.
 The runner uses the existing gateway credential because the deployed LiteLLM
-configuration budgets the `coder` and `reviewer` routes, plus global and
-provider limits; it does not configure separate virtual-key budgets. The
+configuration budgets the `coder`, `reviewer`, and `vision` routes, plus global
+and provider limits; it does not configure separate virtual-key budgets. The
 deployment refreshes the root-only runner copy whenever the application
 credential changes. The runner must use the host-loopback URL above, not the
 compose-only `litellm` hostname.
@@ -172,6 +173,12 @@ separate artifact. Older exploratory turns are compacted while the stable
 prompt prefix, task contract, recent turns, and build/test feedback remain;
 each compaction is recorded as a run event. Approval remains evidence review
 only: this slice does not publish, merge, or deploy sandbox output.
+
+Poster runs use the host-only `vision` route for a digest-bound critique of the
+captured PNG. The configured model is `glm-4.6v-flashx`; `glm-5v-turbo` is the
+documented provider fallback if that route becomes unavailable. The critique
+has its own $0.10 sub-cap and at most two cycles. Image bytes are sent
+ephemerally and are never included in durable prompt artifacts.
 
 Plan approval records preserve the optional reason text and display it in the
 plan view. That reason is the only attribution available; the schema does not
