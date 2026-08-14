@@ -32,6 +32,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install \
             -r app/requirements.txt \
+            "google-api-python-client-stubs==1.39.0" \
             "mypy==1.15.0" \
             "pytest==8.3.5" \
             "pytest-asyncio==0.25.3" \
