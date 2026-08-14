@@ -4,11 +4,14 @@ import base64
 import json
 import os
 import subprocess
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
+import asyncpg
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
@@ -39,8 +42,8 @@ from chitti.google_store import (
     upcoming_events,
 )
 from chitti.google_sync import sync_account
-from chitti.google_sync_access import sync_grants
-from chitti.runner_access import derived_grants
+from chitti.google_sync_access import reconcile_sync_privileges, sync_grants
+from chitti.runner_access import derived_grants, owned_sequences
 
 db_test = pytest.mark.skipif(
     not os.getenv("RUN_DB_TESTS"),
@@ -264,6 +267,77 @@ def test_sync_grants_are_limited_to_google_sync_tables() -> None:
         "google_email_actions",
         "google_email_action_approvals",
     }
+
+
+@pytest.mark.asyncio
+@db_test
+async def test_sync_grants_apply_tables_and_owned_sequences(google_database) -> None:
+    database_url = google_database.engine.url.render_as_string(hide_password=False).replace(
+        "postgresql+asyncpg://", "postgresql://"
+    )
+    parsed = urlsplit(database_url)
+    admin = await asyncpg.connect(database_url)
+    role = f"google_sync_{uuid.uuid4().hex[:12]}"
+    password = uuid.uuid4().hex
+    try:
+        await admin.execute(f'CREATE ROLE "{role}" LOGIN PASSWORD \'{password}\'')
+        await admin.execute(
+            f'GRANT CONNECT ON DATABASE "{parsed.path.lstrip("/")}" TO "{role}"'
+        )
+        await admin.execute('GRANT USAGE ON SCHEMA public TO "' + role + '"')
+        await reconcile_sync_privileges(admin, role)
+
+        role_url = urlunsplit(
+            (
+                parsed.scheme,
+                f"{role}:{password}@{parsed.hostname}:{parsed.port}",
+                parsed.path,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+        connection = await asyncpg.connect(role_url)
+        try:
+            known_tables = {
+                str(row["table_name"])
+                for row in await admin.fetch(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'public'"
+                )
+            }
+            grants = sync_grants(known_tables)
+            assert grants
+            sequence_grants = 0
+            for table, privileges in grants.items():
+                for privilege in privileges:
+                    assert await connection.fetchval(
+                        "SELECT has_table_privilege($1, $2, $3)",
+                        role,
+                        table,
+                        privilege,
+                    )
+                if "INSERT" in privileges:
+                    sequences = await owned_sequences(admin, table)
+                    for sequence in sequences:
+                        sequence_grants += 1
+                        assert await connection.fetchval(
+                            "SELECT has_sequence_privilege($1, $2, 'USAGE')",
+                            role,
+                            sequence,
+                        )
+            assert sequence_grants
+            for table in ("brand_profiles", "decisions"):
+                assert not await connection.fetchval(
+                    "SELECT has_table_privilege($1, $2, 'SELECT')",
+                    role,
+                    table,
+                )
+        finally:
+            await connection.close()
+    finally:
+        await admin.execute(f'DROP OWNED BY "{role}"')
+        await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
+        await admin.close()
 
 
 def test_runner_rejects_google_sensitive_tables() -> None:
