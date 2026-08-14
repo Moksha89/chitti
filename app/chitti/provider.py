@@ -118,6 +118,10 @@ class ModelLimitRefusal(ModelProviderError):
     """The model gateway refused a request because of a budget or limit."""
 
 
+class ModelCostConfigurationError(ModelProviderError):
+    """The model response has unusable cost data."""
+
+
 @dataclass(frozen=True)
 class ExtractedMemory:
     key: str
@@ -364,7 +368,11 @@ class LiteLLMProvider:
             last_failure: ModelProviderError | None = None
             try:
                 completion = await self._agent_completion_once(request, role)
-            except (ModelPolicyRefusal, ModelLimitRefusal):
+            except (
+                ModelPolicyRefusal,
+                ModelLimitRefusal,
+                ModelCostConfigurationError,
+            ):
                 raise
             except ModelHttpError as exc:
                 if exc.failure_class == "http 4xx":
@@ -514,16 +522,28 @@ class LiteLLMProvider:
                 if role != VISION_ROUTE:
                     cost = 0.0
                 elif prompt_tokens + completion_tokens < 1:
-                    raise ValueError("gateway response did not include usable model cost")
+                    raise ModelCostConfigurationError(
+                        "gateway response did not include usable model cost",
+                        failure_class="cost configuration",
+                    )
                 else:
                     cost = (
                         prompt_tokens * VISION_INPUT_COST_PER_TOKEN
                         + completion_tokens * VISION_OUTPUT_COST_PER_TOKEN
                     )
             else:
-                cost = float(raw_cost)
+                try:
+                    cost = float(raw_cost)
+                except (TypeError, ValueError) as exc:
+                    raise ModelCostConfigurationError(
+                        "gateway response contained invalid model cost",
+                        failure_class="cost configuration",
+                    ) from exc
             if role == VISION_ROUTE and cost <= 0:
-                raise ValueError("vision response did not include usable model cost")
+                raise ModelCostConfigurationError(
+                    "vision response did not include usable model cost",
+                    failure_class="cost configuration",
+                )
             return ModelCompletion(
                 content=content if isinstance(content, str) else "",
                 model=str(body.get("model", role)),

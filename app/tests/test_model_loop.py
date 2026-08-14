@@ -122,6 +122,31 @@ def test_model_call_failure_detail_distinguishes_transport_and_response_errors()
     assert "retry_failures=malformed response,malformed response,malformed response" in detail
 
 
+def test_exhausted_model_retry_usage_is_recorded_in_accounting_fields() -> None:
+    from chitti.provider import ModelProviderError
+    from chitti.worker import _model_failure_completion
+
+    completion = _model_failure_completion(
+        "coder",
+        ModelProviderError(
+            "model provider retries exhausted",
+            failure_class="http 5xx",
+            attempts=3,
+            retry_failures=("http 5xx",) * 3,
+            prompt_tokens=12,
+            completion_tokens=18,
+            total_tokens=30,
+            cost_usd=0.042,
+        ),
+    )
+
+    assert completion.prompt_tokens == 12
+    assert completion.completion_tokens == 18
+    assert completion.total_tokens == 30
+    assert completion.cost_usd == 0.042
+    assert "retry_total_tokens=30" in completion.message_fields
+
+
 def test_inspection_does_not_clear_stall_but_write_progress_does() -> None:
     failures, turns = _progress_counters(
         1, 2, workspace_changed=False

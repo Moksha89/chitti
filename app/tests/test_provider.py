@@ -15,6 +15,7 @@ from chitti.provider import (
     GatewayMisconfigurationError,
     GatewayTransientError,
     LiteLLMProvider,
+    ModelCostConfigurationError,
     ModelProviderError,
     ModelToolCall,
     _diagnostic_message_fields,
@@ -488,13 +489,41 @@ def test_vision_completion_missing_cost_fails_closed(monkeypatch) -> None:
         "chitti.provider.httpx.AsyncClient",
         lambda **_kwargs: _Client(response=response),
     )
-    with pytest.raises(ModelProviderError, match="retries exhausted"):
+    with pytest.raises(ModelCostConfigurationError, match="usable model cost"):
         asyncio.run(
             LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
                 [{"role": "user", "content": "inspect"}],
                 VISION_ROUTE,
             )
         )
+
+
+def test_invalid_model_cost_fails_once_without_retry(monkeypatch) -> None:
+    calls = 0
+    response = httpx.Response(
+        200,
+        request=httpx.Request("POST", "http://127.0.0.1:4000/v1/chat/completions"),
+        json={
+            "choices": [{"message": {"content": "done"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "cost": "not-a-number",
+        },
+    )
+
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return response
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    with pytest.raises(ModelCostConfigurationError, match="invalid model cost"):
+        asyncio.run(
+            LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+                [{"role": "user", "content": "work"}], "coder"
+            )
+        )
+    assert calls == 1
 
 
 def test_fake_provider_emits_native_completion_tool_call() -> None:
