@@ -187,7 +187,7 @@ def _call_runpod(endpoint: str, key: str, payload: dict[str, Any]) -> dict[str, 
             ) from exc
 
     request = urllib.request.Request(
-        f"https://api.runpod.ai/v2/{endpoint}/runsync",
+        f"https://api.runpod.ai/v2/{endpoint}/run",
         data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         method="POST",

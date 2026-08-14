@@ -56,6 +56,7 @@ def test_runpod_polls_pending_job_until_completed(monkeypatch) -> None:
 
     assert result["status"] == "COMPLETED"
     assert len(calls) == 2
+    assert calls[0].full_url.endswith("/run")
     assert calls[1].full_url.endswith("/status/job-1")
 
 
@@ -93,7 +94,7 @@ def test_runpod_http_error_preserves_safe_structured_evidence(monkeypatch) -> No
         ).encode()
     )
     error = urllib.error.HTTPError(
-        "https://api.runpod.ai/v2/endpoint/runsync",
+        "https://api.runpod.ai/v2/endpoint/run",
         429,
         "rate limited",
         None,
@@ -115,6 +116,22 @@ def test_runpod_http_error_preserves_safe_structured_evidence(monkeypatch) -> No
     assert "secret-key" not in str(failure)
     assert "Authorization" not in str(failure)
     assert "signed.example" not in str(failure)
+
+
+def test_runpod_submit_transport_failure_is_structured(monkeypatch) -> None:
+    error = urllib.error.URLError("connection reset")
+    monkeypatch.setattr(
+        "chitti.image_generation.urllib.request.urlopen",
+        lambda request, timeout: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(ImageProviderFailure) as raised:
+        _call_runpod("endpoint", "secret-key", {"input": {}})
+
+    failure = raised.value
+    assert failure.diagnostic["failure_class"] == "transport error"
+    assert failure.diagnostic["provider_job_id"] is None
+    assert "URLError" in failure.diagnostic["provider_error_message"]
 
 
 def test_runpod_queue_timeout_is_distinct_and_keeps_job_id(monkeypatch) -> None:
