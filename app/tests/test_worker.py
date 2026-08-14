@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from chitti.brand_profiles import BrandProfile
 from chitti.job_types import POSTER_POLICY
 from chitti.plans import PlanDocument, PlanRevision
 from chitti.provider import ModelCompletion
@@ -153,18 +154,35 @@ async def test_visual_critique_persists_reference_without_base64_and_rebinds_dig
         "accounted_tokens": 0,
         "last_failed_digest": None,
     }
+    profile = BrandProfile(
+        namespace="shared",
+        brand_colors=("#112233",),
+        typography="Inter",
+        poster_formats=("1080x1350",),
+        audience="private audience",
+        voice="private voice",
+        do_not_use=("real player likenesses",),
+        updated_by="owner",
+        updated_at=datetime.now(UTC),
+    )
     first = await dispatcher._visual_critique(
-        1, "task", 1, tmp_path, WorkerLimits(), state, "fixture brief", None
+        1, "task", 1, tmp_path, WorkerLimits(), state, "fixture brief", profile
     )
     image.write_bytes(_visual_png() + b"changed")
     second = await dispatcher._visual_critique(
-        1, "task", 2, tmp_path, WorkerLimits(), state, "fixture brief", None
+        1, "task", 2, tmp_path, WorkerLimits(), state, "fixture brief", profile
     )
     assert first[0].startswith("VISUAL_REVIEW_PASS")
     assert second[0].startswith("VISUAL_REVIEW_PASS")
     assert len(prompts) == 2
     assert all("base64" not in prompt for prompt in prompts)
     assert prompts[0] != prompts[1]
+    assert "#112233" in prompts[0]
+    assert "Inter" in prompts[0]
+    assert "1080x1350" in prompts[0]
+    assert "real player likenesses" in prompts[0]
+    assert "private audience" not in prompts[0]
+    assert "private voice" not in prompts[0]
     assert state["cycles"] == 2
 
 

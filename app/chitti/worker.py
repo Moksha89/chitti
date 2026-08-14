@@ -1577,11 +1577,17 @@ class DockerSandboxDispatcher:
         image_digest = hashlib.sha256(image).hexdigest()
         width, height = _png_dimensions(image)
         generated_asset_count = len(list((workspace / "out" / "generated").glob("*.png")))
-        profile = (
-            json.dumps(getattr(brand_profile, "__dict__", {}), default=str)
+        profile_fields: dict[str, object] = (
+            {
+                "brand_colors": brand_profile.brand_colors,
+                "typography": brand_profile.typography,
+                "poster_formats": brand_profile.poster_formats,
+                "do_not_use": brand_profile.do_not_use,
+            }
             if brand_profile is not None
-            else "{}"
+            else {}
         )
+        profile = json.dumps(profile_fields)
         review_instruction = (
             "Return exactly one JSON object with exactly these top-level fields: "
             "verdict, image_sha256, criteria, findings, summary, evidence_limitations. "
