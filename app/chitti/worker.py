@@ -100,6 +100,42 @@ class VisualReviewInconclusive(RuntimeError):
     """The poster could not reach a trustworthy visual verdict."""
 
 
+VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
+    (
+        "You are judging one captured poster PNG. Describe before you judge: "
+        "an unexamined pass is worse than a false fail, because a pass ends the work.",
+        "Return exactly one JSON object with exactly these top-level fields: "
+        "observations, verdict, image_sha256, criteria, findings, summary, "
+        "evidence_limitations.",
+        "observations must be an object with exactly these keys, each a plain-language "
+        "description of what the image actually shows: background, imagery, "
+        "imagery_edges, text_blocks, colour_use. imagery_edges must state, for every "
+        "placed photographic or illustrated element, whether its boundary is a visible "
+        "straight edge, panel or rectangle against the surrounding design, and where "
+        "in the frame that edge is. If you cannot see a placed element at all, say so "
+        "there.",
+        "criteria must contain exactly these keys, each pass or fail: fixture_text, "
+        "visual_hierarchy, readability, generated_imagery, composite_integrity, "
+        "brand_constraints.",
+        "composite_integrity fails when any placed image reads as a pasted rectangle: "
+        "a visible box, panel or seam around it, a background inside it that differs "
+        "from the poster background, or a washed-out block where the element sits. "
+        "Deliberate framing lines that belong to the design's own geometry are not "
+        "failures; an element's own leftover background is. If you are unsure whether "
+        "an edge is deliberate, describe it and fail composite_integrity.",
+        "generated_imagery fails when imagery is absent, or so dark, faint or "
+        "low-contrast that the poster would read as flat colour without it.",
+        "verdict must be pass or fail, and must be fail if any criterion is fail. "
+        "image_sha256 must exactly match the supplied digest. findings must be a list "
+        "of objects with criterion, issue and action fields; every failed criterion "
+        "needs at least one finding whose action names a concrete change. "
+        "evidence_limitations must be a list of strings; use an empty list if you "
+        "have none. Do not use markdown fences. Do not claim anything the image does "
+        "not show.",
+    )
+)
+
+
 class VisualState(TypedDict):
     cycles: int
     cost: float
@@ -642,8 +678,21 @@ class DockerSandboxDispatcher:
                     return
             await self._capture_workspace_artifacts(run_id, workspace, limits)
             await self._event(run_id, "passed", "all fixed operations passed")
+        except RunCancelled:
+            await self._event(run_id, "cancelled", "worker stopped by cancellation")
+            raise
+        except Exception as exc:
+            detail = str(exc).strip()[:2000] or exc.__class__.__name__
+            await self._event(run_id, "failed", detail)
+            raise
         finally:
-            await self._cleanup_workspace(workspace)
+            try:
+                await self._cleanup_workspace(workspace)
+            except Exception as exc:
+                await self._record_cleanup_failure(
+                    str(run_id),
+                    f"workspace cleanup failed: {str(exc)[:1000]}",
+                )
 
     async def _dispatch_model_one(
         self,
@@ -1631,17 +1680,7 @@ class DockerSandboxDispatcher:
             else {}
         )
         profile = json.dumps(profile_fields)
-        review_instruction = (
-            "Return exactly one JSON object with exactly these top-level fields: "
-            "verdict, image_sha256, criteria, findings, summary, evidence_limitations. "
-            "verdict must be pass or fail. image_sha256 must exactly match the supplied "
-            "image digest. criteria must contain exactly these keys: fixture_text, "
-            "visual_hierarchy, readability, generated_imagery, brand_constraints; "
-            "each value must be pass or fail. findings must be a list of objects with "
-            "criterion, issue, and action fields. A fail requires at least one actionable "
-            "finding tied to a failed criterion. Do not use markdown fences. Do not "
-            "claim certainty beyond what the image shows."
-        )
+        review_instruction = VISUAL_REVIEW_INSTRUCTION
         messages: list[dict[str, object]] = [
             {"role": "system", "content": review_instruction},
             {
@@ -3204,11 +3243,13 @@ def _parse_visual_verdict(value: object, image_digest: str) -> dict[str, object]
         "visual_hierarchy",
         "readability",
         "generated_imagery",
+        "composite_integrity",
         "brand_constraints",
     )
     if not isinstance(value, dict):
         raise VisualReviewInconclusive("visual critique returned a non-object verdict")
     expected = {
+        "observations",
         "verdict",
         "image_sha256",
         "criteria",
@@ -3220,6 +3261,23 @@ def _parse_visual_verdict(value: object, image_digest: str) -> dict[str, object]
         raise VisualReviewInconclusive("visual critique returned incomplete fields")
     if value.get("image_sha256") != image_digest:
         raise VisualReviewInconclusive("visual critique image digest did not match")
+    observations = value.get("observations")
+    observation_names = (
+        "background",
+        "imagery",
+        "imagery_edges",
+        "text_blocks",
+        "colour_use",
+    )
+    if (
+        not isinstance(observations, dict)
+        or set(observations) != set(observation_names)
+        or any(
+            not isinstance(observations[name], str) or not observations[name].strip()
+            for name in observation_names
+        )
+    ):
+        raise VisualReviewInconclusive("visual critique observations were incomplete")
     verdict = value.get("verdict")
     if verdict not in {"pass", "fail"}:
         raise VisualReviewInconclusive("visual critique returned an ambiguous verdict")
@@ -3251,9 +3309,14 @@ def _parse_visual_verdict(value: object, image_digest: str) -> dict[str, object]
         normalized_findings.append(
             {"criterion": criterion, "issue": issue, "action": action}
         )
+    failed_criteria = {name for name in criteria_names if criteria[name] == "fail"}
+    if failed_criteria and verdict != "fail":
+        raise VisualReviewInconclusive(
+            "visual critique passed with failed criteria"
+        )
     if verdict == "fail":
-        failed_criteria = {name for name in criteria_names if criteria[name] == "fail"}
-        if not any(item["criterion"] in failed_criteria for item in normalized_findings):
+        finding_criteria = {item["criterion"] for item in normalized_findings}
+        if not failed_criteria.issubset(finding_criteria):
             raise VisualReviewInconclusive(
                 "visual critique failure had no actionable failed criterion"
             )
@@ -3261,11 +3324,16 @@ def _parse_visual_verdict(value: object, image_digest: str) -> dict[str, object]
     limitations = value.get("evidence_limitations")
     if not isinstance(summary, str) or not summary.strip():
         raise VisualReviewInconclusive("visual critique summary was missing")
+    if isinstance(limitations, str):
+        limitations = [limitations]
     if not isinstance(limitations, list) or any(
         not isinstance(item, str) for item in limitations
     ):
         raise VisualReviewInconclusive("visual critique limitations were invalid")
     return {
+        "observations": {
+            name: observations[name] for name in observation_names
+        },
         "verdict": verdict,
         "image_sha256": image_digest,
         "criteria": {name: criteria[name] for name in criteria_names},
@@ -3499,6 +3567,12 @@ def _model_system_prompt(
             "generated asset; then run generate-images. The host owns the ComfyUI "
             "workflow and provider credentials, writes assets under out/generated, "
             "and resolves /workspace/image_manifest.resolved.json with real dimensions. The "
+            "manifest may set cutout=true for a subject asset that needs host-side "
+            "background removal; cutout assets return RGBA with feathered transparency, "
+            "so do not fake transparency with opacity or screen blending. A background "
+            "plate should remain visible and well-lit: do not make a stadium plate so "
+            "dark that it reads as flat navy. "
+            "The cutout field is opt-in per image; omit it for background plates. "
             "generated asset width and height must each be between 64 and 1024 "
             "pixels. The approved 1080x1350 size is the final composed poster "
             "canvas, not a generated asset size; choose a useful source aspect "

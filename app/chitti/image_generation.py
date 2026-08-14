@@ -9,9 +9,11 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
+from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
+from PIL import Image, ImageFilter
 from sqlalchemy import text
 
 from .runner_access import runner_sql
@@ -69,6 +71,125 @@ class ImageProviderFailure(RuntimeError):
             if value not in (None, "")
         ]
         super().__init__("image provider request failed: " + " ".join(fields))
+
+
+def _cutout_image(
+    raw: bytes,
+    *,
+    tolerance: int = 24,
+    feather_radius: float = 1.25,
+    border_width: int = 2,
+) -> tuple[bytes, dict[str, object]]:
+    try:
+        image = Image.open(BytesIO(raw)).convert("RGBA")
+    except Exception as exc:
+        raise ImageManifestRefused(f"cutout asset is not a readable image: {exc}") from exc
+    width, height = image.size
+    pixels = cast(Any, image.load())
+    border = [
+        pixels[x, y][:3]
+        for x in range(width)
+        for y in range(height)
+        if x < border_width
+        or y < border_width
+        or x >= width - border_width
+        or y >= height - border_width
+    ]
+    background = tuple(
+        sorted(channel)[len(channel) // 2]
+        for channel in zip(*border, strict=True)
+    )
+    if any(
+        max(abs(pixel[channel] - background[channel]) for channel in range(3))
+        > tolerance
+        for pixel in border
+    ):
+        raise ImageManifestRefused(
+            "cutout asset background is not near-uniform along its border"
+        )
+
+    background_pixels = bytearray(width * height)
+    pending = list(
+        {
+            (x, y)
+            for x in range(width)
+            for y in range(height)
+            if x < border_width
+            or y < border_width
+            or x >= width - border_width
+            or y >= height - border_width
+        }
+    )
+    head = 0
+    while head < len(pending):
+        x, y = pending[head]
+        head += 1
+        index = y * width + x
+        if background_pixels[index]:
+            continue
+        pixel = pixels[x, y][:3]
+        if max(abs(pixel[channel] - background[channel]) for channel in range(3)) > tolerance:
+            continue
+        background_pixels[index] = 1
+        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if 0 <= nx < width and 0 <= ny < height:
+                pending.append((nx, ny))
+
+    foreground = [
+        (x, y)
+        for y in range(height)
+        for x in range(width)
+        if not background_pixels[y * width + x]
+    ]
+    if any(
+        max(
+            abs(pixels[x, y][channel] - background[channel])
+            for channel in range(3)
+        )
+        <= tolerance
+        for x, y in foreground
+    ):
+        raise ImageManifestRefused(
+            "cutout background removal would eat into a subject-colored region"
+        )
+    if not foreground:
+        raise ImageManifestRefused("cutout asset contains no subject after background removal")
+    if any(
+        x < border_width
+        or y < border_width
+        or x >= width - border_width
+        or y >= height - border_width
+        for x, y in foreground
+    ):
+        raise ImageManifestRefused(
+            "cutout asset subject touches the border; refusing possible subject removal"
+        )
+    min_x = min(x for x, _ in foreground)
+    max_x = max(x for x, _ in foreground)
+    min_y = min(y for _, y in foreground)
+    max_y = max(y for _, y in foreground)
+    subject_area = len(foreground) / (width * height)
+    if subject_area < 0.005 or subject_area > 0.95:
+        raise ImageManifestRefused(
+            "cutout asset subject mask is not safely separable from its background"
+        )
+
+    alpha = Image.new("L", (width, height), 0)
+    alpha_pixels = cast(Any, alpha.load())
+    for x, y in foreground:
+        alpha_pixels[x, y] = 255
+    output = image.copy()
+    output.putalpha(alpha.filter(ImageFilter.GaussianBlur(radius=feather_radius)))
+    buffer = BytesIO()
+    output.save(buffer, format="PNG")
+    return buffer.getvalue(), {
+        "tolerance": tolerance,
+        "feather_radius": feather_radius,
+        "border_width": border_width,
+        "background_rgb": background,
+        "subject_bbox": [min_x, min_y, max_x, max_y],
+        "subject_area": subject_area,
+    }
 
 
 def _safe_value(value: object) -> str | None:
@@ -320,8 +441,11 @@ async def generate_manifest_images(
             "seed",
             "denoise",
             "reference",
+            "cutout",
         }:
             raise ImageManifestRefused("image manifest contains fields outside the declared contract")
+        if "cutout" in item and not isinstance(item["cutout"], bool):
+            raise ImageManifestRefused("image manifest cutout must be a boolean")
         identifier = str(item.get("id", "")).strip()
         if not identifier or "/" in identifier or "\\" in identifier:
             raise ImageManifestRefused("image manifest image id is invalid")
@@ -345,8 +469,9 @@ async def generate_manifest_images(
             cached = await session.execute(
                 runner_sql(
                     text(
-                        "SELECT width, height, sha256, byte_size, content FROM worker_image_jobs "
-                        "WHERE cache_digest = :digest AND status = 'completed' ORDER BY id DESC LIMIT 1"
+                        "SELECT width, height, sha256, byte_size, content, parameters "
+                        "FROM worker_image_jobs WHERE cache_digest = :digest "
+                        "AND status = 'completed' ORDER BY id DESC LIMIT 1"
                     )
                 ),
                 {"digest": digest},
@@ -357,6 +482,7 @@ async def generate_manifest_images(
             if cached_row["content"]:
                 content = bytes(cached_row["content"])
                 target.write_bytes(content)
+                cached_parameters = cached_row.get("parameters")
                 async with database.sessions() as session:
                     await session.execute(
                         runner_sql(
@@ -376,7 +502,11 @@ async def generate_manifest_images(
                             "digest": digest,
                             "prompt": item["prompt"],
                             "negative": item.get("negative_prompt", ""),
-                            "parameters": json.dumps(request_item),
+                            "parameters": json.dumps(
+                                cached_parameters
+                                if isinstance(cached_parameters, dict)
+                                else request_item
+                            ),
                             "template": WORKFLOW_TEMPLATE_ID,
                             "endpoint": settings.runpod_endpoint_id,
                             "worker": WORKER_IMAGE,
@@ -399,6 +529,16 @@ async def generate_manifest_images(
                         "sha256": cached_row["sha256"],
                         "byte_size": cached_row["byte_size"],
                         "cache_hit": True,
+                        "cutout": bool(item.get("cutout", False)),
+                        "cutout_applied": bool(item.get("cutout", False)),
+                        "cutout_parameters": (
+                            (cached_row.get("parameters") or {}).get(
+                                "cutout_parameters", {}
+                            )
+                            if item.get("cutout", False)
+                            and isinstance(cached_row.get("parameters"), dict)
+                            else {}
+                        ),
                     }
                 )
                 continue
@@ -438,6 +578,12 @@ async def generate_manifest_images(
             encoded = encoded.split(",", 1)[1]
         raw = base64.b64decode(encoded)
         width, height = _png_size(raw)
+        cutout_parameters: dict[str, object] = {}
+        source_sha256 = hashlib.sha256(raw).hexdigest()
+        if item.get("cutout", False):
+            raw, cutout_parameters = _cutout_image(raw)
+            width, height = _png_size(raw)
+        written_sha256 = hashlib.sha256(raw).hexdigest()
         target.write_bytes(raw)
         delay = int(result.get("delayTime") or 0)
         execution = int(result.get("executionTime") or 0)
@@ -461,7 +607,15 @@ async def generate_manifest_images(
                     "digest": digest,
                     "prompt": item["prompt"],
                     "negative": item.get("negative_prompt", ""),
-                    "parameters": json.dumps(dict(item)),
+                    "parameters": json.dumps(
+                        {
+                            **dict(request_item),
+                            "cutout_applied": bool(item.get("cutout", False)),
+                            "cutout_parameters": cutout_parameters,
+                            "source_sha256": source_sha256,
+                            "written_sha256": written_sha256,
+                        }
+                    ),
                     "template": WORKFLOW_TEMPLATE_ID,
                     "endpoint": settings.runpod_endpoint_id,
                     "worker": WORKER_IMAGE,
@@ -487,6 +641,9 @@ async def generate_manifest_images(
                 "sha256": sha,
                 "byte_size": len(raw),
                 "cache_hit": False,
+                "cutout": bool(item.get("cutout", False)),
+                "cutout_applied": bool(item.get("cutout", False)),
+                "cutout_parameters": cutout_parameters,
             }
         )
     resolved_path = workspace / "image_manifest.resolved.json"

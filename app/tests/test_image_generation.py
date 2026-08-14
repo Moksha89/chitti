@@ -10,11 +10,13 @@ from types import SimpleNamespace
 
 import pytest
 
+import chitti.image_generation as module
 from chitti.image_generation import (
     ImageBudgetExceeded,
     ImageManifestRefused,
     ImageProviderFailure,
     _call_runpod,
+    _cutout_image,
     _request_digest,
     _request_payload,
     generate_manifest_images,
@@ -300,6 +302,145 @@ def test_malformed_manifest_is_repairable(monkeypatch, tmp_path) -> None:
 
     with pytest.raises(ImageManifestRefused):
         asyncio.run(generate_manifest_images(None, 1, tmp_path, SimpleNamespace(image_request_count=6, image_spend_usd=0.05)))
+
+
+def test_cutout_removes_uniform_background_and_records_parameters() -> None:
+    from PIL import Image
+
+    image = Image.new("RGB", (20, 20), (230, 230, 230))
+    for x in range(7, 13):
+        for y in range(5, 15):
+            image.putpixel((x, y), (20, 80, 180))
+    source = io.BytesIO()
+    image.save(source, format="PNG")
+    transformed, parameters = _cutout_image(source.getvalue())
+    result = Image.open(io.BytesIO(transformed))
+    assert result.mode == "RGBA"
+    assert result.getpixel((0, 0))[3] == 0
+    assert result.getpixel((10, 10))[3] > 0
+    assert parameters["tolerance"] == 24
+    assert parameters["subject_bbox"] == [7, 5, 12, 14]
+    assert hashlib.sha256(transformed).hexdigest()
+
+
+def test_cutout_refuses_non_uniform_background() -> None:
+    from PIL import Image
+
+    image = Image.new("RGB", (20, 20), (230, 230, 230))
+    image.putpixel((0, 0), (10, 10, 10))
+    source = io.BytesIO()
+    image.save(source, format="PNG")
+    with pytest.raises(ImageManifestRefused, match="not near-uniform"):
+        _cutout_image(source.getvalue())
+
+
+def test_manifest_cutout_persists_transformed_provenance(monkeypatch, tmp_path) -> None:
+    from PIL import Image
+
+    image = Image.new("RGB", (64, 64), (230, 230, 230))
+    for x in range(25, 39):
+        for y in range(15, 49):
+            image.putpixel((x, y), (20, 80, 180))
+    source = io.BytesIO()
+    image.save(source, format="PNG")
+    (tmp_path / "image_manifest.json").write_text(
+        json.dumps(
+            {
+                "images": [
+                    {
+                        "id": "figure",
+                        "purpose": "subject",
+                        "prompt": "figure",
+                        "negative_prompt": "",
+                        "width": 64,
+                        "height": 64,
+                        "cutout": True,
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr(
+        module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            runpod_api_key="key",
+            runpod_endpoint_id="endpoint",
+            runpod_gpu_rate_usd=0.34,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_call_runpod",
+        lambda *_args: {
+            "status": "COMPLETED",
+            "output": {
+                "images": [{"data": base64.b64encode(source.getvalue()).decode()}]
+            },
+        },
+    )
+
+    class Result:
+        def __init__(self, row=None, value=0):
+            self.row = row
+            self.value = value
+
+        def mappings(self):
+            return self
+
+        def first(self):
+            return self.row
+
+        def scalar_one(self):
+            return self.value
+
+    class Session:
+        def __init__(self, database):
+            self.database = database
+
+        async def execute(self, statement, params):
+            sql = str(statement)
+            if "cache_digest" in sql and "SELECT" in sql:
+                return Result()
+            if "COUNT(*)" in sql or "SUM(cost_usd)" in sql:
+                return Result(value=0)
+            if "INSERT INTO worker_image_jobs" in sql:
+                self.database.insert_params = params
+            return Result()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def commit(self):
+            return None
+
+    class Database:
+        insert_params: dict[str, object] = {}
+
+        def sessions(self):
+            return Session(self)
+
+    database = Database()
+    detail = asyncio.run(
+        generate_manifest_images(
+            database,
+            1,
+            tmp_path,
+            SimpleNamespace(image_request_count=6, image_spend_usd=0.05),
+        )
+    )
+    resolved = json.loads((tmp_path / "image_manifest.resolved.json").read_text())
+    written = (tmp_path / "out" / "generated" / "figure.png").read_bytes()
+    parameters = json.loads(str(database.insert_params["parameters"]))
+    assert "resolved manifest" in detail
+    assert resolved["images"][0]["cutout_applied"] is True
+    assert parameters["cutout_applied"] is True
+    assert parameters["cutout_parameters"]["tolerance"] == 24
+    assert parameters["written_sha256"] == hashlib.sha256(written).hexdigest()
+    assert resolved["images"][0]["sha256"] == hashlib.sha256(written).hexdigest()
 
 
 def test_host_rejects_forged_resolved_asset(tmp_path) -> None:

@@ -65,13 +65,21 @@ def _visual_verdict(digest: str, verdict: str = "pass") -> str:
     return json.dumps(
         {
             "verdict": verdict,
+            "observations": {
+                "background": "A dark background.",
+                "imagery": "A generated image is visible.",
+                "imagery_edges": "No visible rectangular edges surround the generated image.",
+                "text_blocks": "Fixture text is visible.",
+                "colour_use": "Brand colours are visible.",
+            },
             "image_sha256": digest,
             "criteria": {
-                "fixture_text": verdict,
-                "visual_hierarchy": verdict,
+                "fixture_text": "pass",
+                "visual_hierarchy": "pass",
                 "readability": verdict,
-                "generated_imagery": verdict,
-                "brand_constraints": verdict,
+                "generated_imagery": "pass",
+                "composite_integrity": "pass",
+                "brand_constraints": "pass",
             },
             "findings": (
                 []
@@ -97,12 +105,41 @@ def test_visual_verdict_is_digest_bound_and_strict() -> None:
         digest,
     )
     assert parsed["image_sha256"] == digest
+    assert parsed["observations"]["imagery_edges"].startswith("No visible")
     with pytest.raises(VisualReviewInconclusive, match="digest"):
         _parse_visual_verdict(json.loads(_visual_verdict(digest)), "different")
     malformed = json.loads(_visual_verdict(digest))
     del malformed["criteria"]
     with pytest.raises(VisualReviewInconclusive, match="incomplete"):
         _parse_visual_verdict(malformed, digest)
+
+
+def test_visual_verdict_accepts_string_evidence_limitation() -> None:
+    digest = hashlib.sha256(b"poster").hexdigest()
+    value = json.loads(_visual_verdict(digest))
+    value["evidence_limitations"] = "Screenshot-only review."
+    parsed = _parse_visual_verdict(value, digest)
+    assert parsed["evidence_limitations"] == ["Screenshot-only review."]
+
+
+@pytest.mark.parametrize("field", ["observations", "criteria"])
+def test_visual_verdict_rejects_malformed_visual_fields(field: str) -> None:
+    digest = hashlib.sha256(b"poster").hexdigest()
+    value = json.loads(_visual_verdict(digest))
+    if field == "observations":
+        value[field]["imagery_edges"] = 1
+    else:
+        del value[field]["composite_integrity"]
+    with pytest.raises(VisualReviewInconclusive, match="incomplete"):
+        _parse_visual_verdict(value, digest)
+
+
+def test_visual_verdict_requires_fail_when_composite_integrity_fails() -> None:
+    digest = hashlib.sha256(b"poster").hexdigest()
+    value = json.loads(_visual_verdict(digest))
+    value["criteria"]["composite_integrity"] = "fail"
+    with pytest.raises(VisualReviewInconclusive, match="failed criteria"):
+        _parse_visual_verdict(value, digest)
 
 
 def test_visual_pass_cannot_rescue_deterministic_poster_gates() -> None:
@@ -791,6 +828,58 @@ def test_cancelled_run_still_cleans_up_workspace(monkeypatch, tmp_path) -> None:
 
     assert events == [("running", "run started"), ("cancelled", "cancelled before operation")]
     assert cleaned == [tmp_path / "chitti-run-1"]
+
+
+def test_model_critique_failure_records_terminal_run_event(monkeypatch, tmp_path) -> None:
+    class Result:
+        def mappings(self):
+            return self
+
+        def one(self):
+            return {"job_type": "website", "job_config": {}}
+
+    class Session:
+        async def execute(self, _statement, _params):
+            return Result()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Database:
+        def sessions(self):
+            return Session()
+
+    dispatcher = DockerSandboxDispatcher(Database(), workspace_root=tmp_path)
+    dispatcher.model_provider = object()  # type: ignore[assignment]
+    events: list[tuple[str, str]] = []
+
+    async def event(_run_id, status, detail, **_kwargs):
+        events.append((status, detail))
+
+    async def mount(_workspace, _limits):
+        return None
+
+    async def cleanup(_workspace):
+        return None
+
+    async def fail_dispatch(*_args):
+        raise VisualReviewInconclusive("visual critique observations were incomplete")
+
+    monkeypatch.setattr(dispatcher, "_event", event)
+    monkeypatch.setattr(dispatcher, "_mount_workspace", mount)
+    monkeypatch.setattr(dispatcher, "_cleanup_workspace", cleanup)
+    monkeypatch.setattr(dispatcher, "_dispatch_model_one", fail_dispatch)
+
+    with pytest.raises(VisualReviewInconclusive):
+        asyncio.run(dispatcher._dispatch_one(revision(), 1, WorkerLimits()))
+
+    assert events[-1] == (
+        "failed",
+        "visual critique observations were incomplete",
+    )
 
 
 def test_stale_cleanup_attempts_every_workspace_before_failing(monkeypatch, tmp_path) -> None:
