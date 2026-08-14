@@ -136,25 +136,6 @@ assert_process_setting_forwarded() {
 git -c safe.directory="${INSTALL_DIR}" fetch --quiet origin "${REMOTE_BRANCH}"
 git -c safe.directory="${INSTALL_DIR}" checkout --quiet --detach "origin/${REMOTE_BRANCH}"
 
-required_app_settings=(
-  DATABASE_URL LITELLM_BASE_URL LITELLM_MASTER_KEY CHITTI_PROVIDER
-  CHITTI_USERNAME CHITTI_PASSWORD_HASH CHITTI_SESSION_TTL_MINUTES
-  CHITTI_AUTH_STATE_PATH CHITTI_TRUSTED_PROXY_IP CHITTI_FONT_MANIFEST
-  TELEGRAM_BOT_TOKEN ALLOWED_TELEGRAM_USER_IDS PROFILE_PATH PROJECT_ROOT
-  DISPLAY_TIMEZONE EMBEDDING_MODEL PREVIEW_ROOT PREVIEW_STAGING_ROOT
-  PREVIEW_TTL_HOURS PREVIEW_MAX_BYTES PREVIEW_MAX_COUNT RUNPOD_API_KEY
-  RUNPOD_ENDPOINT_ID RUNPOD_GPU_RATE_USD GOOGLE_CLIENT_ID
-  GOOGLE_CLIENT_SECRET GOOGLE_OAUTH_REDIRECT_URI GOOGLE_CREDENTIALS_KEY
-  GOOGLE_SYNC_INTERVAL_SECONDS GOOGLE_RECENT_MAIL_DAYS
-  GOOGLE_INITIAL_MAIL_LIMIT GOOGLE_CALENDAR_WINDOW_DAYS
-)
-for app_setting in "${required_app_settings[@]}"; do
-  if ! grep -Eq "^[[:space:]]+${app_setting}:" docker-compose.yml; then
-    echo "docker-compose.yml does not pass through ${app_setting}" >&2
-    exit 1
-  fi
-done
-
 install -d -o root -g root -m 0750 \
   /var/lib/chitti-previews /var/lib/chitti-preview-staging
 
@@ -171,6 +152,29 @@ docker compose ps --status running --services | grep -qx chitti
 
 docker build --quiet -t chitti-sandbox:latest sandbox >/dev/null
 runner_image="chitti-chitti:latest"
+
+declared_app_settings="$(
+  docker run --rm --entrypoint python "${runner_image}" -c '
+from chitti.settings import Settings
+
+fields = getattr(Settings, "model_fields", None)
+if not fields:
+    raise SystemExit("Settings model fields are empty or unavailable")
+for field in sorted(fields):
+    print(field.upper())
+'
+)"
+if [[ -z "${declared_app_settings}" ]]; then
+  echo "could not derive application settings from the Settings model" >&2
+  exit 1
+fi
+while IFS= read -r app_setting; do
+  if ! grep -Eq "^[[:space:]]+${app_setting}:" docker-compose.yml; then
+    echo "docker-compose.yml does not pass through ${app_setting}" >&2
+    exit 1
+  fi
+done <<<"${declared_app_settings}"
+echo "Settings model compose pass-through assertions passed."
 
 # Recreate LiteLLM so it cannot retain a process or file-mounted config from
 # an earlier checkout.

@@ -15,14 +15,11 @@ grep -Fq 'docker run --rm \' "${script}"
 ! grep -Fq '< <(printf '\''%s'\'' "${gateway_models}")' "${script}"
 grep -Fq 'response was not valid JSON' "${script}"
 grep -Fq 'gateway request was unreachable or failed' "${script}"
-for setting in \
-  RUNPOD_API_KEY RUNPOD_ENDPOINT_ID RUNPOD_GPU_RATE_USD \
-  GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET GOOGLE_OAUTH_REDIRECT_URI \
-  GOOGLE_CREDENTIALS_KEY GOOGLE_SYNC_INTERVAL_SECONDS \
-  GOOGLE_RECENT_MAIL_DAYS GOOGLE_INITIAL_MAIL_LIMIT GOOGLE_CALENDAR_WINDOW_DAYS; do
-  grep -Fq "${setting}" "${script}"
-  grep -Eq "^[[:space:]]+${setting}:" "${repo_root}/docker-compose.yml"
-done
+grep -Fq 'from chitti.settings import Settings' "${script}"
+grep -Fq 'getattr(Settings, "model_fields", None)' "${script}"
+grep -Fq 'Settings model fields are empty or unavailable' "${script}"
+grep -Fq 'could not derive application settings from the Settings model' "${script}"
+! grep -Fq 'required_app_settings=(' "${script}"
 gateway_input='{"data":[{"id":"chitti-chat"}]}'
 parsed_gateway_input="$(
   CHITTI_GATEWAY_MODELS_JSON="${gateway_input}" \
