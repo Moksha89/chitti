@@ -334,6 +334,24 @@ def test_cutout_refuses_non_uniform_background() -> None:
         _cutout_image(source.getvalue())
 
 
+def test_cutout_allows_edge_touching_subject_and_enclosed_background() -> None:
+    from PIL import Image
+
+    image = Image.new("RGB", (20, 20), (230, 230, 230))
+    for x in range(7, 13):
+        for y in range(5, 20):
+            image.putpixel((x, y), (20, 80, 180))
+    for x in range(9, 11):
+        for y in range(8, 11):
+            image.putpixel((x, y), (230, 230, 230))
+    source = io.BytesIO()
+    image.save(source, format="PNG")
+    transformed, _parameters = _cutout_image(source.getvalue())
+    result = Image.open(io.BytesIO(transformed))
+    assert result.getpixel((10, 19))[3] > 0
+    assert result.getpixel((10, 9))[3] < 255
+
+
 def test_manifest_cutout_persists_transformed_provenance(monkeypatch, tmp_path) -> None:
     from PIL import Image
 

@@ -8,6 +8,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from collections.abc import Mapping
 from io import BytesIO
 from pathlib import Path
@@ -90,10 +91,8 @@ def _cutout_image(
         pixels[x, y][:3]
         for x in range(width)
         for y in range(height)
-        if x < border_width
-        or y < border_width
-        or x >= width - border_width
-        or y >= height - border_width
+        if (x < border_width or x >= width - border_width)
+        and (y < border_width or y >= height - border_width)
     ]
     background = tuple(
         sorted(channel)[len(channel) // 2]
@@ -108,32 +107,50 @@ def _cutout_image(
             "cutout asset background is not near-uniform along its border"
         )
 
-    background_pixels = bytearray(width * height)
-    pending = list(
-        {
-            (x, y)
-            for x in range(width)
-            for y in range(height)
-            if x < border_width
-            or y < border_width
-            or x >= width - border_width
-            or y >= height - border_width
-        }
-    )
-    head = 0
-    while head < len(pending):
-        x, y = pending[head]
-        head += 1
-        index = y * width + x
-        if background_pixels[index]:
-            continue
+    def near_background(x: int, y: int) -> bool:
         pixel = pixels[x, y][:3]
-        if max(abs(pixel[channel] - background[channel]) for channel in range(3)) > tolerance:
+        return bool(
+            max(
+                abs(pixel[channel] - background[channel])
+                for channel in range(3)
+            )
+            <= tolerance
+        )
+
+    background_pixels = bytearray(width * height)
+    queued = bytearray(width * height)
+    pending: deque[tuple[int, int]] = deque()
+    for x in range(width):
+        for y in (*range(border_width), *range(height - border_width, height)):
+            index = y * width + x
+            if not queued[index]:
+                queued[index] = 1
+                pending.append((x, y))
+    for y in range(height):
+        for x in (*range(border_width), *range(width - border_width, width)):
+            index = y * width + x
+            if not queued[index]:
+                queued[index] = 1
+                pending.append((x, y))
+    while pending:
+        x, y = pending.popleft()
+        index = y * width + x
+        if not near_background(x, y):
             continue
         background_pixels[index] = 1
         for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
             if 0 <= nx < width and 0 <= ny < height:
-                pending.append((nx, ny))
+                neighbor_index = ny * width + nx
+                if not queued[neighbor_index]:
+                    queued[neighbor_index] = 1
+                    pending.append((nx, ny))
+
+    # Enclosed holes and background-coloured pockets are still background.
+    for y in range(height):
+        for x in range(width):
+            index = y * width + x
+            if not background_pixels[index] and near_background(x, y):
+                background_pixels[index] = 1
 
     foreground = [
         (x, y)
@@ -141,29 +158,8 @@ def _cutout_image(
         for x in range(width)
         if not background_pixels[y * width + x]
     ]
-    if any(
-        max(
-            abs(pixels[x, y][channel] - background[channel])
-            for channel in range(3)
-        )
-        <= tolerance
-        for x, y in foreground
-    ):
-        raise ImageManifestRefused(
-            "cutout background removal would eat into a subject-colored region"
-        )
     if not foreground:
         raise ImageManifestRefused("cutout asset contains no subject after background removal")
-    if any(
-        x < border_width
-        or y < border_width
-        or x >= width - border_width
-        or y >= height - border_width
-        for x, y in foreground
-    ):
-        raise ImageManifestRefused(
-            "cutout asset subject touches the border; refusing possible subject removal"
-        )
     min_x = min(x for x, _ in foreground)
     max_x = max(x for x, _ in foreground)
     min_y = min(y for _, y in foreground)
@@ -581,7 +577,7 @@ async def generate_manifest_images(
         cutout_parameters: dict[str, object] = {}
         source_sha256 = hashlib.sha256(raw).hexdigest()
         if item.get("cutout", False):
-            raw, cutout_parameters = _cutout_image(raw)
+            raw, cutout_parameters = await asyncio.to_thread(_cutout_image, raw)
             width, height = _png_size(raw)
         written_sha256 = hashlib.sha256(raw).hexdigest()
         target.write_bytes(raw)
