@@ -15,6 +15,14 @@ grep -Fq 'docker run --rm \' "${script}"
 ! grep -Fq '< <(printf '\''%s'\'' "${gateway_models}")' "${script}"
 grep -Fq 'response was not valid JSON' "${script}"
 grep -Fq 'gateway request was unreachable or failed' "${script}"
+for setting in \
+  RUNPOD_API_KEY RUNPOD_ENDPOINT_ID RUNPOD_GPU_RATE_USD \
+  GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET GOOGLE_OAUTH_REDIRECT_URI \
+  GOOGLE_CREDENTIALS_KEY GOOGLE_SYNC_INTERVAL_SECONDS \
+  GOOGLE_RECENT_MAIL_DAYS GOOGLE_INITIAL_MAIL_LIMIT GOOGLE_CALENDAR_WINDOW_DAYS; do
+  grep -Fq "${setting}" "${script}"
+  grep -Eq "^[[:space:]]+${setting}:" "${repo_root}/docker-compose.yml"
+done
 gateway_input='{"data":[{"id":"chitti-chat"}]}'
 parsed_gateway_input="$(
   CHITTI_GATEWAY_MODELS_JSON="${gateway_input}" \

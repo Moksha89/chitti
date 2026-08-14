@@ -106,10 +106,30 @@ async def test_poster_preflight_refuses_before_inserting_a_run(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_poster_preflight_refuses_unconfigured_image_generation(monkeypatch) -> None:
+    database = _Database()
+    monkeypatch.setattr("chitti.worker.approved_revision", _approved_revision)
+    monkeypatch.setattr("chitti.worker.get_brand_profile", _present_profile)
+    monkeypatch.setattr(
+        "chitti.worker.get_settings",
+        lambda: SimpleNamespace(runpod_api_key="", runpod_endpoint_id=""),
+    )
+
+    with pytest.raises(ValueError, match="image generation is unavailable"):
+        await WorkerRunManager(database).enqueue(7, job_type="poster")
+
+    assert database.session.calls == []
+
+
+@pytest.mark.asyncio
 async def test_poster_job_config_persists_only_declared_configuration(monkeypatch) -> None:
     database = _Database()
     monkeypatch.setattr("chitti.worker.approved_revision", _approved_revision)
     monkeypatch.setattr("chitti.worker.get_brand_profile", _present_profile)
+    monkeypatch.setattr(
+        "chitti.worker.get_settings",
+        lambda: SimpleNamespace(runpod_api_key="key", runpod_endpoint_id="endpoint"),
+    )
     declared = {"artifact": "campaign/poster.svg", "width": 1200, "height": 628, "scale": 2}
 
     await WorkerRunManager(database).enqueue(

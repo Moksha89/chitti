@@ -108,8 +108,52 @@ set -a
 source .env
 set +a
 
+assert_container_setting_forwarded() {
+  local container="$1"
+  local setting="$2"
+  if [[ -z "${!setting:-}" ]]; then
+    return 0
+  fi
+  if ! docker inspect "${container}" --format '{{range .Config.Env}}{{println .}}{{end}}' |
+    grep -q "^${setting}="; then
+    echo "configured ${setting} was not forwarded to ${container}" >&2
+    exit 1
+  fi
+}
+
+assert_process_setting_forwarded() {
+  local pid="$1"
+  local setting="$2"
+  if [[ -z "${!setting:-}" ]]; then
+    return 0
+  fi
+  if ! tr '\0' '\n' <"/proc/${pid}/environ" | grep -q "^${setting}="; then
+    echo "configured ${setting} was not forwarded to process ${pid}" >&2
+    exit 1
+  fi
+}
+
 git -c safe.directory="${INSTALL_DIR}" fetch --quiet origin "${REMOTE_BRANCH}"
 git -c safe.directory="${INSTALL_DIR}" checkout --quiet --detach "origin/${REMOTE_BRANCH}"
+
+required_app_settings=(
+  DATABASE_URL LITELLM_BASE_URL LITELLM_MASTER_KEY CHITTI_PROVIDER
+  CHITTI_USERNAME CHITTI_PASSWORD_HASH CHITTI_SESSION_TTL_MINUTES
+  CHITTI_AUTH_STATE_PATH CHITTI_TRUSTED_PROXY_IP CHITTI_FONT_MANIFEST
+  TELEGRAM_BOT_TOKEN ALLOWED_TELEGRAM_USER_IDS PROFILE_PATH PROJECT_ROOT
+  DISPLAY_TIMEZONE EMBEDDING_MODEL PREVIEW_ROOT PREVIEW_STAGING_ROOT
+  PREVIEW_TTL_HOURS PREVIEW_MAX_BYTES PREVIEW_MAX_COUNT RUNPOD_API_KEY
+  RUNPOD_ENDPOINT_ID RUNPOD_GPU_RATE_USD GOOGLE_CLIENT_ID
+  GOOGLE_CLIENT_SECRET GOOGLE_OAUTH_REDIRECT_URI GOOGLE_CREDENTIALS_KEY
+  GOOGLE_SYNC_INTERVAL_SECONDS GOOGLE_RECENT_MAIL_DAYS
+  GOOGLE_INITIAL_MAIL_LIMIT GOOGLE_CALENDAR_WINDOW_DAYS
+)
+for app_setting in "${required_app_settings[@]}"; do
+  if ! grep -Eq "^[[:space:]]+${app_setting}:" docker-compose.yml; then
+    echo "docker-compose.yml does not pass through ${app_setting}" >&2
+    exit 1
+  fi
+done
 
 install -d -o root -g root -m 0750 \
   /var/lib/chitti-previews /var/lib/chitti-preview-staging
@@ -275,9 +319,14 @@ if [[ "${role_exists}" == "1" ]]; then
   sed \
     -e '/^LITELLM_BASE_URL=/d' \
     -e '/^LITELLM_MASTER_KEY=/d' \
+    -e '/^RUNPOD_API_KEY=/d' \
+    -e '/^RUNPOD_ENDPOINT_ID=/d' \
+    -e '/^RUNPOD_GPU_RATE_USD=/d' \
     "${RUNNER_ENV}" >"${runner_env_tmp}"
-  printf 'LITELLM_BASE_URL=http://127.0.0.1:%s\nLITELLM_MASTER_KEY=%s\n' \
-    "${LITELLM_PORT:-4000}" "${LITELLM_MASTER_KEY}" >>"${runner_env_tmp}"
+  printf 'LITELLM_BASE_URL=http://127.0.0.1:%s\nLITELLM_MASTER_KEY=%s\nRUNPOD_API_KEY=%s\nRUNPOD_ENDPOINT_ID=%s\nRUNPOD_GPU_RATE_USD=%s\n' \
+    "${LITELLM_PORT:-4000}" "${LITELLM_MASTER_KEY}" \
+    "${RUNPOD_API_KEY:-}" "${RUNPOD_ENDPOINT_ID:-}" "${RUNPOD_GPU_RATE_USD:-0.34}" \
+    >>"${runner_env_tmp}"
   chmod 0600 "${runner_env_tmp}"
   install -o root -g root -m 0600 "${runner_env_tmp}" "${RUNNER_ENV}"
   rm -f "${runner_env_tmp}"
@@ -288,8 +337,9 @@ else
   runner_sql_tmp="$(mktemp /etc/chitti/runner-role.sql.XXXXXX)"
   trap 'rm -f "${runner_env_tmp:-}" "${runner_sql_tmp:-}"' EXIT
 
-  printf 'DATABASE_URL=postgresql+asyncpg://chitti_runner:%s@127.0.0.1:5432/%s\nPREVIEW_ROOT=/var/lib/chitti-previews\nPREVIEW_STAGING_ROOT=/var/lib/chitti-preview-staging\nLITELLM_BASE_URL=http://127.0.0.1:%s\nLITELLM_MASTER_KEY=%s\n' \
-    "${runner_password}" "${POSTGRES_DB}" "${LITELLM_PORT:-4000}" "${LITELLM_MASTER_KEY}" >"${runner_env_tmp}"
+  printf 'DATABASE_URL=postgresql+asyncpg://chitti_runner:%s@127.0.0.1:5432/%s\nPREVIEW_ROOT=/var/lib/chitti-previews\nPREVIEW_STAGING_ROOT=/var/lib/chitti-preview-staging\nLITELLM_BASE_URL=http://127.0.0.1:%s\nLITELLM_MASTER_KEY=%s\nRUNPOD_API_KEY=%s\nRUNPOD_ENDPOINT_ID=%s\nRUNPOD_GPU_RATE_USD=%s\n' \
+    "${runner_password}" "${POSTGRES_DB}" "${LITELLM_PORT:-4000}" "${LITELLM_MASTER_KEY}" \
+    "${RUNPOD_API_KEY:-}" "${RUNPOD_ENDPOINT_ID:-}" "${RUNPOD_GPU_RATE_USD:-0.34}" >"${runner_env_tmp}"
   chmod 0600 "${runner_env_tmp}"
 
   sed "s/REPLACE_WITH_A_RANDOM_SECRET/${runner_password}/" \
@@ -313,12 +363,31 @@ if [[ "${sync_role_exists}" == "1" ]]; then
     echo "Google sync role exists but ${GOOGLE_SYNC_ENV} is missing; refusing to rotate credentials." >&2
     exit 1
   fi
+  sync_env_tmp="$(mktemp /etc/chitti/google-sync.env.XXXXXX)"
+  trap 'rm -f "${sync_env_tmp:-}"' EXIT
+  sed \
+    -e '/^GOOGLE_CREDENTIALS_KEY=/d' \
+    -e '/^GOOGLE_SYNC_INTERVAL_SECONDS=/d' \
+    -e '/^GOOGLE_RECENT_MAIL_DAYS=/d' \
+    -e '/^GOOGLE_INITIAL_MAIL_LIMIT=/d' \
+    -e '/^GOOGLE_CALENDAR_WINDOW_DAYS=/d' \
+    "${GOOGLE_SYNC_ENV}" >"${sync_env_tmp}"
+  printf 'GOOGLE_CREDENTIALS_KEY=%s\nGOOGLE_SYNC_INTERVAL_SECONDS=%s\nGOOGLE_RECENT_MAIL_DAYS=%s\nGOOGLE_INITIAL_MAIL_LIMIT=%s\nGOOGLE_CALENDAR_WINDOW_DAYS=%s\n' \
+    "${GOOGLE_CREDENTIALS_KEY:-}" "${GOOGLE_SYNC_INTERVAL_SECONDS:-300}" \
+    "${GOOGLE_RECENT_MAIL_DAYS:-30}" "${GOOGLE_INITIAL_MAIL_LIMIT:-100}" \
+    "${GOOGLE_CALENDAR_WINDOW_DAYS:-30}" >>"${sync_env_tmp}"
+  chmod 0600 "${sync_env_tmp}"
+  install -o root -g root -m 0600 "${sync_env_tmp}" "${GOOGLE_SYNC_ENV}"
+  rm -f "${sync_env_tmp}"
+  trap - EXIT
 else
   sync_password="$(openssl rand -hex 32)"
   sync_env_tmp="$(mktemp /etc/chitti/google-sync.env.XXXXXX)"
   trap 'rm -f "${sync_env_tmp:-}"' EXIT
-  printf 'DATABASE_URL=postgresql+asyncpg://chitti_google_sync:%s@127.0.0.1:5432/%s\nGOOGLE_CREDENTIALS_KEY=%s\n' \
-    "${sync_password}" "${POSTGRES_DB}" "${GOOGLE_CREDENTIALS_KEY:-}" >"${sync_env_tmp}"
+  printf 'DATABASE_URL=postgresql+asyncpg://chitti_google_sync:%s@127.0.0.1:5432/%s\nGOOGLE_CREDENTIALS_KEY=%s\nGOOGLE_SYNC_INTERVAL_SECONDS=%s\nGOOGLE_RECENT_MAIL_DAYS=%s\nGOOGLE_INITIAL_MAIL_LIMIT=%s\nGOOGLE_CALENDAR_WINDOW_DAYS=%s\n' \
+    "${sync_password}" "${POSTGRES_DB}" "${GOOGLE_CREDENTIALS_KEY:-}" \
+    "${GOOGLE_SYNC_INTERVAL_SECONDS:-300}" "${GOOGLE_RECENT_MAIL_DAYS:-30}" \
+    "${GOOGLE_INITIAL_MAIL_LIMIT:-100}" "${GOOGLE_CALENDAR_WINDOW_DAYS:-30}" >"${sync_env_tmp}"
   chmod 0600 "${sync_env_tmp}"
   docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
     -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
@@ -439,8 +508,27 @@ if identity.get("digest") != os.environ["EXPECTED_RUNNER_DIGEST"]:
 PY
 echo "Runner loaded-code identity assertion passed."
 
+for runner_setting in RUNPOD_API_KEY RUNPOD_ENDPOINT_ID RUNPOD_GPU_RATE_USD; do
+  assert_process_setting_forwarded "${runner_pid}" "${runner_setting}"
+done
+sync_pid="$(systemctl show --property=MainPID --value "${GOOGLE_SYNC_UNIT}")"
+if [[ "${sync_pid}" != "0" ]]; then
+  for sync_setting in GOOGLE_CREDENTIALS_KEY GOOGLE_SYNC_INTERVAL_SECONDS \
+    GOOGLE_RECENT_MAIL_DAYS GOOGLE_INITIAL_MAIL_LIMIT GOOGLE_CALENDAR_WINDOW_DAYS; do
+    assert_process_setting_forwarded "${sync_pid}" "${sync_setting}"
+  done
+fi
+echo "Configured runtime settings reached their owning processes."
+
 app_container="$(docker compose ps -q chitti)"
 [[ -n "${app_container}" ]]
+for app_setting in \
+  RUNPOD_API_KEY RUNPOD_ENDPOINT_ID RUNPOD_GPU_RATE_USD \
+  GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET GOOGLE_OAUTH_REDIRECT_URI \
+  GOOGLE_CREDENTIALS_KEY GOOGLE_SYNC_INTERVAL_SECONDS \
+  GOOGLE_RECENT_MAIL_DAYS GOOGLE_INITIAL_MAIL_LIMIT GOOGLE_CALENDAR_WINDOW_DAYS; do
+  assert_container_setting_forwarded "${app_container}" "${app_setting}"
+done
 if docker inspect "${app_container}" \
   --format '{{range .Mounts}}{{if eq .Destination "/var/run/docker.sock"}}FAIL{{end}}{{end}}' |
   grep -q '^FAIL$'; then
@@ -448,6 +536,23 @@ if docker inspect "${app_container}" \
     exit 1
 fi
 docker exec "${app_container}" test ! -S /var/run/docker.sock
+
+for runner_setting in RUNPOD_API_KEY RUNPOD_ENDPOINT_ID RUNPOD_GPU_RATE_USD; do
+  if [[ -n "${!runner_setting:-}" ]] &&
+    ! grep -Eq "^${runner_setting}=" "${RUNNER_ENV}"; then
+    echo "configured ${runner_setting} was not written to ${RUNNER_ENV}" >&2
+    exit 1
+  fi
+done
+for sync_setting in GOOGLE_CREDENTIALS_KEY GOOGLE_SYNC_INTERVAL_SECONDS \
+  GOOGLE_RECENT_MAIL_DAYS GOOGLE_INITIAL_MAIL_LIMIT GOOGLE_CALENDAR_WINDOW_DAYS; do
+  if [[ -n "${!sync_setting:-}" ]] &&
+    ! grep -Eq "^${sync_setting}=" "${GOOGLE_SYNC_ENV}"; then
+    echo "configured ${sync_setting} was not written to ${GOOGLE_SYNC_ENV}" >&2
+    exit 1
+  fi
+done
+echo "Configured runtime settings were forwarded to their owning processes."
 
 worker_targets=""
 for service_port in postgres:5432 redis:6379 litellm:4000 caddy:80; do
