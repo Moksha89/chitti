@@ -78,6 +78,10 @@ async def create_action(
     requested_by: str,
     expires_at: datetime | None = None,
 ) -> int:
+    if attachments:
+        raise ValueError(
+            "Email attachments are not supported because trusted attachment bytes are unavailable"
+        )
     action = canonical_action(
         to_recipients=to_recipients,
         cc_recipients=cc_recipients,

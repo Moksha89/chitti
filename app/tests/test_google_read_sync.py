@@ -392,7 +392,7 @@ async def test_email_action_approval_sends_once_and_records_provider_id(google_d
             bcc_recipients=[],
             subject="Exact subject",
             body="Exact body",
-            attachments=[{"name": "brief.txt", "size": 12, "sha256": "a" * 64}],
+            attachments=[],
             requested_by="owner",
         )
         action = await action_for_namespace(session, action_id, "jsv-fashion")
@@ -480,6 +480,26 @@ async def test_email_action_requires_approval_and_rejects_tampering(google_datab
         await session.execute(text("ALTER TABLE google_email_actions ENABLE TRIGGER reject_google_email_action_mutation_trigger"))
     with pytest.raises(GoogleProviderError, match="content hash mismatch"):
         await send_pending_action(google_database, account, SendProvider(), action_id)
+
+
+@pytest.mark.asyncio
+@db_test
+async def test_email_action_rejects_attachments_before_creation(google_database) -> None:
+    account_id = await _account(google_database, "general", "owner@example.com")
+    async with google_database.begin() as session:
+        with pytest.raises(ValueError, match="trusted attachment bytes"):
+            await create_action(
+                session,
+                namespace="general",
+                account_id=account_id,
+                to_recipients=["recipient@example.com"],
+                cc_recipients=[],
+                bcc_recipients=[],
+                subject="Subject",
+                body="Body",
+                attachments=[{"name": "brief.txt", "size": 12, "sha256": "a" * 64}],
+                requested_by="owner",
+            )
 
 
 @pytest.mark.asyncio
