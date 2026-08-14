@@ -34,9 +34,22 @@ from .db import Database
 from .diff_parser import parse_diff as _parse_diff
 from .embedding import FakeEmbedder, get_embedder
 from .google_crypto import CredentialCipher
-from .google_oauth import OAuthStateStore, authorization_url, exchange_code
-from .google_provider import GOOGLE_SCOPES, GoogleApiProvider, GoogleProviderError
+from .google_email import (
+    action_for_namespace,
+    create_action,
+    list_actions,
+    parse_recipient_field,
+    record_approval,
+)
+from .google_oauth import (
+    OAuthStateStore,
+    authorization_url,
+    exchange_code,
+    validate_scopes,
+)
+from .google_provider import GoogleApiProvider, GoogleProviderError
 from .google_store import (
+    account_for_namespace,
     account_summary,
     create_account,
     credential_for_account,
@@ -390,6 +403,7 @@ async def dashboard_context(
         google_account = await account_summary(db_session, namespace)
         google_messages = await recent_messages(db_session, namespace)
         google_events = await upcoming_events(db_session, namespace)
+        google_email_actions = await list_actions(db_session, namespace)
         for plan in plans:
             approval_result = await db_session.execute(
                 text(
@@ -458,6 +472,7 @@ async def dashboard_context(
         "google_account": google_account,
         "google_messages": google_messages,
         "google_events": google_events,
+        "google_email_actions": google_email_actions,
         "google_error": request.query_params.get("google_error"),
     }
 
@@ -719,8 +734,7 @@ async def google_callback(request: Request) -> RedirectResponse:
         if not code:
             raise ValueError("Google authorization did not return a code")
         token = exchange_code(request.app.state.settings, code)
-        if set(str(scope) for scope in token["scopes"]) != set(GOOGLE_SCOPES):
-            raise ValueError("Google returned scopes outside the read-only contract")
+        validate_scopes([str(scope) for scope in token["scopes"]])
         provider = GoogleApiProvider(token["client_config"], token["refresh_token"])
         email = provider.account_email()
         cipher = CredentialCipher(request.app.state.settings.google_credentials_key)
@@ -772,6 +786,107 @@ async def google_disconnect(request: Request) -> RedirectResponse:
         await disconnect_account(db_session, account_id, namespace, session.username or "owner")
         await db_session.commit()
     return RedirectResponse(f"/?namespace={namespace}&google_error=Google+disconnected", status_code=303)
+
+
+@app.post("/google/email")
+async def create_google_email_action(request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
+    account_id = int(str(form.get("account_id", "0")))
+    async with request.app.state.database.sessions() as db_session:
+        account = await account_for_namespace(db_session, account_id, namespace)
+        if account is None:
+            raise HTTPException(status_code=404, detail="Google account not found")
+        if account["status"] == "reconnect_needed":
+            return RedirectResponse(
+                f"/?namespace={namespace}&google_error=Reconnect+needed+to+grant+Gmail+send+access",
+                status_code=303,
+            )
+        try:
+            await create_action(
+                db_session,
+                namespace=namespace,
+                account_id=account_id,
+                to_recipients=parse_recipient_field(str(form.get("to", ""))),
+                cc_recipients=parse_recipient_field(str(form.get("cc", ""))) if str(form.get("cc", "")).strip() else [],
+                bcc_recipients=parse_recipient_field(str(form.get("bcc", ""))) if str(form.get("bcc", "")).strip() else [],
+                subject=str(form.get("subject", "")),
+                body=str(form.get("body", "")),
+                attachments=[],
+                requested_by=session.username or "owner",
+            )
+            await db_session.commit()
+        except ValueError as exc:
+            return RedirectResponse(
+                f"/?namespace={namespace}&google_error={quote(str(exc), safe='')}",
+                status_code=303,
+            )
+    return RedirectResponse(f"/?namespace={namespace}", status_code=303)
+
+
+@app.post("/google/email/{action_id}/approve")
+async def approve_google_email_action(action_id: int, request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
+    async with request.app.state.database.sessions() as db_session:
+        action = await action_for_namespace(db_session, action_id, namespace)
+        if action is None:
+            raise HTTPException(status_code=404, detail="Email action not found")
+        try:
+            await record_approval(
+                db_session,
+                action,
+                decision="approved",
+                reason=str(form.get("reason", "")).strip() or None,
+                approved_by=session.username or "owner",
+            )
+            await db_session.commit()
+        except ValueError as exc:
+            return RedirectResponse(
+                f"/?namespace={namespace}&google_error={quote(str(exc), safe='')}",
+                status_code=303,
+            )
+    return RedirectResponse(f"/?namespace={namespace}", status_code=303)
+
+
+@app.post("/google/email/{action_id}/reject")
+async def reject_google_email_action(action_id: int, request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
+    async with request.app.state.database.sessions() as db_session:
+        action = await action_for_namespace(db_session, action_id, namespace)
+        if action is None:
+            raise HTTPException(status_code=404, detail="Email action not found")
+        try:
+            await record_approval(
+                db_session,
+                action,
+                decision="rejected",
+                reason=str(form.get("reason", "")).strip() or None,
+                approved_by=session.username or "owner",
+            )
+            await db_session.commit()
+        except ValueError as exc:
+            return RedirectResponse(
+                f"/?namespace={namespace}&google_error={quote(str(exc), safe='')}",
+                status_code=303,
+            )
+    return RedirectResponse(f"/?namespace={namespace}", status_code=303)
 
 
 @app.post("/reminders")

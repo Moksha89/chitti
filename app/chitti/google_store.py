@@ -7,8 +7,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .google_crypto import CredentialCipher
+from .google_provider import GOOGLE_SEND_SCOPE
 from .memory import normalize_namespace
-from .runner_access import application_only_sql
+from .runner_access import application_only_sql, sync_sql
 
 
 async def account_for_namespace(
@@ -23,7 +24,17 @@ async def account_for_namespace(
         {"id": account_id, "namespace": normalize_namespace(namespace)},
     )
     row = result.mappings().one_or_none()
-    return dict(row) if row else None
+    if not row:
+        return None
+    account = dict(row)
+    if account["status"] == "connected" and GOOGLE_SEND_SCOPE not in {
+        str(scope) for scope in account["scopes"]
+    }:
+        account["status"] = "reconnect_needed"
+        account["reconnect_reason"] = (
+            "Reconnect required: this Google connection predates Gmail send permission."
+        )
+    return account
 
 
 async def account_summary(
@@ -38,7 +49,17 @@ async def account_summary(
         {"namespace": normalize_namespace(namespace)},
     )
     row = result.mappings().one_or_none()
-    return dict(row) if row else None
+    if not row:
+        return None
+    account = dict(row)
+    if account["status"] == "connected" and GOOGLE_SEND_SCOPE not in {
+        str(scope) for scope in account["scopes"]
+    }:
+        account["status"] = "reconnect_needed"
+        account["reconnect_reason"] = (
+            "Reconnect required: this Google connection predates Gmail send permission."
+        )
+    return account
 
 
 async def create_account(
@@ -113,6 +134,24 @@ async def credential_for_account(
     return dict(row) if row else None
 
 
+async def sync_credential_for_account(
+    session: AsyncSession, account_id: int, namespace: str
+) -> dict[str, Any] | None:
+    result = await session.execute(
+        sync_sql(
+            text(
+                "SELECT c.client_config_ciphertext, c.refresh_token_ciphertext, c.key_version "
+                "FROM google_oauth_credentials c JOIN google_provider_accounts a "
+                "ON a.id = c.account_id WHERE c.account_id = :account_id "
+                "AND a.namespace = :namespace"
+            )
+        ),
+        {"account_id": account_id, "namespace": normalize_namespace(namespace)},
+    )
+    row = result.mappings().one_or_none()
+    return dict(row) if row else None
+
+
 async def mark_account_failure(
     session: AsyncSession, account_id: int, namespace: str, detail: str
 ) -> None:
@@ -134,6 +173,35 @@ async def mark_account_synced(
             "last_synced_at = now(), updated_at = now() "
             "WHERE id = :id AND namespace = :namespace"
         )),
+        {"id": account_id, "namespace": normalize_namespace(namespace)},
+    )
+
+
+async def sync_mark_account_failure(
+    session: AsyncSession, account_id: int, namespace: str, detail: str
+) -> None:
+    await session.execute(
+        sync_sql(
+            text(
+                "UPDATE google_provider_accounts SET status = 'error', last_error = :detail, "
+                "updated_at = now() WHERE id = :id AND namespace = :namespace"
+            )
+        ),
+        {"id": account_id, "namespace": normalize_namespace(namespace), "detail": detail[:2000]},
+    )
+
+
+async def sync_mark_account_synced(
+    session: AsyncSession, account_id: int, namespace: str
+) -> None:
+    await session.execute(
+        sync_sql(
+            text(
+                "UPDATE google_provider_accounts SET status = 'connected', last_error = NULL, "
+                "last_synced_at = now(), updated_at = now() "
+                "WHERE id = :id AND namespace = :namespace"
+            )
+        ),
         {"id": account_id, "namespace": normalize_namespace(namespace)},
     )
 
