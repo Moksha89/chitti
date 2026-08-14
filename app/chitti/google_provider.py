@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import base64
+import importlib
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 GOOGLE_SCOPES = (
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -62,11 +63,17 @@ class GoogleReadProvider(Protocol):
 class GoogleApiProvider:
     def __init__(self, client_config: dict[str, Any], refresh_token: str) -> None:
         try:
-            from google.oauth2.credentials import Credentials
-            from googleapiclient.discovery import build  # type: ignore[import-untyped]
+            credentials_type = cast(
+                Any,
+                importlib.import_module("google.oauth2.credentials").Credentials,
+            )
+            build = cast(
+                Any,
+                importlib.import_module("googleapiclient.discovery").build,
+            )
         except ImportError as exc:
             raise GoogleProviderError("Google client libraries are not installed") from exc
-        self.credentials = Credentials(
+        self.credentials = credentials_type(
             token=None,
             refresh_token=refresh_token,
             token_uri="https://oauth2.googleapis.com/token",
@@ -175,9 +182,11 @@ class GoogleApiProvider:
 
     def revoke(self) -> None:
         try:
-            from google.auth.transport.requests import Request
-
-            response = Request().session.post(
+            request_type = cast(
+                Any,
+                importlib.import_module("google.auth.transport.requests").Request,
+            )
+            response = request_type().session.post(
                 "https://oauth2.googleapis.com/revoke",
                 data={"token": self.credentials.refresh_token},
                 timeout=20,
