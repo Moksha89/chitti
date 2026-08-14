@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .runner_access import derived_sync_grants, runner_source_texts
+from .runner_access import derived_sync_grants, owned_sequences, runner_source_texts
 
 
 def sync_source_texts() -> list[str]:
@@ -27,19 +27,5 @@ async def reconcile_sync_privileges(conn: Any, role: str = "chitti_google_sync")
         for privilege in privileges:
             await conn.execute(f'GRANT {privilege} ON TABLE "{table}" TO "{role}"')
         if "INSERT" in privileges:
-            columns = await conn.fetch(
-                "SELECT a.attname AS column_name FROM pg_attribute a "
-                "JOIN pg_class c ON c.oid = a.attrelid "
-                "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE n.nspname = 'public' AND c.relname = $1 "
-                "AND a.attnum > 0 AND NOT a.attisdropped",
-                table,
-            )
-            for column in columns:
-                sequence = await conn.fetchval(
-                    "SELECT pg_get_serial_sequence('public.' || $1, $2)",
-                    table,
-                    column["column_name"],
-                )
-                if sequence:
-                    await conn.execute(f'GRANT USAGE, SELECT ON SEQUENCE "{sequence}" TO "{role}"')
+            for sequence in await owned_sequences(conn, table):
+                await conn.execute(f'GRANT USAGE, SELECT ON {sequence} TO "{role}"')
