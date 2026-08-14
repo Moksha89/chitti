@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -11,7 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Protocol, cast
+from typing import IO, TYPE_CHECKING, Protocol, TypedDict, cast
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,6 +47,7 @@ from .previews import copy_export, remove_preview
 from .provider import (
     CODER_ROUTE,
     REVIEWER_ROUTE,
+    VISION_ROUTE,
     ModelCompletion,
     ModelProvider,
     ModelToolCall,
@@ -72,6 +74,8 @@ MAX_FILE_REWRITES_WITHOUT_COMMAND = 4
 MODEL_TOOL_CALL_BUDGET = 240
 MAX_FILE_WRITES_WITHOUT_COMMAND = 24
 REQUIRED_GATE_COMMANDS = ("build", "test", "export")
+VISUAL_REVIEW_MAX_CYCLES = 2
+VISUAL_REVIEW_SPEND_CAP_USD = 0.10
 
 
 class RunBudgetExceeded(RuntimeError):
@@ -88,6 +92,19 @@ class RunCancelled(RuntimeError):
 
 class ModelProgressError(RuntimeError):
     """The model loop stopped because it was not making useful progress."""
+
+
+class VisualReviewInconclusive(RuntimeError):
+    """The poster could not reach a trustworthy visual verdict."""
+
+
+class VisualState(TypedDict):
+    cycles: int
+    cost: float
+    tokens: int
+    accounted_cost: float
+    accounted_tokens: int
+    last_failed_digest: str | None
 
 
 class GateEvidenceContradiction(ModelProgressError):
@@ -645,6 +662,34 @@ class DockerSandboxDispatcher:
         writes = 0
         operation_index = 1
         completed_commands: set[str] = set()
+        visual_state: VisualState = {
+            "cycles": 0,
+            "cost": 0.0,
+            "tokens": 0,
+            "accounted_cost": 0.0,
+            "accounted_tokens": 0,
+            "last_failed_digest": None,
+        }
+        visual_brief = "\n".join(
+            [revision.document.title]
+            + [f"{item.title}: {item.description}" for item in revision.document.tasks]
+        )
+
+        def account_visual_spend() -> None:
+            nonlocal spent, spent_tokens
+            visual_cost = visual_state["cost"] - visual_state["accounted_cost"]
+            visual_tokens = visual_state["tokens"] - visual_state["accounted_tokens"]
+            if not visual_cost and not visual_tokens:
+                return
+            spent += visual_cost
+            spent_tokens += visual_tokens
+            visual_state["accounted_cost"] = visual_state["cost"]
+            visual_state["accounted_tokens"] = visual_state["tokens"]
+            if spent > limits.model_spend_usd:
+                raise RunBudgetExceeded("model spend")
+            if spent_tokens > limits.model_tokens:
+                raise RunBudgetExceeded("model token")
+
         for task in revision.document.tasks:
             await self._task_event(run_id, task.id, "running", task.title)
             file_write_counts: dict[str, int] = {}
@@ -897,8 +942,10 @@ class DockerSandboxDispatcher:
                                             run_id, task.id, operation_index, tool,
                                             arguments, workspace, limits, route,
                                             policy, job_config, brand_profile,
+                                            visual_state, visual_brief,
                                         )
                                     )
+                                    account_visual_spend()
                                     self._raise_if_cancelled(run_id)
                                     writes += written
                                     if writes > limits.model_write_bytes:
@@ -926,6 +973,11 @@ class DockerSandboxDispatcher:
                                         )
                                     elif tool == "capture_screenshot":
                                         completed_commands.add("capture_screenshot")
+                                    elif tool == "visual_critique":
+                                        if result_text.startswith("VISUAL_REVIEW_PASS"):
+                                            completed_commands.add("visual-review")
+                                        else:
+                                            completed_commands.discard("visual-review")
                                     elif tool == "write_file":
                                         path = str(arguments.get("path", ""))
                                         if _source_path_invalidates_gates(path):
@@ -957,9 +1009,15 @@ class DockerSandboxDispatcher:
                                         )
                                     )
                                 except Exception as exc:
+                                    account_visual_spend()
                                     if self._is_cancelled(run_id):
                                         raise RunCancelled from exc
-                                    if isinstance(exc, ModelProgressError | RunBudgetExceeded):
+                                    if isinstance(
+                                        exc,
+                                        ModelProgressError
+                                        | RunBudgetExceeded
+                                        | VisualReviewInconclusive,
+                                    ):
                                         await self._task_event(
                                             run_id, task.id, "failed", str(exc)[:1000]
                                         )
@@ -1095,7 +1153,9 @@ class DockerSandboxDispatcher:
                     result_text, written, operation_index = await self._execute_model_tool(
                         run_id, task.id, operation_index, tool, arguments,
                         workspace, limits, route, policy, job_config, brand_profile,
+                        visual_state, visual_brief,
                     )
+                    account_visual_spend()
                     self._raise_if_cancelled(run_id)
                     writes += written
                     if writes > limits.model_write_bytes:
@@ -1122,6 +1182,11 @@ class DockerSandboxDispatcher:
                         )
                     elif tool == "capture_screenshot":
                         completed_commands.add("capture_screenshot")
+                    elif tool == "visual_critique":
+                        if result_text.startswith("VISUAL_REVIEW_PASS"):
+                            completed_commands.add("visual-review")
+                        else:
+                            completed_commands.discard("visual-review")
                     elif tool == "write_file":
                         path = str(arguments.get("path", ""))
                         if _source_path_invalidates_gates(path):
@@ -1147,9 +1212,15 @@ class DockerSandboxDispatcher:
                     else:
                         await record_inspection_turn()
                 except Exception as exc:
+                    account_visual_spend()
                     if self._is_cancelled(run_id):
                         raise RunCancelled from exc
-                    if isinstance(exc, ModelProgressError | RunBudgetExceeded):
+                    if isinstance(
+                        exc,
+                        ModelProgressError
+                        | RunBudgetExceeded
+                        | VisualReviewInconclusive,
+                    ):
                         await self._task_event(
                             run_id, task.id, "failed", str(exc)[:1000]
                         )
@@ -1307,6 +1378,8 @@ class DockerSandboxDispatcher:
         policy: JobTypePolicy = WEBSITE_POLICY,
         job_config: dict[str, object] | None = None,
         brand_profile: BrandProfile | None = None,
+        visual_state: VisualState | None = None,
+        visual_brief: str = "",
     ) -> tuple[str, int, int]:
         job_config = job_config or {}
         if tool == "list_files":
@@ -1316,6 +1389,23 @@ class DockerSandboxDispatcher:
             path = _confined_path(workspace, str(arguments.get("path", "")))
             maximum = min(int(cast(int, arguments.get("max_bytes", 65536))), 65536)
             return path.read_bytes()[:maximum].decode("utf-8", errors="replace"), 0, operation_index
+        if tool == "visual_critique":
+            if not policy.is_poster:
+                raise ValueError("visual critique is only available to poster jobs")
+            if route != CODER_ROUTE:
+                raise ValueError("only the coder route may request visual critique")
+            if visual_state is None:
+                raise ValueError("visual critique state was not initialized")
+            return await self._visual_critique(
+                run_id,
+                task_id,
+                operation_index,
+                workspace,
+                limits,
+                visual_state,
+                visual_brief,
+                brand_profile,
+            )
         if tool == "write_file":
             if route != CODER_ROUTE:
                 raise ValueError("reviewer route cannot write files")
@@ -1460,6 +1550,171 @@ class DockerSandboxDispatcher:
         if tool == "finish":
             return str(arguments.get("summary", "")), 0, operation_index
         raise ValueError(f"unknown model tool: {tool}")
+
+    async def _visual_critique(
+        self,
+        run_id: int,
+        task_id: str,
+        iteration: int,
+        workspace: Path,
+        limits: WorkerLimits,
+        visual_state: VisualState,
+        brief: str,
+        brand_profile: BrandProfile | None,
+    ) -> tuple[str, int, int]:
+        if visual_state["cycles"] >= VISUAL_REVIEW_MAX_CYCLES:
+            raise VisualReviewInconclusive(
+                f"visual review exceeded {VISUAL_REVIEW_MAX_CYCLES} critique cycles"
+            )
+        image_path = workspace / "artifacts" / "poster.png"
+        if not image_path.is_file():
+            raise ValueError("visual critique requires a captured artifacts/poster.png")
+        image = image_path.read_bytes()
+        if not image:
+            raise ValueError("visual critique requires a non-empty poster PNG")
+        if len(image) > 5 * 1024 * 1024:
+            raise VisualReviewInconclusive("visual critique PNG exceeds provider size limit")
+        image_digest = hashlib.sha256(image).hexdigest()
+        width, height = _png_dimensions(image)
+        generated_asset_count = len(list((workspace / "out" / "generated").glob("*.png")))
+        profile_fields: dict[str, object] = (
+            {
+                "brand_colors": brand_profile.brand_colors,
+                "typography": brand_profile.typography,
+                "poster_formats": brand_profile.poster_formats,
+                "do_not_use": brand_profile.do_not_use,
+            }
+            if brand_profile is not None
+            else {}
+        )
+        profile = json.dumps(profile_fields)
+        review_instruction = (
+            "Return exactly one JSON object with exactly these top-level fields: "
+            "verdict, image_sha256, criteria, findings, summary, evidence_limitations. "
+            "verdict must be pass or fail. image_sha256 must exactly match the supplied "
+            "image digest. criteria must contain exactly these keys: fixture_text, "
+            "visual_hierarchy, readability, generated_imagery, brand_constraints; "
+            "each value must be pass or fail. findings must be a list of objects with "
+            "criterion, issue, and action fields. A fail requires at least one actionable "
+            "finding tied to a failed criterion. Do not use markdown fences. Do not "
+            "claim certainty beyond what the image shows."
+        )
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": review_instruction},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"POSTER BRIEF:\n{brief}\n\nBRAND PROFILE:\n{profile}\n\n"
+                            f"IMAGE SHA-256: {image_digest}\n"
+                            f"IMAGE DIMENSIONS: {width}x{height}\n"
+                            f"GENERATED ASSET COUNT: {generated_asset_count}\n"
+                            "Judge this exact captured PNG against the brief."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": (
+                                "data:image/png;base64,"
+                                + base64.b64encode(image).decode("ascii")
+                            )
+                        },
+                    },
+                ],
+            },
+        ]
+        persisted_messages = [
+            messages[0],
+            {
+                "role": "user",
+                "content": (
+                    f"POSTER BRIEF:\n{brief}\n\nBRAND PROFILE:\n{profile}\n\n"
+                    f"IMAGE PATH: artifacts/poster.png\n"
+                    f"IMAGE SHA-256: {image_digest}\n"
+                    f"IMAGE BYTE SIZE: {len(image)}\n"
+                    f"IMAGE DIMENSIONS: {width}x{height}\n"
+                    f"GENERATED ASSET COUNT: {generated_asset_count}\n"
+                    "The PNG bytes were sent ephemerally and are not stored in this prompt."
+                ),
+            },
+        ]
+        assert self.model_provider is not None
+        visual_state["cycles"] += 1
+        try:
+            completion = await self.model_provider.agent_completion(messages, VISION_ROUTE)
+        except ModelTransportError as exc:
+            raise VisualReviewInconclusive(
+                f"visual critique provider accounting failed: {exc}"
+            ) from exc
+        visual_state["cost"] += completion.cost_usd
+        visual_state["tokens"] += completion.total_tokens
+        if visual_state["cost"] > VISUAL_REVIEW_SPEND_CAP_USD:
+            raise RunBudgetExceeded("visual model spend")
+        if "data:image" in completion.content.lower() or "base64" in completion.content.lower():
+            raise VisualReviewInconclusive(
+                "visual critique response contained image data"
+            )
+        await self._record_model_call(
+            run_id,
+            task_id,
+            iteration,
+            VISION_ROUTE,
+            completion,
+            kind="visual_critique",
+            prompt=json.dumps(persisted_messages, separators=(",", ":")),
+        )
+        try:
+            verdict = json.loads(completion.content)
+        except json.JSONDecodeError as exc:
+            raise VisualReviewInconclusive(
+                f"visual critique returned invalid JSON: {exc}"
+            ) from exc
+        parsed = _parse_visual_verdict(verdict, image_digest)
+        if generated_asset_count == 0 and parsed["verdict"] == "pass":
+            parsed = {
+                **parsed,
+                "verdict": "fail",
+                "criteria": {
+                    **cast(dict[str, str], parsed["criteria"]),
+                    "generated_imagery": "fail",
+                },
+                "findings": [
+                    *cast(list[dict[str, str]], parsed["findings"]),
+                    {
+                        "criterion": "generated_imagery",
+                        "issue": "No authoritative generated image asset was present.",
+                        "action": "Use generate-images and compose one of its assets into the poster.",
+                    },
+                ],
+                "summary": "Generated imagery is required but no generated asset was present.",
+            }
+        if parsed["verdict"] == "fail":
+            if visual_state["last_failed_digest"] == image_digest:
+                raise VisualReviewInconclusive(
+                    "visual critique failed without a new rendered image digest"
+                )
+            visual_state["last_failed_digest"] = image_digest
+            if visual_state["cycles"] >= VISUAL_REVIEW_MAX_CYCLES:
+                raise VisualReviewInconclusive(
+                    "visual critique remained failing after the maximum repair cycles"
+                )
+            await self._event(
+                run_id,
+                "visual_review_failed",
+                json.dumps(parsed, separators=(",", ":"))[:4000],
+                task_id=task_id,
+            )
+            return "VISUAL_REVIEW_FAIL\n" + json.dumps(parsed), 0, iteration
+        await self._event(
+            run_id,
+            "visual_review_passed",
+            json.dumps(parsed, separators=(",", ":"))[:4000],
+            task_id=task_id,
+        )
+        return "VISUAL_REVIEW_PASS\n" + json.dumps(parsed), 0, iteration
 
     async def _review_run(
         self, run_id: int, revision: PlanRevision, limits: WorkerLimits,
@@ -2881,6 +3136,89 @@ def _task_done_checks(
     return not _missing_gate_evidence(completed_commands, required_gates)
 
 
+def _png_dimensions(content: bytes) -> tuple[int, int]:
+    if content[:8] != b"\x89PNG\r\n\x1a\n" or len(content) < 24:
+        raise VisualReviewInconclusive("visual critique requires a valid PNG")
+    return int.from_bytes(content[16:20], "big"), int.from_bytes(content[20:24], "big")
+
+
+def _parse_visual_verdict(value: object, image_digest: str) -> dict[str, object]:
+    criteria_names = (
+        "fixture_text",
+        "visual_hierarchy",
+        "readability",
+        "generated_imagery",
+        "brand_constraints",
+    )
+    if not isinstance(value, dict):
+        raise VisualReviewInconclusive("visual critique returned a non-object verdict")
+    expected = {
+        "verdict",
+        "image_sha256",
+        "criteria",
+        "findings",
+        "summary",
+        "evidence_limitations",
+    }
+    if set(value) != expected:
+        raise VisualReviewInconclusive("visual critique returned incomplete fields")
+    if value.get("image_sha256") != image_digest:
+        raise VisualReviewInconclusive("visual critique image digest did not match")
+    verdict = value.get("verdict")
+    if verdict not in {"pass", "fail"}:
+        raise VisualReviewInconclusive("visual critique returned an ambiguous verdict")
+    criteria = value.get("criteria")
+    if (
+        not isinstance(criteria, dict)
+        or set(criteria) != set(criteria_names)
+        or any(criteria[name] not in {"pass", "fail"} for name in criteria_names)
+    ):
+        raise VisualReviewInconclusive("visual critique criteria were incomplete")
+    findings = value.get("findings")
+    if not isinstance(findings, list):
+        raise VisualReviewInconclusive("visual critique findings were not a list")
+    normalized_findings: list[dict[str, str]] = []
+    for finding in findings:
+        if not isinstance(finding, dict) or set(finding) != {"criterion", "issue", "action"}:
+            raise VisualReviewInconclusive("visual critique finding was incomplete")
+        criterion = finding["criterion"]
+        issue = finding["issue"]
+        action = finding["action"]
+        if (
+            criterion not in criteria_names
+            or not isinstance(issue, str)
+            or not issue.strip()
+            or not isinstance(action, str)
+            or not action.strip()
+        ):
+            raise VisualReviewInconclusive("visual critique finding was not actionable")
+        normalized_findings.append(
+            {"criterion": criterion, "issue": issue, "action": action}
+        )
+    if verdict == "fail":
+        failed_criteria = {name for name in criteria_names if criteria[name] == "fail"}
+        if not any(item["criterion"] in failed_criteria for item in normalized_findings):
+            raise VisualReviewInconclusive(
+                "visual critique failure had no actionable failed criterion"
+            )
+    summary = value.get("summary")
+    limitations = value.get("evidence_limitations")
+    if not isinstance(summary, str) or not summary.strip():
+        raise VisualReviewInconclusive("visual critique summary was missing")
+    if not isinstance(limitations, list) or any(
+        not isinstance(item, str) for item in limitations
+    ):
+        raise VisualReviewInconclusive("visual critique limitations were invalid")
+    return {
+        "verdict": verdict,
+        "image_sha256": image_digest,
+        "criteria": {name: criteria[name] for name in criteria_names},
+        "findings": normalized_findings,
+        "summary": summary,
+        "evidence_limitations": limitations,
+    }
+
+
 def _record_gate_command(evidence: set[str], command: str) -> None:
     if command == "sync-lockfile":
         evidence.clear()
@@ -2890,6 +3228,7 @@ def _record_gate_command(evidence: set[str], command: str) -> None:
         "export",
         "poster-export",
         "capture_screenshot",
+        "visual-review",
     }:
         evidence.add(command)
 
@@ -3090,9 +3429,13 @@ def _model_system_prompt(
             f"artifact {approved['artifact']} at width {approved['width']}, height "
             f"{approved['height']}, and device scale {approved['scale']}. These "
             "capture numbers are binding; do not raise the scale. A poster capture "
-            "does not need a route argument. The reviewer can inspect source facts "
-            "and dimensions, not "
-            "visual quality, which requires owner approval.\n"
+            "does not need a route argument. After capture, call visual_critique. "
+            "A visual critique is required before finish; if it fails, make a real "
+            "workspace edit, rerun poster-export, capture_screenshot, and call "
+            "visual_critique again. The host critique is bound to the exact PNG "
+            "digest and cannot be reused after a render change. The reviewer can "
+            "inspect source facts and dimensions, not visual quality, which still "
+            "requires owner approval.\n"
             "Generated imagery is available through the host-only generate-images "
             "allowlisted operation. First write image_manifest.json with only these "
             "fields per image: id, purpose, prompt, negative_prompt, width, height, "

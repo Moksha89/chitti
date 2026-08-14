@@ -11,9 +11,19 @@ logger = logging.getLogger(__name__)
 
 CODER_ROUTE = "coder"
 REVIEWER_ROUTE = "reviewer"
-REQUIRED_GATEWAY_ROUTES = frozenset({CODER_ROUTE, REVIEWER_ROUTE})
+BULK_ROUTE = "bulk"
+VISION_ROUTE = "vision"
+DEPLOYMENT_GATEWAY_ROUTES = frozenset(
+    {"chitti-chat", "planner", CODER_ROUTE, REVIEWER_ROUTE, BULK_ROUTE, VISION_ROUTE}
+)
+REQUIRED_GATEWAY_ROUTES = frozenset(
+    {CODER_ROUTE, REVIEWER_ROUTE, BULK_ROUTE, VISION_ROUTE}
+)
 CODER_MAX_OUTPUT_TOKENS = 32768
 REVIEWER_MAX_OUTPUT_TOKENS = 4096
+VISION_MAX_OUTPUT_TOKENS = 1024
+VISION_INPUT_COST_PER_TOKEN = 0.00000004
+VISION_OUTPUT_COST_PER_TOKEN = 0.0000004
 MODEL_GATEWAY_TIMEOUT_SECONDS = 600
 MODEL_CLIENT_TIMEOUT_SECONDS = 660
 
@@ -77,7 +87,7 @@ class ModelToolCall:
 
 
 class ModelProvider(Protocol):
-    async def validate_gateway(self) -> None: ...
+    async def validate_gateway(self, probe_routes: bool = False) -> None: ...
 
     async def chat(self, system: str, messages: list[dict[str, object]], role: str) -> str: ...
 
@@ -172,7 +182,7 @@ class LiteLLMProvider:
         self.url = self.base_url + "/v1/chat/completions"
         self.api_key = api_key
 
-    async def validate_gateway(self) -> None:
+    async def validate_gateway(self, probe_routes: bool = False) -> None:
         if not self.api_key.strip():
             raise GatewayMisconfigurationError("gateway credential is missing")
         try:
@@ -211,6 +221,22 @@ class LiteLLMProvider:
             raise GatewayMisconfigurationError(
                 f"gateway routes unavailable: {', '.join(missing)}"
             )
+        if not probe_routes:
+            return
+        for route in sorted(REQUIRED_GATEWAY_ROUTES):
+            try:
+                completion = await self.agent_completion(
+                    [{"role": "user", "content": "Return exactly OK."}],
+                    route,
+                )
+            except Exception as exc:
+                raise GatewayMisconfigurationError(
+                    f"gateway route failed during preflight: {route}"
+                ) from exc
+            if completion.total_tokens < 1:
+                raise GatewayMisconfigurationError(
+                    f"gateway route returned no usage during preflight: {route}"
+                )
 
     async def _completion(self, messages: list[dict[str, object]], role: str) -> str:
         return (await self.agent_completion(messages, role)).content
@@ -229,6 +255,8 @@ class LiteLLMProvider:
             "max_tokens": (
                 REVIEWER_MAX_OUTPUT_TOKENS
                 if role == "reviewer"
+                else VISION_MAX_OUTPUT_TOKENS
+                if role == VISION_ROUTE
                 else CODER_MAX_OUTPUT_TOKENS
             ),
         }
@@ -271,7 +299,28 @@ class LiteLLMProvider:
             if isinstance(completion_details, dict)
             else 0
         )
-        cost = body.get("cost", response.headers.get("x-litellm-response-cost", 0.0))
+        raw_cost = body.get("cost", response.headers.get("x-litellm-response-cost"))
+        if raw_cost is None:
+            if role != VISION_ROUTE:
+                cost = 0.0
+            elif prompt_tokens + completion_tokens < 1:
+                raise ModelTransportError(
+                    "gateway response did not include usable model cost"
+                )
+            else:
+                cost = (
+                    prompt_tokens * VISION_INPUT_COST_PER_TOKEN
+                    + completion_tokens * VISION_OUTPUT_COST_PER_TOKEN
+                )
+        else:
+            try:
+                cost = float(raw_cost)
+            except (TypeError, ValueError) as exc:
+                raise ModelTransportError(
+                    "gateway response contained invalid model cost"
+                ) from exc
+        if role == VISION_ROUTE and cost <= 0:
+            raise ModelTransportError("vision response did not include usable model cost")
         return ModelCompletion(
             content=content if isinstance(content, str) else "",
             model=str(body.get("model", role)),
@@ -404,7 +453,7 @@ class LiteLLMProvider:
 
 
 class FakeProvider:
-    async def validate_gateway(self) -> None:
+    async def validate_gateway(self, probe_routes: bool = False) -> None:
         return
 
     async def chat(self, system: str, messages: list[dict[str, object]], role: str) -> str:

@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import importlib.util
+import json
 import subprocess
 import urllib.request
 from datetime import UTC, datetime
@@ -8,12 +10,18 @@ from pathlib import Path
 
 import pytest
 
+from chitti.brand_profiles import BrandProfile
+from chitti.job_types import POSTER_POLICY
 from chitti.plans import PlanDocument, PlanRevision
+from chitti.provider import ModelCompletion
 from chitti.worker import (
     DockerSandboxDispatcher,
     FixedOperation,
+    VisualReviewInconclusive,
     WorkerLimits,
     _model_tool_progress_detail,
+    _parse_visual_verdict,
+    _task_done_checks,
     fixed_operations,
 )
 
@@ -41,6 +49,186 @@ def revision() -> PlanRevision:
         created_at=datetime.now(UTC),
         parent_revision_id=None,
     )
+
+
+def _visual_png() -> bytes:
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+        b"\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+
+def _visual_verdict(digest: str, verdict: str = "pass") -> str:
+    return json.dumps(
+        {
+            "verdict": verdict,
+            "image_sha256": digest,
+            "criteria": {
+                "fixture_text": verdict,
+                "visual_hierarchy": verdict,
+                "readability": verdict,
+                "generated_imagery": verdict,
+                "brand_constraints": verdict,
+            },
+            "findings": (
+                []
+                if verdict == "pass"
+                else [
+                    {
+                        "criterion": "readability",
+                        "issue": "Text is too small.",
+                        "action": "Increase the fixture text size.",
+                    }
+                ]
+            ),
+            "summary": "Visual review completed.",
+            "evidence_limitations": [],
+        }
+    )
+
+
+def test_visual_verdict_is_digest_bound_and_strict() -> None:
+    digest = hashlib.sha256(b"poster").hexdigest()
+    parsed = _parse_visual_verdict(
+        json.loads(_visual_verdict(digest)),
+        digest,
+    )
+    assert parsed["image_sha256"] == digest
+    with pytest.raises(VisualReviewInconclusive, match="digest"):
+        _parse_visual_verdict(json.loads(_visual_verdict(digest)), "different")
+    malformed = json.loads(_visual_verdict(digest))
+    del malformed["criteria"]
+    with pytest.raises(VisualReviewInconclusive, match="incomplete"):
+        _parse_visual_verdict(malformed, digest)
+
+
+def test_visual_pass_cannot_rescue_deterministic_poster_gates() -> None:
+    assert not _task_done_checks(
+        {"visual-review"},
+        POSTER_POLICY.required_gates,
+    )
+
+
+@pytest.mark.asyncio
+async def test_visual_critique_persists_reference_without_base64_and_rebinds_digest(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "artifacts" / "poster.png"
+    image.parent.mkdir()
+    image.write_bytes(_visual_png())
+    generated = tmp_path / "out" / "generated"
+    generated.mkdir(parents=True)
+    (generated / "stadium.png").write_bytes(_visual_png())
+    prompts: list[str] = []
+
+    class Provider:
+        async def agent_completion(self, messages, role, tools=None, tool_choice=None):
+            content = messages[1]["content"]
+            text = content[0]["text"]
+            digest = text.split("IMAGE SHA-256: ", 1)[1].splitlines()[0]
+            return ModelCompletion(
+                content=_visual_verdict(digest),
+                model="fake:vision",
+                prompt_tokens=10,
+                completion_tokens=10,
+                total_tokens=20,
+                cost_usd=0.001,
+            )
+
+    dispatcher = object.__new__(DockerSandboxDispatcher)
+    dispatcher.model_provider = Provider()
+    dispatcher._event = lambda *args, **kwargs: asyncio.sleep(0)
+
+    async def record(*args, **kwargs):
+        prompts.append(kwargs["prompt"])
+
+    dispatcher._record_model_call = record
+    state = {
+        "cycles": 0,
+        "cost": 0.0,
+        "tokens": 0,
+        "accounted_cost": 0.0,
+        "accounted_tokens": 0,
+        "last_failed_digest": None,
+    }
+    profile = BrandProfile(
+        namespace="shared",
+        brand_colors=("#112233",),
+        typography="Inter",
+        poster_formats=("1080x1350",),
+        audience="private audience",
+        voice="private voice",
+        do_not_use=("real player likenesses",),
+        updated_by="owner",
+        updated_at=datetime.now(UTC),
+    )
+    first = await dispatcher._visual_critique(
+        1, "task", 1, tmp_path, WorkerLimits(), state, "fixture brief", profile
+    )
+    image.write_bytes(_visual_png() + b"changed")
+    second = await dispatcher._visual_critique(
+        1, "task", 2, tmp_path, WorkerLimits(), state, "fixture brief", profile
+    )
+    assert first[0].startswith("VISUAL_REVIEW_PASS")
+    assert second[0].startswith("VISUAL_REVIEW_PASS")
+    assert len(prompts) == 2
+    assert all("base64" not in prompt for prompt in prompts)
+    assert prompts[0] != prompts[1]
+    assert "#112233" in prompts[0]
+    assert "Inter" in prompts[0]
+    assert "1080x1350" in prompts[0]
+    assert "real player likenesses" in prompts[0]
+    assert "private audience" not in prompts[0]
+    assert "private voice" not in prompts[0]
+    assert state["cycles"] == 2
+
+
+@pytest.mark.asyncio
+async def test_visual_critique_caps_two_failing_cycles(tmp_path: Path) -> None:
+    image = tmp_path / "artifacts" / "poster.png"
+    image.parent.mkdir()
+    image.write_bytes(_visual_png())
+    generated = tmp_path / "out" / "generated"
+    generated.mkdir(parents=True)
+    (generated / "stadium.png").write_bytes(_visual_png())
+
+    class Provider:
+        async def agent_completion(self, messages, role, tools=None, tool_choice=None):
+            text = messages[1]["content"][0]["text"]
+            digest = text.split("IMAGE SHA-256: ", 1)[1].splitlines()[0]
+            return ModelCompletion(
+                content=_visual_verdict(digest, "fail"),
+                model="fake:vision",
+                prompt_tokens=10,
+                completion_tokens=10,
+                total_tokens=20,
+                cost_usd=0.001,
+            )
+
+    dispatcher = object.__new__(DockerSandboxDispatcher)
+    dispatcher.model_provider = Provider()
+    dispatcher._event = lambda *args, **kwargs: asyncio.sleep(0)
+    dispatcher._record_model_call = lambda *args, **kwargs: asyncio.sleep(0)
+    state = {
+        "cycles": 0,
+        "cost": 0.0,
+        "tokens": 0,
+        "accounted_cost": 0.0,
+        "accounted_tokens": 0,
+        "last_failed_digest": None,
+    }
+    await dispatcher._visual_critique(
+        1, "task", 1, tmp_path, WorkerLimits(), state, "fixture brief", None
+    )
+    image.write_bytes(_visual_png() + b"changed")
+    with pytest.raises(VisualReviewInconclusive, match="maximum repair cycles"):
+        await dispatcher._visual_critique(
+            1, "task", 2, tmp_path, WorkerLimits(), state, "fixture brief", None
+        )
+    assert state["cycles"] == 2
 
 
 def test_worker_limits_are_recorded_as_explicit_sandbox_contract() -> None:

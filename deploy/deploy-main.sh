@@ -162,7 +162,7 @@ if missing_gateway_routes="$(
     'import json
 import os
 import sys
-from chitti.provider import REQUIRED_GATEWAY_ROUTES
+from chitti.provider import DEPLOYMENT_GATEWAY_ROUTES
 
 try:
     payload = json.loads(os.environ["CHITTI_GATEWAY_MODELS_JSON"])
@@ -174,7 +174,7 @@ model_ids = {
     for item in payload.get("data", [])
     if isinstance(item, dict) and "id" in item
 }
-print("\n".join(sorted(REQUIRED_GATEWAY_ROUTES - model_ids)))' \
+print("\n".join(sorted(DEPLOYMENT_GATEWAY_ROUTES - model_ids)))' \
     2>"${gateway_assertion_error}"
 )"; then
   :
@@ -195,6 +195,29 @@ if [[ -n "${missing_gateway_routes}" ]]; then
   exit 1
 fi
 echo "Gateway loaded-route assertions passed."
+for gateway_route in chitti-chat planner coder reviewer bulk vision; do
+  gateway_probe="$(
+    curl --fail --silent --show-error --max-time 30 \
+      -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+      -H "Content-Type: application/json" \
+      "http://127.0.0.1:${LITELLM_PORT:-4000}/v1/chat/completions" \
+      --data "{\"model\":\"${gateway_route}\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly OK.\"}],\"max_tokens\":1}"
+  )" || {
+    echo "gateway route probe failed: ${gateway_route}" >&2
+    exit 1
+  }
+  if ! printf '%s' "${gateway_probe}" | docker run --rm -i --entrypoint python "${runner_image}" -c \
+    'import json
+import sys
+payload = json.load(sys.stdin)
+choices = payload.get("choices")
+if not isinstance(choices, list) or not choices:
+    raise SystemExit("gateway response contained no choices")'; then
+    echo "gateway route probe returned an invalid response: ${gateway_route}" >&2
+    exit 1
+  fi
+done
+echo "Gateway route response probes passed."
 
 caddy_container="$(docker compose ps -q caddy)"
 [[ -n "${caddy_container}" ]]

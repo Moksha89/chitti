@@ -28,7 +28,7 @@ WEBSITE_POLICY = JobTypePolicy(
 )
 POSTER_POLICY = JobTypePolicy(
     POSTER_JOB,
-    ("poster-export", "capture_screenshot"),
+    ("poster-export", "capture_screenshot", "visual-review"),
     ("poster-export", "generate-images"),
 )
 

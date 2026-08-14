@@ -57,7 +57,7 @@ MODEL_TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
                 "type": "object",
                 "properties": {
                     "name": {
-                        "type": "string",
+                    "type": "string",
                         "enum": [
                             "sync-lockfile",
                             "install",
@@ -71,6 +71,21 @@ MODEL_TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
                     "args": {"type": "array", "items": {}},
                 },
                 "required": ["name"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "visual_critique",
+            "description": (
+                "Have the host inspect the authoritative captured poster PNG "
+                "against the brief. Use only after poster-export and capture_screenshot."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
                 "additionalProperties": False,
             },
         },
