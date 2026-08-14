@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy import text
 
 from .db import Database
-from .google_crypto import CredentialCipher
+from .google_crypto import CredentialCipher, CredentialError
 from .google_provider import (
     GoogleApiProvider,
     GoogleCursorInvalid,
@@ -38,11 +38,26 @@ async def sync_account(
             return
         try:
             cipher = CredentialCipher(settings.google_credentials_key)
-            client_config = json.loads(cipher.decrypt(str(credential["client_config_ciphertext"])))
-            refresh_token = cipher.decrypt(str(credential["refresh_token_ciphertext"]))
+            try:
+                client_config = json.loads(
+                    cipher.decrypt(str(credential["client_config_ciphertext"]))
+                )
+                refresh_token = cipher.decrypt(
+                    str(credential["refresh_token_ciphertext"])
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CredentialError("Stored Google credentials are invalid") from exc
             provider = provider_factory(client_config, refresh_token)
-            await _sync_gmail(database, account, provider, settings.google_recent_mail_days, settings.google_initial_mail_limit)
-            await _sync_calendar(database, account, provider, settings.google_calendar_window_days)
+            await _sync_gmail(
+                database,
+                account,
+                provider,
+                settings.google_recent_mail_days,
+                settings.google_initial_mail_limit,
+            )
+            await _sync_calendar(
+                database, account, provider, settings.google_calendar_window_days
+            )
             await mark_account_synced(session, account_id, namespace)
             await session.execute(
                 sync_sql(text(
@@ -50,14 +65,14 @@ async def sync_account(
                     "(component, status, detail, first_failed_at, last_failed_at, "
                     "consecutive_failures, resolved_at, last_succeeded_at) "
                     "VALUES ('google_sync', 'healthy', 'Google sync completed', "
-                    "now(), NULL, 0, now(), now()) "
+                    "now(), now(), 0, now(), now()) "
                     "ON CONFLICT (component) DO UPDATE SET status = 'healthy', "
                     "detail = EXCLUDED.detail, consecutive_failures = 0, "
                     "resolved_at = now(), last_succeeded_at = now()"
                 ))
             )
             await session.commit()
-        except (GoogleProviderError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (GoogleProviderError, CredentialError) as exc:
             await mark_account_failure(session, account_id, namespace, str(exc))
             await session.execute(
                 sync_sql(text(
@@ -98,7 +113,9 @@ async def _sync_gmail(
     if history_id is None and after is None:
         after = datetime.now(UTC) - timedelta(days=recent_days)
     try:
-        newest, messages = provider.gmail_messages(history_id, after, initial_limit)
+        newest, messages = await asyncio.to_thread(
+            provider.gmail_messages, history_id, after, initial_limit
+        )
     except GoogleCursorInvalid:
         async with database.sessions() as session:
             await session.execute(
@@ -115,8 +132,11 @@ async def _sync_gmail(
                 },
             )
             await session.commit()
-        newest, messages = provider.gmail_messages(
-            None, datetime.now(UTC) - timedelta(days=recent_days), initial_limit
+        newest, messages = await asyncio.to_thread(
+            provider.gmail_messages,
+            None,
+            datetime.now(UTC) - timedelta(days=recent_days),
+            initial_limit,
         )
     async with database.sessions() as session:
         for message in messages:
@@ -173,12 +193,18 @@ async def _sync_calendar(
         )
         token = result.scalar_one()
     try:
-        next_token, events = provider.calendar_events(
-            token, datetime.now(UTC), datetime.now(UTC) + timedelta(days=window_days)
+        next_token, events = await asyncio.to_thread(
+            provider.calendar_events,
+            token,
+            datetime.now(UTC),
+            datetime.now(UTC) + timedelta(days=window_days),
         )
     except GoogleCursorInvalid:
-        next_token, events = provider.calendar_events(
-            None, datetime.now(UTC), datetime.now(UTC) + timedelta(days=window_days)
+        next_token, events = await asyncio.to_thread(
+            provider.calendar_events,
+            None,
+            datetime.now(UTC),
+            datetime.now(UTC) + timedelta(days=window_days),
         )
     async with database.sessions() as session:
         for event in events:

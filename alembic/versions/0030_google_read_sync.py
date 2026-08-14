@@ -4,8 +4,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0029_google_read_sync"
-down_revision = "0028_plan_job_intent"
+revision = "0030_google_read_sync"
+down_revision = "0029_generated_images"
 branch_labels = None
 depends_on = None
 
