@@ -157,7 +157,7 @@ declared_app_settings="$(
   docker run --rm --entrypoint python "${runner_image}" -c '
 from chitti.settings import Settings
 
-fields = getattr(Settings, "model_fields", None)
+fields = Settings.model_fields
 if not fields:
     raise SystemExit("Settings model fields are empty or unavailable")
 for field in sorted(fields):
