@@ -11,13 +11,18 @@ from sqlalchemy import text
 
 from .db import Database
 from .google_crypto import CredentialCipher, CredentialError
+from .google_email import has_send_scope, pending_actions, send_pending_action
 from .google_provider import (
     GoogleApiProvider,
     GoogleCursorInvalid,
     GoogleProviderError,
     GoogleReadProvider,
 )
-from .google_store import credential_for_account, mark_account_failure, mark_account_synced
+from .google_store import (
+    sync_credential_for_account,
+    sync_mark_account_failure,
+    sync_mark_account_synced,
+)
 from .runner_access import sync_sql
 from .settings import get_settings
 
@@ -33,7 +38,7 @@ async def sync_account(
     account_id = int(account["id"])
     namespace = str(account["namespace"])
     async with database.sessions() as session:
-        credential = await credential_for_account(session, account_id, namespace)
+        credential = await sync_credential_for_account(session, account_id, namespace)
         if credential is None:
             return
         try:
@@ -58,7 +63,14 @@ async def sync_account(
             await _sync_calendar(
                 database, account, provider, settings.google_calendar_window_days
             )
-            await mark_account_synced(session, account_id, namespace)
+            if has_send_scope(account.get("scopes", [])):
+                async with database.sessions() as action_session:
+                    action_ids = await pending_actions(
+                        action_session, account_id, namespace
+                    )
+                for action_id in action_ids:
+                    await send_pending_action(database, account, provider, action_id)
+            await sync_mark_account_synced(session, account_id, namespace)
             await session.execute(
                 sync_sql(text(
                     "INSERT INTO runner_health "
@@ -73,7 +85,7 @@ async def sync_account(
             )
             await session.commit()
         except (GoogleProviderError, CredentialError) as exc:
-            await mark_account_failure(session, account_id, namespace, str(exc))
+            await sync_mark_account_failure(session, account_id, namespace, str(exc))
             await session.execute(
                 sync_sql(text(
                     "INSERT INTO runner_health "
@@ -250,7 +262,7 @@ async def sync_forever(database: Database) -> None:
         async with database.sessions() as session:
             result = await session.execute(
                 sync_sql(text(
-                    "SELECT id, namespace FROM google_provider_accounts "
+                    "SELECT id, namespace, scopes FROM google_provider_accounts "
                     "WHERE status IN ('connected', 'error') ORDER BY id"
                 ))
             )

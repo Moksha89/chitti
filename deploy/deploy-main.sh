@@ -492,7 +492,8 @@ BEGIN
     'promotion_approvals', 'previews'
     , 'google_provider_accounts', 'google_oauth_credentials',
     'google_sync_state', 'google_gmail_messages', 'google_calendar_events',
-    'google_account_audit'
+    'google_account_audit', 'google_email_actions',
+    'google_email_action_approvals'
   ] LOOP
     IF to_regclass('public.' || required_table) IS NULL THEN
       RAISE EXCEPTION 'missing required table %', required_table;
@@ -519,7 +520,9 @@ BEGIN
     'reject_promotion_approval_mutation_trigger',
     'reject_preview_mutation_trigger',
     'chat_transcript_entries_immutable'
-    , 'reject_google_account_audit_mutation_trigger'
+    , 'reject_google_account_audit_mutation_trigger',
+    'reject_google_email_action_mutation_trigger',
+    'reject_google_email_approval_mutation_trigger'
   ] LOOP
     IF NOT EXISTS (
       SELECT 1 FROM pg_trigger

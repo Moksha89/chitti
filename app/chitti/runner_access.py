@@ -50,6 +50,8 @@ SENSITIVE_RUNNER_TABLES = frozenset(
         "google_gmail_messages",
         "google_calendar_events",
         "google_account_audit",
+        "google_email_actions",
+        "google_email_action_approvals",
         "session_store",
     }
 )
@@ -251,6 +253,8 @@ def derived_sync_grants(
         "google_gmail_messages",
         "google_calendar_events",
         "runner_health",
+        "google_email_actions",
+        "google_email_action_approvals",
     }
     unexpected = sorted(set(required) - allowed)
     if unexpected:

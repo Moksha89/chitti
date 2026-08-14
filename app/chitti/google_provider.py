@@ -3,16 +3,19 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from datetime import datetime
+from email.message import EmailMessage
 from typing import Any, Protocol, cast
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-GOOGLE_SCOPES = (
+GOOGLE_READ_SCOPES = (
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/calendar.events.readonly",
 )
+GOOGLE_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+GOOGLE_SCOPES = GOOGLE_READ_SCOPES + (GOOGLE_SEND_SCOPE,)
 
 
 class GoogleProviderError(RuntimeError):
@@ -61,6 +64,8 @@ class GoogleReadProvider(Protocol):
     ) -> tuple[str | None, list[CalendarEvent]]: ...
 
     def revoke(self) -> None: ...
+
+    def send_email(self, action: dict[str, Any]) -> str: ...
 
 
 class GoogleApiProvider:
@@ -200,6 +205,36 @@ class GoogleApiProvider:
                 raise GoogleProviderError("Google token revocation was rejected")
         except Exception as exc:
             raise GoogleProviderError("Google token revocation failed") from exc
+
+    def send_email(self, action: dict[str, Any]) -> str:
+        message = EmailMessage()
+        message["To"] = ", ".join(str(value) for value in action["to_recipients"])
+        if action["cc_recipients"]:
+            message["Cc"] = ", ".join(str(value) for value in action["cc_recipients"])
+        if action["bcc_recipients"]:
+            message["Bcc"] = ", ".join(str(value) for value in action["bcc_recipients"])
+        message["Subject"] = str(action["subject"])
+        message.set_content(str(action["body"]))
+        attachments = cast(list[dict[str, Any]], action["attachments"])
+        if attachments:
+            raise GoogleProviderError(
+                "Email attachments are recorded but their content is not available"
+            )
+        encoded = base64.urlsafe_b64encode(message.as_bytes()).decode().rstrip("=")
+        try:
+            response = cast(
+                dict[str, Any],
+                self.gmail.users()
+                .messages()
+                .send(userId="me", body={"raw": encoded})
+                .execute(),
+            )
+        except Exception as exc:
+            raise GoogleProviderError("Google email send failed") from exc
+        message_id = response.get("id")
+        if not message_id:
+            raise GoogleProviderError("Google email send returned no message id")
+        return str(message_id)
 
 
 def _decode_body(payload: dict[str, Any]) -> str | None:

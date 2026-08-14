@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -13,8 +15,21 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 from testcontainers.postgres import PostgresContainer
 
 from chitti.google_crypto import CredentialCipher
-from chitti.google_oauth import OAuthStateStore
-from chitti.google_provider import GOOGLE_SCOPES, GoogleCursorInvalid
+from chitti.google_email import (
+    action_for_namespace,
+    create_action,
+    list_actions,
+    record_approval,
+    send_pending_action,
+)
+from chitti.google_oauth import OAuthStateStore, authorization_url, validate_scopes
+from chitti.google_provider import (
+    GOOGLE_READ_SCOPES,
+    GOOGLE_SCOPES,
+    GoogleApiProvider,
+    GoogleCursorInvalid,
+    GoogleProviderError,
+)
 from chitti.google_store import (
     account_for_namespace,
     account_summary,
@@ -150,11 +165,79 @@ def test_oauth_state_is_single_use_and_bound_to_csrf_and_namespace() -> None:
         states.consume(state, "csrf-token")
 
 
-def test_google_contract_is_read_only() -> None:
-    assert GOOGLE_SCOPES == (
+def test_google_contract_is_read_and_send_only() -> None:
+    assert GOOGLE_READ_SCOPES == (
         "https://www.googleapis.com/auth/gmail.readonly",
         "https://www.googleapis.com/auth/calendar.events.readonly",
     )
+    assert GOOGLE_SCOPES == GOOGLE_READ_SCOPES + (
+        "https://www.googleapis.com/auth/gmail.send",
+    )
+    validate_scopes(list(GOOGLE_SCOPES))
+    with pytest.raises(ValueError, match="outside"):
+        validate_scopes([*GOOGLE_READ_SCOPES, "https://www.googleapis.com/auth/gmail.modify"])
+
+
+def test_google_authorization_requests_send_scope(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    class FlowStub:
+        redirect_uri = ""
+
+        @classmethod
+        def from_client_config(cls, _config, scopes, state=None):
+            seen["scopes"] = scopes
+            seen["state"] = state
+            return cls()
+
+        def authorization_url(self, **_kwargs):
+            return "https://example.test/oauth", None
+
+    monkeypatch.setattr("chitti.google_oauth.Flow", FlowStub)
+    authorization_url(
+        SimpleNamespace(
+            google_client_id="id",
+            google_client_secret="secret",
+            google_oauth_redirect_uri="https://example.test/callback",
+        ),
+        "state",
+    )
+    assert seen["scopes"] == list(GOOGLE_SCOPES)
+
+
+def test_google_provider_builds_exact_mime_payload() -> None:
+    captured: dict[str, object] = {}
+
+    class SendRequest:
+        def execute(self):
+            return {"id": "provider-id"}
+
+    class Messages:
+        def send(self, **kwargs):
+            captured.update(kwargs)
+            return SendRequest()
+
+    class Users:
+        def messages(self):
+            return Messages()
+
+    provider = object.__new__(GoogleApiProvider)
+    provider.gmail = SimpleNamespace(users=lambda: Users())
+    action = {
+        "to_recipients": ["to@example.com"],
+        "cc_recipients": ["cc@example.com"],
+        "bcc_recipients": ["bcc@example.com"],
+        "subject": "Exact subject",
+        "body": "Exact body",
+        "attachments": [],
+    }
+    assert provider.send_email(action) == "provider-id"
+    raw = base64.urlsafe_b64decode(str(captured["body"]["raw"]) + "===")
+    assert b"To: to@example.com" in raw
+    assert b"Cc: cc@example.com" in raw
+    assert b"Bcc: bcc@example.com" in raw
+    assert b"Subject: Exact subject" in raw
+    assert b"Exact body" in raw
 
 
 def test_sync_grants_are_limited_to_google_sync_tables() -> None:
@@ -166,6 +249,8 @@ def test_sync_grants_are_limited_to_google_sync_tables() -> None:
             "google_gmail_messages",
             "google_calendar_events",
             "runner_health",
+            "google_email_actions",
+            "google_email_action_approvals",
         }
     )
 
@@ -176,6 +261,8 @@ def test_sync_grants_are_limited_to_google_sync_tables() -> None:
         "google_gmail_messages",
         "google_calendar_events",
         "runner_health",
+        "google_email_actions",
+        "google_email_action_approvals",
     }
 
 
@@ -289,3 +376,184 @@ async def test_revoked_token_status_requires_reconnect(google_database) -> None:
     assert summary is not None
     assert summary["status"] == "error"
     assert "reconnect needed" in str(summary["last_error"])
+
+
+@pytest.mark.asyncio
+@db_test
+async def test_email_action_approval_sends_once_and_records_provider_id(google_database) -> None:
+    account_id = await _account(google_database, "jsv-fashion", "jsv@example.com")
+    async with google_database.begin() as session:
+        action_id = await create_action(
+            session,
+            namespace="jsv-fashion",
+            account_id=account_id,
+            to_recipients=["recipient@example.com"],
+            cc_recipients=[],
+            bcc_recipients=[],
+            subject="Exact subject",
+            body="Exact body",
+            attachments=[{"name": "brief.txt", "size": 12, "sha256": "a" * 64}],
+            requested_by="owner",
+        )
+        action = await action_for_namespace(session, action_id, "jsv-fashion")
+        assert action is not None
+        await record_approval(
+            session,
+            action,
+            decision="approved",
+            reason=None,
+            approved_by="owner",
+        )
+    calls: list[dict[str, Any]] = []
+
+    class SendProvider:
+        def send_email(self, action: dict[str, Any]) -> str:
+            calls.append(action)
+            return "provider-message-1"
+
+    account = {
+        "id": account_id,
+        "namespace": "jsv-fashion",
+        "scopes": list(GOOGLE_SCOPES),
+    }
+    await send_pending_action(google_database, account, SendProvider(), action_id)
+    with pytest.raises(GoogleProviderError, match="already executed"):
+        await send_pending_action(google_database, account, SendProvider(), action_id)
+    assert len(calls) == 1
+    async with google_database.begin() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT state, provider_message_id FROM google_email_actions WHERE id = :id"
+                ),
+                {"id": action_id},
+            )
+        ).one()
+    assert row == ("sent", "provider-message-1")
+
+
+@pytest.mark.asyncio
+@db_test
+async def test_email_action_requires_approval_and_rejects_tampering(google_database) -> None:
+    account_id = await _account(google_database, "andhrawala", "andhra@example.com")
+    async with google_database.begin() as session:
+        action_id = await create_action(
+            session,
+            namespace="andhrawala",
+            account_id=account_id,
+            to_recipients=["recipient@example.com"],
+            cc_recipients=[],
+            bcc_recipients=[],
+            subject="Subject",
+            body="Body",
+            attachments=[],
+            requested_by="owner",
+        )
+    account = {"id": account_id, "namespace": "andhrawala", "scopes": list(GOOGLE_SCOPES)}
+
+    class SendProvider:
+        def send_email(self, action: dict[str, Any]) -> str:
+            raise AssertionError("unapproved action was sent")
+
+    with pytest.raises(GoogleProviderError, match="unapproved"):
+        await send_pending_action(google_database, account, SendProvider(), action_id)
+    async with google_database.begin() as session:
+        action = await action_for_namespace(session, action_id, "andhrawala")
+        assert action is not None
+        await record_approval(
+            session,
+            action,
+            decision="approved",
+            reason=None,
+            approved_by="owner",
+        )
+        await session.execute(
+            text(
+                "ALTER TABLE google_email_actions "
+                "DISABLE TRIGGER reject_google_email_action_mutation_trigger"
+            )
+        )
+        await session.execute(
+            text("UPDATE google_email_actions SET body = 'tampered' WHERE id = :id"),
+            {"id": action_id},
+        )
+        await session.execute(text("ALTER TABLE google_email_actions ENABLE TRIGGER reject_google_email_action_mutation_trigger"))
+    with pytest.raises(GoogleProviderError, match="content hash mismatch"):
+        await send_pending_action(google_database, account, SendProvider(), action_id)
+
+
+@pytest.mark.asyncio
+@db_test
+async def test_email_approval_expiry_and_namespace_isolation(google_database) -> None:
+    first = await _account(google_database, "pj-digi", "pj@example.com")
+    second = await _account(google_database, "vsports", "vsports@example.com")
+    async with google_database.begin() as session:
+        action_id = await create_action(
+            session,
+            namespace="pj-digi",
+            account_id=first,
+            to_recipients=["recipient@example.com"],
+            cc_recipients=[],
+            bcc_recipients=[],
+            subject="Subject",
+            body="Body",
+            attachments=[],
+            requested_by="owner",
+        )
+        action = await action_for_namespace(session, action_id, "pj-digi")
+        assert action is not None
+        await record_approval(
+            session,
+            action,
+            decision="approved",
+            reason=None,
+            approved_by="owner",
+            expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        )
+        assert await action_for_namespace(session, action_id, "vsports") is None
+        assert len(await list_actions(session, "pj-digi")) == 1
+        assert await list_actions(session, "vsports") == []
+    account = {"id": first, "namespace": "pj-digi", "scopes": list(GOOGLE_SCOPES)}
+    with pytest.raises(GoogleProviderError, match="expired"):
+        await send_pending_action(google_database, account, object(), action_id)
+    assert second != first
+
+
+@pytest.mark.asyncio
+@db_test
+async def test_missing_send_scope_requires_reconnect(google_database) -> None:
+    account_id = await _account(google_database, "general", "owner@example.com")
+    async with google_database.begin() as session:
+        action_id = await create_action(
+            session,
+            namespace="general",
+            account_id=account_id,
+            to_recipients=["recipient@example.com"],
+            cc_recipients=[],
+            bcc_recipients=[],
+            subject="Subject",
+            body="Body",
+            attachments=[],
+            requested_by="owner",
+        )
+    account = {"id": account_id, "namespace": "general", "scopes": list(GOOGLE_READ_SCOPES)}
+    with pytest.raises(GoogleProviderError, match="reconnect needed"):
+        await send_pending_action(google_database, account, object(), action_id)
+
+
+@pytest.mark.asyncio
+@db_test
+async def test_old_connection_is_visible_as_reconnect_needed(google_database) -> None:
+    account_id = await _account(google_database, "general", "owner@example.com")
+    async with google_database.begin() as session:
+        await session.execute(
+            text(
+                "UPDATE google_provider_accounts SET scopes = CAST(:scopes AS jsonb) "
+                "WHERE id = :id"
+            ),
+            {"scopes": json.dumps(list(GOOGLE_READ_SCOPES)), "id": account_id},
+        )
+        summary = await account_summary(session, "general")
+    assert summary is not None
+    assert summary["status"] == "reconnect_needed"
+    assert "predates Gmail send permission" in str(summary["reconnect_reason"])

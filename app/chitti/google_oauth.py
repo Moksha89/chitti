@@ -10,6 +10,11 @@ from .google_provider import GOOGLE_SCOPES
 from .settings import Settings
 
 
+def validate_scopes(scopes: list[str]) -> None:
+    if set(scopes) != set(GOOGLE_SCOPES):
+        raise ValueError("Google returned scopes outside the read-and-send contract")
+
+
 class OAuthStateStore:
     def __init__(self) -> None:
         self._states: dict[str, tuple[str, str, float]] = {}
