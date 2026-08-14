@@ -599,6 +599,7 @@ async def test_model_write_budget_and_command_allowlist(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_poster_capture_enforces_approved_dimensions_and_scale(tmp_path: Path) -> None:
     dispatcher = object.__new__(DockerSandboxDispatcher)
+    dispatcher.database = object()
     limits = WorkerLimits()
     approved = {"artifact": "poster.html", "width": 1080, "height": 1350, "scale": 1}
     container_calls: list[object] = []

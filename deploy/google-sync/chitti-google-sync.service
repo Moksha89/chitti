@@ -1,0 +1,23 @@
+[Unit]
+Description=Chitti host-side Google read synchronization
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/chitti/app
+EnvironmentFile=/etc/chitti/google-sync.env
+Environment=PYTHONPATH=/opt/chitti/app
+ExecStart=/opt/chitti-runner/bin/python -m chitti.google_sync
+Restart=on-failure
+RestartSec=15s
+StandardOutput=journal
+StandardError=journal
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

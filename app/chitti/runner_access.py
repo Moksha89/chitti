@@ -44,6 +44,12 @@ SENSITIVE_RUNNER_TABLES = frozenset(
         "memory_namespaces",
         "provider_credentials",
         "provider_keys",
+        "google_oauth_credentials",
+        "google_provider_accounts",
+        "google_sync_state",
+        "google_gmail_messages",
+        "google_calendar_events",
+        "google_account_audit",
         "session_store",
     }
 )
@@ -54,6 +60,10 @@ def application_only_sql(statement: Any) -> Any:
 
 
 def runner_sql(statement: Any) -> Any:
+    return statement
+
+
+def sync_sql(statement: Any) -> Any:
     return statement
 
 
@@ -225,6 +235,26 @@ def derived_grants(
         application_only_privileges(source_texts, known_tables),
         runner_privileges(source_texts, known_tables),
     )
+    return required
+
+
+def derived_sync_grants(
+    source_texts: list[str], known_tables: set[str]
+) -> dict[str, set[str]]:
+    required = _declared_privileges(source_texts, "sync_sql", known_tables)
+    if not required:
+        raise SystemExit("Google sync privilege derivation produced no table expectations")
+    allowed = {
+        "google_provider_accounts",
+        "google_oauth_credentials",
+        "google_sync_state",
+        "google_gmail_messages",
+        "google_calendar_events",
+        "runner_health",
+    }
+    unexpected = sorted(set(required) - allowed)
+    if unexpected:
+        raise SystemExit("Google sync reached unexpected tables: " + ", ".join(unexpected))
     return required
 
 

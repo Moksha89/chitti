@@ -17,6 +17,14 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .brand_profiles import BrandProfile, available_font_families, get_brand_profile
+from .image_generation import (
+    ImageBudgetExceeded,
+    ImageManifestRefused,
+    ImageProviderFailure,
+    ImageProviderUnavailable,
+    generate_manifest_images,
+    verify_export_assets,
+)
 from .job_types import (
     WEBSITE_POLICY,
     JobTypePolicy,
@@ -69,9 +77,9 @@ REQUIRED_GATE_COMMANDS = ("build", "test", "export")
 class RunBudgetExceeded(RuntimeError):
     """A run-level budget ended execution and must not be retried by the model."""
 
-    def __init__(self, budget: str) -> None:
+    def __init__(self, budget: str, detail: str | None = None) -> None:
         self.budget = budget
-        super().__init__(f"{budget} budget exceeded")
+        super().__init__(detail or f"{budget} budget exceeded")
 
 
 class RunCancelled(RuntimeError):
@@ -323,6 +331,8 @@ class WorkerLimits:
     model_tokens: int = 500000
     model_write_bytes: int = 2 * 1024 * 1024
     model_spend_usd: float = 0.75
+    image_spend_usd: float = 0.05
+    image_request_count: int = 6
     run_timeout_seconds: int = 7200
 
     def as_json(self) -> dict[str, object]:
@@ -341,6 +351,8 @@ class WorkerLimits:
             "model_tokens": self.model_tokens,
             "model_write_bytes": self.model_write_bytes,
             "model_spend_usd": self.model_spend_usd,
+            "image_spend_usd": self.image_spend_usd,
+            "image_request_count": self.image_request_count,
             "run_timeout_seconds": self.run_timeout_seconds,
             "network_policy": "public_egress_default_bridge",
             "non_root_uid": 65532,
@@ -366,6 +378,8 @@ class WorkerLimits:
             model_tokens=int(cast(int, values.get("model_tokens", 500000))),
             model_write_bytes=int(cast(int, values.get("model_write_bytes", 2 * 1024 * 1024))),
             model_spend_usd=float(cast(float, values.get("model_spend_usd", 0.75))),
+            image_spend_usd=float(cast(float, values.get("image_spend_usd", 0.05))),
+            image_request_count=int(cast(int, values.get("image_request_count", 6))),
             run_timeout_seconds=int(cast(int, values.get("run_timeout_seconds", 7200))),
         )
 
@@ -407,6 +421,11 @@ MODEL_COMMANDS: dict[str, tuple[str, tuple[str, ...], str]] = {
             "python3",
             "/opt/validate_poster.py",
         ),
+        "none",
+    ),
+    "generate-images": (
+        "generate-images",
+        ("sh", "-c", "test -f /workspace/image_manifest.json"),
         "none",
     ),
 }
@@ -1192,6 +1211,15 @@ class DockerSandboxDispatcher:
         )
         if diff_result.returncode:
             raise RuntimeError(diff_err[-1000:] or "git diff failed")
+        if policy.is_poster:
+            verify_operation = FixedOperation(
+                "runner",
+                "poster-export-assets",
+                (),
+            )
+            await self._verify_poster_assets(
+                run_id, workspace, verify_operation, operation_index + 1
+            )
         await self._operation(
             run_id, diff, operation_index, "passed", _diff_out, diff_err,
             diff_result.returncode, datetime.now(UTC),
@@ -1213,6 +1241,15 @@ class DockerSandboxDispatcher:
             )
         staging = self.preview_staging_root / str(run_id)
         try:
+            if revision.job_type == "poster":
+                verify_operation = FixedOperation(
+                    "runner",
+                    "poster-preview-assets",
+                    (),
+                )
+                await self._verify_poster_assets(
+                    run_id, workspace, verify_operation, 0
+                )
             manifest = await asyncio.to_thread(copy_export, export_root, staging)
             async with self.database.sessions() as session:
                 artifacts = await session.execute(
@@ -1328,6 +1365,10 @@ class DockerSandboxDispatcher:
                 operation_index=operation_index + 1,
             )
             operation_index += 1
+            if policy.is_poster and result.returncode == 0:
+                await self._verify_poster_assets(
+                    run_id, workspace, operation, operation_index, stdout
+                )
             await self._operation(
                 run_id, operation, operation_index,
                 "passed" if result.returncode == 0 else "failed",
@@ -1346,8 +1387,54 @@ class DockerSandboxDispatcher:
                 raise ValueError("arbitrary command arguments are not allowed")
             if name not in policy.model_commands:
                 raise ValueError("unknown allowlisted command")
+            if name == "generate-images":
+                if not policy.is_poster:
+                    raise ValueError("generated images are only available to poster jobs")
+                started = datetime.now(UTC)
+                operation = FixedOperation(task_id, "generate-images", MODEL_COMMANDS[name][1])
+                await self._event(
+                    run_id, "operation_running", operation.name,
+                    operation_index=operation_index + 1, task_id=task_id,
+                )
+                try:
+                    detail = await generate_manifest_images(
+                        self.database, run_id, workspace, limits
+                    )
+                except ImageManifestRefused as exc:
+                    await self._operation(
+                        run_id, operation, operation_index + 1, "failed", "",
+                        str(exc)[:2000], 1, started,
+                    )
+                    raise
+                except (
+                    ImageBudgetExceeded,
+                    ImageProviderFailure,
+                    ImageProviderUnavailable,
+                ) as exc:
+                    await self._operation(
+                        run_id, operation, operation_index + 1, "failed", "",
+                        str(exc)[:2000], 1, started,
+                    )
+                    raise RunBudgetExceeded("image", str(exc)) from exc
+                except Exception as exc:
+                    await self._operation(
+                        run_id, operation, operation_index + 1, "failed", "",
+                        str(exc)[:2000], 1, started,
+                    )
+                    raise
+                operation_index += 1
+                await self._operation(
+                    run_id, operation, operation_index, "passed", detail, "",
+                    0, started,
+                )
+                await self._capture_generated_images(run_id, workspace, limits)
+                return detail, 0, operation_index
             op_name, command, network = MODEL_COMMANDS[name]
             operation = FixedOperation(task_id, op_name, command, network=network)
+            if name == "poster-export":
+                await self._verify_poster_assets(
+                    run_id, workspace, operation, operation_index + 1
+                )
             result, stdout, stderr = await self._run_container(
                 run_id,
                 self._docker_command(
@@ -1358,6 +1445,10 @@ class DockerSandboxDispatcher:
             )
             operation_index += 1
             status = "passed" if result.returncode == 0 else "failed"
+            if name == "poster-export" and result.returncode == 0:
+                await self._verify_poster_assets(
+                    run_id, workspace, operation, operation_index, stdout
+                )
             await self._operation(
                 run_id, operation, operation_index, status, stdout, stderr,
                 result.returncode, datetime.now(UTC),
@@ -1494,6 +1585,23 @@ class DockerSandboxDispatcher:
                 if name == "browser-errors.json":
                     item["content"] = path.read_text(encoding="utf-8")[:8000]
             facts.append(item)
+        generated_root = workspace / "out" / "generated"
+        if generated_root.is_dir():
+            for source in sorted(generated_root.glob("*")):
+                if not source.is_file():
+                    continue
+                raw = source.read_bytes()
+                item = {
+                    "path": str(source.relative_to(workspace)),
+                    "bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+                if raw[:8] == b"\x89PNG\r\n\x1a\n" and len(raw) >= 24:
+                    item["dimensions"] = {
+                        "width": int.from_bytes(raw[16:20], "big"),
+                        "height": int.from_bytes(raw[20:24], "big"),
+                    }
+                facts.append(item)
         for source in sorted((workspace / "out").rglob("*")) if (workspace / "out").is_dir() else ():
             if source.is_file() and source.suffix.lower() in {".html", ".css", ".svg"}:
                 facts.append(
@@ -2431,6 +2539,57 @@ class DockerSandboxDispatcher:
                 )
                 await session.commit()
 
+    async def _capture_generated_images(
+        self, run_id: int, workspace: Path, limits: WorkerLimits
+    ) -> None:
+        root = workspace / "out" / "generated"
+        if not root.is_dir():
+            return
+        for path in sorted(root.glob("*.png")):
+            if path.stat().st_size > limits.artifact_bytes:
+                continue
+            content = path.read_bytes()
+            async with self.database.sessions() as session:
+                artifact = await session.execute(
+                    text(
+                        "INSERT INTO worker_artifacts "
+                        "(run_id, kind, path, sha256, byte_size) "
+                        "VALUES (:run_id, 'generated_image', :path, :sha256, :size) "
+                        "RETURNING id"
+                    ),
+                    {
+                        "run_id": run_id,
+                        "path": str(path.relative_to(workspace)),
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                        "size": len(content),
+                    },
+                )
+                await session.execute(
+                    text(
+                        "INSERT INTO worker_artifact_payloads (artifact_id, content) "
+                        "VALUES (:artifact_id, :content)"
+                    ),
+                    {"artifact_id": int(artifact.scalar_one()), "content": content},
+                )
+                await session.commit()
+
+    async def _verify_poster_assets(
+        self,
+        run_id: int,
+        workspace: Path,
+        operation: FixedOperation,
+        operation_index: int,
+        stdout: str = "",
+    ) -> None:
+        try:
+            await verify_export_assets(self.database, run_id, workspace)
+        except ImageManifestRefused as exc:
+            await self._operation(
+                run_id, operation, operation_index, "failed", stdout,
+                str(exc)[:2000], 1, datetime.now(UTC),
+            )
+            raise RuntimeError(str(exc)) from exc
+
 
 class WorkerRunManager:
     def __init__(
@@ -2934,6 +3093,18 @@ def _model_system_prompt(
             "does not need a route argument. The reviewer can inspect source facts "
             "and dimensions, not "
             "visual quality, which requires owner approval.\n"
+            "Generated imagery is available through the host-only generate-images "
+            "allowlisted operation. First write image_manifest.json with only these "
+            "fields per image: id, purpose, prompt, negative_prompt, width, height, "
+            "optional seed, optional denoise, and optional reference to an existing "
+            "generated asset; then run generate-images. The host owns the ComfyUI "
+            "workflow and provider credentials, writes assets under out/generated, "
+            "and resolves image_manifest.resolved.json with real dimensions. The "
+            "image budget is "
+            f"{WorkerLimits().image_request_count} requests and "
+            f"${WorkerLimits().image_spend_usd:.2f}; cache hits do not rebill. "
+            "Undeclared local assets, remote URLs, data URLs, and runtime fetches "
+            "are refused. Never write workflow JSON or provider credentials.\n"
             f"BRAND PROFILE:\n{json.dumps(profile_data, default=str)}"
         )
     return (

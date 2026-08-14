@@ -33,6 +33,17 @@ from .briefings import compose_briefing
 from .db import Database
 from .diff_parser import parse_diff as _parse_diff
 from .embedding import FakeEmbedder, get_embedder
+from .google_crypto import CredentialCipher
+from .google_oauth import OAuthStateStore, authorization_url, exchange_code
+from .google_provider import GOOGLE_SCOPES, GoogleApiProvider, GoogleProviderError
+from .google_store import (
+    account_summary,
+    create_account,
+    credential_for_account,
+    disconnect_account,
+    recent_messages,
+    upcoming_events,
+)
 from .job_types import normalize_job_type, poster_config, poster_config_within_ceiling
 from .memory import (
     MemoryStore,
@@ -203,6 +214,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.worker_manager = WorkerRunManager(database)
     app.state.project_state = ProjectState(settings.project_root)
     app.state.auth = auth
+    app.state.google_oauth_states = OAuthStateStore()
     await app.state.plan_manager.resume_queued()
     try:
         yield
@@ -375,6 +387,9 @@ async def dashboard_context(
         notifications = await recent_notifications(database, namespace)
         brand_profile = await get_brand_profile(db_session, namespace)
         runner_health = await recent_runner_health(database)
+        google_account = await account_summary(db_session, namespace)
+        google_messages = await recent_messages(db_session, namespace)
+        google_events = await upcoming_events(db_session, namespace)
         for plan in plans:
             approval_result = await db_session.execute(
                 text(
@@ -440,6 +455,10 @@ async def dashboard_context(
         "brand_profile": brand_profile,
         "available_fonts": available_font_families(),
         "brand_error": request.query_params.get("brand_error"),
+        "google_account": google_account,
+        "google_messages": google_messages,
+        "google_events": google_events,
+        "google_error": request.query_params.get("google_error"),
     }
 
 
@@ -669,6 +688,90 @@ async def dashboard(request: Request) -> HTMLResponse | RedirectResponse:
         name="dashboard.html",
         context=await dashboard_context(request, session, requested_namespace(request)),
     )
+
+
+@app.post("/google/connect")
+async def google_connect(request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
+    settings: Settings = request.app.state.settings
+    if not settings.google_client_id or not settings.google_client_secret:
+        return RedirectResponse(f"/?namespace={namespace}&google_error=Google+OAuth+is+not+configured", status_code=303)
+    state = request.app.state.google_oauth_states.create(session.csrf_token, namespace)
+    return RedirectResponse(authorization_url(settings, state), status_code=303)
+
+
+@app.get("/google/callback")
+async def google_callback(request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    state = request.query_params.get("state", "")
+    code = request.query_params.get("code", "")
+    try:
+        namespace = request.app.state.google_oauth_states.consume(state, session.csrf_token)
+        if not code:
+            raise ValueError("Google authorization did not return a code")
+        token = exchange_code(request.app.state.settings, code)
+        if set(str(scope) for scope in token["scopes"]) != set(GOOGLE_SCOPES):
+            raise ValueError("Google returned scopes outside the read-only contract")
+        provider = GoogleApiProvider(token["client_config"], token["refresh_token"])
+        email = provider.account_email()
+        cipher = CredentialCipher(request.app.state.settings.google_credentials_key)
+        async with request.app.state.database.sessions() as db_session:
+            await create_account(
+                db_session,
+                namespace,
+                email,
+                None,
+                [str(scope) for scope in token["scopes"]],
+                cast(dict[str, object], token["client_config"]),
+                str(token["refresh_token"]),
+                cipher,
+            )
+            await db_session.commit()
+    except (ValueError, RuntimeError, GoogleProviderError) as exc:
+        logging.getLogger(__name__).warning("Google OAuth callback failed: %s", str(exc)[:200])
+        return RedirectResponse(
+            f"/?namespace={namespace if 'namespace' in locals() else SHARED_NAMESPACE}"
+            "&google_error=Google+connection+failed%3B+please+try+again",
+            status_code=303,
+        )
+    return RedirectResponse(f"/?namespace={namespace}&google_error=Google+connected", status_code=303)
+
+
+@app.post("/google/disconnect")
+async def google_disconnect(request: Request) -> RedirectResponse:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    _, session = result
+    form = await request.form()
+    require_csrf(request, session, str(form.get(CSRF_FIELD, "")))
+    namespace = requested_namespace(request, str(form.get("namespace", "")) or None)
+    account_id = int(str(form.get("account_id", "0")))
+    async with request.app.state.database.sessions() as db_session:
+        account = await account_summary(db_session, namespace)
+        if account is None or int(account["id"]) != account_id:
+            raise HTTPException(status_code=404, detail="Google account not found")
+        try:
+            credential = await credential_for_account(db_session, account_id, namespace)
+            if credential is not None:
+                cipher = CredentialCipher(request.app.state.settings.google_credentials_key)
+                config = json.loads(cipher.decrypt(str(credential["client_config_ciphertext"])))
+                token = cipher.decrypt(str(credential["refresh_token_ciphertext"]))
+                GoogleApiProvider(config, token).revoke()
+        except Exception:
+            logging.getLogger(__name__).warning("Google token revocation failed; deleting local credential")
+        await disconnect_account(db_session, account_id, namespace, session.username or "owner")
+        await db_session.commit()
+    return RedirectResponse(f"/?namespace={namespace}&google_error=Google+disconnected", status_code=303)
 
 
 @app.post("/reminders")

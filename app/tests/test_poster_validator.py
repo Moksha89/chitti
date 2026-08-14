@@ -45,3 +45,30 @@ def test_missing_colour_error_separates_declared_colours() -> None:
             {"freesans"},
             colors=("TRIAL TEAL", "TRIAL GOLD"),
         )
+
+
+def test_declared_relative_raster_asset_is_allowed() -> None:
+    MODULE.validate_poster_source(
+        '<img src="generated/stadium.png">'
+        '<style>.hero { background-image: url("generated/stadium.png"); }</style>',
+        {"freesans"},
+        assets={"generated/stadium.png"},
+    )
+
+
+def test_undeclared_relative_raster_asset_is_refused() -> None:
+    with pytest.raises(SystemExit, match="remote URL or runtime fetch"):
+        MODULE.validate_poster_source(
+            '<img src="generated/unknown.png">',
+            {"freesans"},
+            assets={"generated/stadium.png"},
+        )
+
+
+def test_undeclared_svg_image_href_is_refused() -> None:
+    with pytest.raises(SystemExit, match="remote URL or runtime fetch"):
+        MODULE.validate_poster_source(
+            '<svg><image href="generated/unknown.png"/></svg>',
+            {"freesans"},
+            assets={"generated/stadium.png"},
+        )
