@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
+import json
+import urllib.error
 from types import SimpleNamespace
 
 import pytest
@@ -10,12 +13,129 @@ import pytest
 from chitti.image_generation import (
     ImageBudgetExceeded,
     ImageManifestRefused,
+    ImageProviderFailure,
+    _call_runpod,
     _request_digest,
     _request_payload,
     generate_manifest_images,
     verify_export_assets,
 )
 from chitti.worker import DockerSandboxDispatcher, FixedOperation
+
+
+class _ProviderResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.content = json.dumps(payload).encode()
+        self.status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        pass
+
+    def read(self) -> bytes:
+        return self.content
+
+
+def test_runpod_polls_pending_job_until_completed(monkeypatch) -> None:
+    responses = iter(
+        [
+            _ProviderResponse({"id": "job-1", "status": "IN_QUEUE"}),
+            _ProviderResponse({"id": "job-1", "status": "COMPLETED", "output": {}}),
+        ]
+    )
+    calls = []
+    monkeypatch.setattr(
+        "chitti.image_generation.urllib.request.urlopen",
+        lambda request, timeout: calls.append(request) or next(responses),
+    )
+    monkeypatch.setattr("chitti.image_generation.time.sleep", lambda _seconds: None)
+
+    result = _call_runpod("endpoint", "secret-key", {"input": {}})
+
+    assert result["status"] == "COMPLETED"
+    assert len(calls) == 2
+    assert calls[1].full_url.endswith("/status/job-1")
+
+
+def test_runpod_terminal_failure_is_not_polled(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        "chitti.image_generation.urllib.request.urlopen",
+        lambda request, timeout: calls.append(request)
+        or _ProviderResponse(
+            {
+                "id": "job-2",
+                "status": "FAILED",
+                "error": {"code": "WORKER_FAILED", "message": "worker stopped"},
+            }
+        ),
+    )
+
+    with pytest.raises(ImageProviderFailure) as raised:
+        _call_runpod("endpoint", "secret-key", {"input": {}})
+
+    assert len(calls) == 1
+    assert raised.value.diagnostic["failure_class"] == "terminal provider failure"
+    assert raised.value.diagnostic["provider_error_code"] == "WORKER_FAILED"
+
+
+def test_runpod_http_error_preserves_safe_structured_evidence(monkeypatch) -> None:
+    body = io.BytesIO(
+        json.dumps(
+            {
+                "error": {
+                    "code": "RATE_LIMITED",
+                    "message": "see https://signed.example/image?sig=secret",
+                }
+            }
+        ).encode()
+    )
+    error = urllib.error.HTTPError(
+        "https://api.runpod.ai/v2/endpoint/runsync",
+        429,
+        "rate limited",
+        None,
+        body,
+    )
+    monkeypatch.setattr(
+        "chitti.image_generation.urllib.request.urlopen",
+        lambda request, timeout: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(ImageProviderFailure) as raised:
+        _call_runpod("endpoint", "secret-key", {"input": {}})
+
+    failure = raised.value
+    assert failure.diagnostic["failure_class"] == "http error"
+    assert failure.diagnostic["http_status"] == "429"
+    assert failure.diagnostic["provider_error_code"] == "RATE_LIMITED"
+    assert "<redacted-url>" in str(failure)
+    assert "secret-key" not in str(failure)
+    assert "Authorization" not in str(failure)
+    assert "signed.example" not in str(failure)
+
+
+def test_runpod_queue_timeout_is_distinct_and_keeps_job_id(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "chitti.image_generation.urllib.request.urlopen",
+        lambda request, timeout: _ProviderResponse(
+            {"id": "job-3", "status": "IN_QUEUE"}
+        ),
+    )
+    monotonic = iter([0.0, 601.0])
+    monkeypatch.setattr(
+        "chitti.image_generation.time.monotonic", lambda: next(monotonic)
+    )
+    monkeypatch.setattr("chitti.image_generation.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(ImageProviderFailure) as raised:
+        _call_runpod("endpoint", "secret-key", {"input": {}})
+
+    assert raised.value.diagnostic["failure_class"] == "queue timeout"
+    assert raised.value.diagnostic["provider_job_id"] == "job-3"
+    assert raised.value.diagnostic["http_status"] == "200"
 
 
 def test_image_request_owns_comfy_workflow_and_accepts_only_intent() -> None:

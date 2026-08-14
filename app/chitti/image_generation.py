@@ -4,6 +4,8 @@ import asyncio
 import base64
 import hashlib
 import json
+import re
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
@@ -19,6 +21,12 @@ WORKFLOW_TEMPLATE_ID = "sdxl-base-v1"
 WORKER_IMAGE = "runpod/worker-comfyui:5.8.6-sdxl"
 MAX_DIMENSION = 1024
 MAX_PROMPT = 4000
+RUNPOD_HTTP_TIMEOUT_SECONDS = 30
+RUNPOD_POLL_INTERVAL_SECONDS = 5
+# Ten minutes covers scale-to-zero SDXL cold starts while remaining bounded
+# well inside the runner's two-hour run deadline.
+RUNPOD_POLL_TIMEOUT_SECONDS = 600
+RUNPOD_PENDING_STATUSES = frozenset({"IN_QUEUE", "IN_PROGRESS"})
 
 
 class ImageManifestRefused(RuntimeError):
@@ -34,7 +42,60 @@ class ImageProviderUnavailable(RuntimeError):
 
 
 class ImageProviderFailure(RuntimeError):
-    pass
+    def __init__(
+        self,
+        detail: str | None = None,
+        *,
+        failure_class: str = "terminal provider failure",
+        endpoint: object = None,
+        provider_job_id: object = None,
+        provider_status: object = None,
+        http_status: object = None,
+        error_code: object = None,
+        error_message: object = None,
+    ) -> None:
+        self.diagnostic = {
+            "failure_class": failure_class,
+            "endpoint_id": endpoint,
+            "provider_job_id": _safe_value(provider_job_id),
+            "provider_status": _safe_value(provider_status),
+            "http_status": _safe_value(http_status),
+            "provider_error_code": _safe_value(error_code),
+            "provider_error_message": _safe_error_message(error_message or detail),
+        }
+        fields = [
+            f"{key}={value}"
+            for key, value in self.diagnostic.items()
+            if value not in (None, "")
+        ]
+        super().__init__("image provider request failed: " + " ".join(fields))
+
+
+def _safe_value(value: object) -> str | None:
+    if value is None:
+        return None
+    return re.sub(r"https?://\S+", "<redacted-url>", str(value))[:200]
+
+
+def _safe_error_message(value: object) -> str | None:
+    if value is None:
+        return None
+    message = str(value).replace("\n", " ").strip()
+    message = re.sub(r"https?://\S+", "<redacted-url>", message)
+    return message[:500] or None
+
+
+def _provider_error_fields(result: Mapping[str, Any]) -> tuple[object, object]:
+    error = result.get("error")
+    if isinstance(error, Mapping):
+        return (
+            error.get("code", error.get("type", error.get("error_code"))),
+            error.get("message", error.get("detail")),
+        )
+    return (
+        result.get("errorCode", result.get("error_code", result.get("code"))),
+        error or result.get("message"),
+    )
 
 
 def _png_size(raw: bytes) -> tuple[int, int]:
@@ -97,20 +158,89 @@ def _request_payload(item: Mapping[str, Any], seed: int, source_raw: bytes | Non
 
 
 def _call_runpod(endpoint: str, key: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def request_json(request: urllib.request.Request) -> tuple[dict[str, Any], int]:
+        try:
+            with urllib.request.urlopen(
+                request, timeout=RUNPOD_HTTP_TIMEOUT_SECONDS
+            ) as response:
+                return cast(dict[str, Any], json.load(response)), response.status
+        except urllib.error.HTTPError as exc:
+            try:
+                body = json.load(exc)
+            except (ValueError, OSError):
+                body = {}
+            if not isinstance(body, Mapping):
+                body = {}
+            error_code, error_message = _provider_error_fields(body)
+            raise ImageProviderFailure(
+                failure_class="http error",
+                endpoint=endpoint,
+                http_status=exc.code,
+                error_code=error_code,
+                error_message=error_message or exc.reason,
+            ) from exc
+        except (OSError, urllib.error.URLError, TimeoutError) as exc:
+            raise ImageProviderFailure(
+                failure_class="transport error",
+                endpoint=endpoint,
+                error_message=f"{type(exc).__name__}: {exc}",
+            ) from exc
+
     request = urllib.request.Request(
         f"https://api.runpod.ai/v2/{endpoint}/runsync",
         data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=900) as response:
-            result = cast(dict[str, Any], json.load(response))
-    except (OSError, urllib.error.URLError, TimeoutError) as exc:
-        raise ImageProviderFailure(f"image provider request failed: {exc}") from exc
-    if result.get("status") != "COMPLETED":
-        raise ImageProviderFailure(f"image provider request failed: {result.get('error', 'unknown error')}")
-    return result
+    result, http_status = request_json(request)
+    status = result.get("status")
+    provider_job_id = result.get("id")
+    if status == "COMPLETED":
+        return result
+    if status in RUNPOD_PENDING_STATUSES:
+        deadline = time.monotonic() + RUNPOD_POLL_TIMEOUT_SECONDS
+        while provider_job_id and time.monotonic() < deadline:
+            time.sleep(RUNPOD_POLL_INTERVAL_SECONDS)
+            status_request = urllib.request.Request(
+                f"https://api.runpod.ai/v2/{endpoint}/status/{provider_job_id}",
+                headers={"Authorization": f"Bearer {key}"},
+                method="GET",
+            )
+            result, http_status = request_json(status_request)
+            status = result.get("status")
+            if status == "COMPLETED":
+                return result
+            if status not in RUNPOD_PENDING_STATUSES:
+                error_code, error_message = _provider_error_fields(result)
+                raise ImageProviderFailure(
+                    failure_class="terminal provider failure",
+                    endpoint=endpoint,
+                    provider_job_id=provider_job_id,
+                    provider_status=status,
+                    http_status=http_status,
+                    error_code=error_code,
+                    error_message=error_message,
+                )
+        error_code, error_message = _provider_error_fields(result)
+        raise ImageProviderFailure(
+            failure_class="queue timeout",
+            endpoint=endpoint,
+            provider_job_id=provider_job_id,
+            provider_status=status,
+            http_status=http_status,
+            error_code=error_code,
+            error_message=error_message,
+        )
+    error_code, error_message = _provider_error_fields(result)
+    raise ImageProviderFailure(
+        failure_class="terminal provider failure",
+        endpoint=endpoint,
+        provider_job_id=provider_job_id,
+        provider_status=status,
+        http_status=http_status,
+        error_code=error_code,
+        error_message=error_message,
+    )
 
 
 def _digest(item: Mapping[str, Any], source_digest: str) -> str:
