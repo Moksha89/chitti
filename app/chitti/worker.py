@@ -54,6 +54,7 @@ from .provider import (
     ModelTransportError,
 )
 from .runner_access import application_only_sql, runner_sql
+from .settings import get_settings
 
 MAX_CAPTURE_ARTIFACTS_PER_RUN = 32
 LIVE_OUTPUT_FLUSH_BYTES = 16 * 1024
@@ -2881,6 +2882,12 @@ class WorkerRunManager:
                 else {}
             )
             if policy.is_poster:
+                settings = get_settings()
+                if not settings.runpod_api_key or not settings.runpod_endpoint_id:
+                    raise ValueError(
+                        "poster run not started: image generation is unavailable; "
+                        "RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID are not configured"
+                    )
                 profile = await get_brand_profile(session, revision.namespace)
                 if profile is None:
                     raise ValueError(

@@ -15,6 +15,11 @@ grep -Fq 'docker run --rm \' "${script}"
 ! grep -Fq '< <(printf '\''%s'\'' "${gateway_models}")' "${script}"
 grep -Fq 'response was not valid JSON' "${script}"
 grep -Fq 'gateway request was unreachable or failed' "${script}"
+grep -Fq 'from chitti.settings import Settings' "${script}"
+grep -Fq 'fields = Settings.model_fields' "${script}"
+grep -Fq 'Settings model fields are empty or unavailable' "${script}"
+grep -Fq 'could not derive application settings from the Settings model' "${script}"
+! grep -Fq 'required_app_settings=(' "${script}"
 gateway_input='{"data":[{"id":"chitti-chat"}]}'
 parsed_gateway_input="$(
   CHITTI_GATEWAY_MODELS_JSON="${gateway_input}" \
