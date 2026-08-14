@@ -493,5 +493,5 @@ async def generate_manifest_images(
     resolved_path.write_text(json.dumps({"images": resolved}, indent=2), encoding="utf-8")
     return (
         f"generated {len(resolved)} image(s); resolved manifest: "
-        "workspace/image_manifest.resolved.json"
+        "/workspace/image_manifest.resolved.json"
     )

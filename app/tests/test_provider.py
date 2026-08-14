@@ -7,6 +7,7 @@ import pytest
 from chitti.provider import (
     CODER_MAX_OUTPUT_TOKENS,
     MODEL_CALL_MAX_ATTEMPTS,
+    MODEL_CALL_MAX_RETRY_AFTER_SECONDS,
     MODEL_CLIENT_TIMEOUT_SECONDS,
     MODEL_GATEWAY_TIMEOUT_SECONDS,
     REVIEWER_MAX_OUTPUT_TOKENS,
@@ -388,6 +389,30 @@ def test_agent_completion_retries_429_and_honors_retry_after(monkeypatch) -> Non
     )
     assert calls == 2
     assert delays == [7.0]
+
+
+def test_agent_completion_refuses_retry_after_above_bound(monkeypatch) -> None:
+    calls = 0
+    requested_delay = MODEL_CALL_MAX_RETRY_AFTER_SECONDS + 1
+
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                429,
+                request=httpx.Request("POST", "http://gateway"),
+                headers={"Retry-After": str(requested_delay)},
+            )
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    with pytest.raises(ModelProviderError, match="exceeding Chitti's"):
+        asyncio.run(
+            LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+                [{"role": "user", "content": "work"}], "coder"
+            )
+        )
+    assert calls == 1
 
 
 def test_agent_completion_does_not_retry_other_4xx(monkeypatch) -> None:

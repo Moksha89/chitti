@@ -30,6 +30,7 @@ MODEL_GATEWAY_TIMEOUT_SECONDS = 600
 MODEL_CLIENT_TIMEOUT_SECONDS = 660
 MODEL_CALL_MAX_ATTEMPTS = 3
 MODEL_CALL_RETRY_BACKOFF_SECONDS = 1.0
+MODEL_CALL_MAX_RETRY_AFTER_SECONDS = 30.0
 
 
 class GatewayValidationError(RuntimeError):
@@ -422,7 +423,10 @@ class LiteLLMProvider:
                     ModelPolicyRefusal | ModelLimitRefusal | ModelCostConfigurationError,
                 )
                 if isinstance(exc, ModelHttpError):
-                    is_retryable = exc.status_code in {408, 429} or exc.status_code >= 500
+                    is_retryable = (
+                        exc.failure_class != "retry-after exceeds bound"
+                        and (exc.status_code in {408, 429} or exc.status_code >= 500)
+                    )
                 if not is_retryable or attempt == MODEL_CALL_MAX_ATTEMPTS:
                     if attempt == 1:
                         raise
@@ -496,11 +500,25 @@ class LiteLLMProvider:
                 if response.status_code in {408, 429}
                 else "http 4xx"
             )
+            retry_after_seconds = _retry_after_seconds(response)
+            if retry_after_seconds is not None and (
+                retry_after_seconds > MODEL_CALL_MAX_RETRY_AFTER_SECONDS
+            ):
+                raise ModelHttpError(
+                    (
+                        f"gateway requested Retry-After {retry_after_seconds:g}s, "
+                        f"exceeding Chitti's "
+                        f"{MODEL_CALL_MAX_RETRY_AFTER_SECONDS:g}s retry wait bound"
+                    ),
+                    failure_class="retry-after exceeds bound",
+                    status_code=response.status_code,
+                    retry_after_seconds=retry_after_seconds,
+                )
             raise ModelHttpError(
                 f"gateway returned HTTP {response.status_code}",
                 failure_class=failure_class,
                 status_code=response.status_code,
-                retry_after_seconds=_retry_after_seconds(response),
+                retry_after_seconds=retry_after_seconds,
             )
         if response.status_code >= 500:
             prompt_tokens, completion_tokens, total_tokens, cost_usd = (
