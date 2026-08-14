@@ -50,6 +50,7 @@ model_list:
 litellm_settings:
   drop_params: true
   request_timeout: 600
+  # Chitti owns bounded retry classification and accounting per model call.
   num_retries: 0
   json_logs: true
   set_verbose: false
