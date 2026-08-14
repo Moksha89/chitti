@@ -3,7 +3,8 @@ import json
 import logging
 import re
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol, cast
 
 import httpx
@@ -29,6 +30,7 @@ MODEL_GATEWAY_TIMEOUT_SECONDS = 600
 MODEL_CLIENT_TIMEOUT_SECONDS = 660
 MODEL_CALL_MAX_ATTEMPTS = 3
 MODEL_CALL_RETRY_BACKOFF_SECONDS = 1.0
+MODEL_CALL_MAX_RETRY_AFTER_SECONDS = 30.0
 
 
 class GatewayValidationError(RuntimeError):
@@ -69,6 +71,7 @@ class ModelProviderError(RuntimeError):
         completion_tokens: int = 0,
         total_tokens: int = 0,
         cost_usd: float = 0.0,
+        retry_after_seconds: float | None = None,
     ) -> None:
         self.failure_class = failure_class
         self.attempts = attempts
@@ -77,6 +80,7 @@ class ModelProviderError(RuntimeError):
         self.completion_tokens = completion_tokens
         self.total_tokens = total_tokens
         self.cost_usd = cost_usd
+        self.retry_after_seconds = retry_after_seconds
         super().__init__(message)
 
 
@@ -93,6 +97,7 @@ class ModelTransportError(ModelProviderError):
         completion_tokens: int = 0,
         total_tokens: int = 0,
         cost_usd: float = 0.0,
+        retry_after_seconds: float | None = None,
     ) -> None:
         super().__init__(
             message,
@@ -103,11 +108,39 @@ class ModelTransportError(ModelProviderError):
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
             cost_usd=cost_usd,
+            retry_after_seconds=retry_after_seconds,
         )
 
 
 class ModelHttpError(ModelProviderError):
     """The model gateway returned a non-success HTTP response."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_class: str,
+        status_code: int,
+        retry_after_seconds: float | None = None,
+        attempts: int = 1,
+        retry_failures: tuple[str, ...] = (),
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        cost_usd: float = 0.0,
+    ) -> None:
+        self.status_code = status_code
+        super().__init__(
+            message,
+            failure_class=failure_class,
+            attempts=attempts,
+            retry_failures=retry_failures,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            cost_usd=cost_usd,
+            retry_after_seconds=retry_after_seconds,
+        )
 
 
 class ModelPolicyRefusal(ModelProviderError):
@@ -271,6 +304,22 @@ def _response_usage(response: httpx.Response) -> tuple[int, int, int, float]:
     return prompt_tokens, completion_tokens, total_tokens, cost
 
 
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        return max(0.0, float((retry_at - datetime.now(UTC)).total_seconds()))
+
+
 class LiteLLMProvider:
     def __init__(self, base_url: str, api_key: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -365,39 +414,26 @@ class LiteLLMProvider:
         retry_total_tokens = 0
         retry_cost_usd = 0.0
         for attempt in range(1, MODEL_CALL_MAX_ATTEMPTS + 1):
-            last_failure: ModelProviderError | None = None
             try:
                 completion = await self._agent_completion_once(request, role)
-            except (
-                ModelPolicyRefusal,
-                ModelLimitRefusal,
-                ModelCostConfigurationError,
-            ):
-                raise
-            except ModelHttpError as exc:
-                if exc.failure_class == "http 4xx":
-                    raise
-                last_failure = exc
-                retry_failures.append(exc.failure_class)
-                if attempt == MODEL_CALL_MAX_ATTEMPTS:
-                    raise ModelProviderError(
-                        "model provider retries exhausted",
-                        failure_class=exc.failure_class,
-                        attempts=attempt,
-                        retry_failures=tuple(retry_failures),
-                        prompt_tokens=retry_prompt_tokens + exc.prompt_tokens,
-                        completion_tokens=(
-                            retry_completion_tokens + exc.completion_tokens
-                        ),
-                        total_tokens=retry_total_tokens + exc.total_tokens,
-                        cost_usd=retry_cost_usd + exc.cost_usd,
-                    ) from exc
             except ModelProviderError as exc:
-                last_failure = exc
                 retry_failures.append(exc.failure_class)
-                if attempt == MODEL_CALL_MAX_ATTEMPTS:
+                is_retryable = not isinstance(
+                    exc,
+                    ModelPolicyRefusal | ModelLimitRefusal | ModelCostConfigurationError,
+                )
+                if isinstance(exc, ModelHttpError):
+                    is_retryable = (
+                        exc.failure_class != "retry-after exceeds bound"
+                        and (exc.status_code in {408, 429} or exc.status_code >= 500)
+                    )
+                if not is_retryable or attempt == MODEL_CALL_MAX_ATTEMPTS:
+                    if attempt == 1:
+                        raise
                     raise ModelProviderError(
-                        "model provider retries exhausted",
+                        "model provider retries exhausted"
+                        if is_retryable
+                        else "model provider request failed",
                         failure_class=exc.failure_class,
                         attempts=attempt,
                         retry_failures=tuple(retry_failures),
@@ -408,6 +444,16 @@ class LiteLLMProvider:
                         total_tokens=retry_total_tokens + exc.total_tokens,
                         cost_usd=retry_cost_usd + exc.cost_usd,
                     ) from exc
+                retry_prompt_tokens += exc.prompt_tokens
+                retry_completion_tokens += exc.completion_tokens
+                retry_total_tokens += exc.total_tokens
+                retry_cost_usd += exc.cost_usd
+                await asyncio.sleep(
+                    exc.retry_after_seconds
+                    if exc.retry_after_seconds is not None
+                    else MODEL_CALL_RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1)
+                )
+                continue
             else:
                 if attempt == 1:
                     return completion
@@ -426,12 +472,6 @@ class LiteLLMProvider:
                     retry_total_tokens=retry_total_tokens,
                     retry_cost_usd=retry_cost_usd,
                 )
-            assert last_failure is not None
-            retry_prompt_tokens += last_failure.prompt_tokens
-            retry_completion_tokens += last_failure.completion_tokens
-            retry_total_tokens += last_failure.total_tokens
-            retry_cost_usd += last_failure.cost_usd
-            await asyncio.sleep(MODEL_CALL_RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1))
         raise AssertionError("model completion retry loop did not return")
 
     async def _agent_completion_once(
@@ -455,9 +495,30 @@ class LiteLLMProvider:
         except Exception as exc:
             raise ModelTransportError("gateway transport request failed") from exc
         if 400 <= response.status_code < 500:
+            failure_class = (
+                f"http {response.status_code}"
+                if response.status_code in {408, 429}
+                else "http 4xx"
+            )
+            retry_after_seconds = _retry_after_seconds(response)
+            if retry_after_seconds is not None and (
+                retry_after_seconds > MODEL_CALL_MAX_RETRY_AFTER_SECONDS
+            ):
+                raise ModelHttpError(
+                    (
+                        f"gateway requested Retry-After {retry_after_seconds:g}s, "
+                        f"exceeding Chitti's "
+                        f"{MODEL_CALL_MAX_RETRY_AFTER_SECONDS:g}s retry wait bound"
+                    ),
+                    failure_class="retry-after exceeds bound",
+                    status_code=response.status_code,
+                    retry_after_seconds=retry_after_seconds,
+                )
             raise ModelHttpError(
                 f"gateway returned HTTP {response.status_code}",
-                failure_class="http 4xx",
+                failure_class=failure_class,
+                status_code=response.status_code,
+                retry_after_seconds=retry_after_seconds,
             )
         if response.status_code >= 500:
             prompt_tokens, completion_tokens, total_tokens, cost_usd = (
@@ -466,6 +527,7 @@ class LiteLLMProvider:
             raise ModelHttpError(
                 f"gateway returned HTTP {response.status_code}",
                 failure_class="http 5xx",
+                status_code=response.status_code,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,

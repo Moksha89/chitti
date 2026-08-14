@@ -3498,7 +3498,7 @@ def _model_system_prompt(
             "optional seed, optional denoise, and optional reference to an existing "
             "generated asset; then run generate-images. The host owns the ComfyUI "
             "workflow and provider credentials, writes assets under out/generated, "
-            "and resolves image_manifest.resolved.json with real dimensions. The "
+            "and resolves /workspace/image_manifest.resolved.json with real dimensions. The "
             "generated asset width and height must each be between 64 and 1024 "
             "pixels. The approved 1080x1350 size is the final composed poster "
             "canvas, not a generated asset size; choose a useful source aspect "

@@ -62,6 +62,8 @@ def poster_config(value: object) -> dict[str, object]:
     scale = int(value.get("scale", 1))
     if not artifact or artifact.startswith("/") or ".." in artifact.split("/"):
         raise ValueError("poster artifact must be a relative export path")
+    if not artifact.lower().endswith((".html", ".svg")):
+        raise ValueError("poster artifact must use an .html or .svg extension")
     if width < 1 or height < 1 or width > MAX_POSTER_CSS_DIMENSION or height > MAX_POSTER_CSS_DIMENSION:
         raise ValueError(
             f"poster dimensions must be between 1 and {MAX_POSTER_CSS_DIMENSION} CSS pixels"

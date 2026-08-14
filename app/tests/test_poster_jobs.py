@@ -64,6 +64,8 @@ def test_poster_dimensions_and_scale_are_bounded() -> None:
         poster_config({"width": MAX_POSTER_CSS_DIMENSION + 1, "height": 1})
     with pytest.raises(ValueError, match="device scale"):
         poster_config({"width": 1, "height": 1, "scale": 3})
+    with pytest.raises(ValueError, match=r"\.html or \.svg"):
+        poster_config({"artifact": "poster.png"})
 
 
 def test_poster_prompts_require_brand_and_honest_visual_review() -> None:
@@ -119,6 +121,23 @@ async def test_poster_preflight_refuses_unconfigured_image_generation(monkeypatc
     )
 
     with pytest.raises(ValueError, match="image generation is unavailable"):
+        await WorkerRunManager(database).enqueue(7, job_type="poster")
+
+    assert database.session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_poster_run_refuses_invalid_approved_artifact(monkeypatch) -> None:
+    database = _Database()
+
+    async def bad_revision(*_args, **_kwargs):
+        revision = await _approved_revision()
+        revision.job_config["artifact"] = "poster.png"
+        return revision
+
+    monkeypatch.setattr("chitti.worker.approved_revision", bad_revision)
+
+    with pytest.raises(ValueError, match=r"\.html or \.svg"):
         await WorkerRunManager(database).enqueue(7, job_type="poster")
 
     assert database.session.calls == []
