@@ -23,7 +23,11 @@ REQUIRED_GATEWAY_ROUTES = frozenset(
 )
 CODER_MAX_OUTPUT_TOKENS = 32768
 REVIEWER_MAX_OUTPUT_TOKENS = 4096
-VISION_MAX_OUTPUT_TOKENS = 1024
+# The rubric requires five prose observations, six criteria, findings, and a
+# summary.  The prior 1,024-token cap cut valid reviews mid-object; 4,096 gives
+# the complete rubric response roughly 4x the observed cap while staying below
+# the provider's configured ceiling.
+VISION_MAX_OUTPUT_TOKENS = 4096
 VISION_INPUT_COST_PER_TOKEN = 0.00000004
 VISION_OUTPUT_COST_PER_TOKEN = 0.0000004
 MODEL_GATEWAY_TIMEOUT_SECONDS = 600

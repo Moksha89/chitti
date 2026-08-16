@@ -11,6 +11,7 @@ from chitti.provider import (
     MODEL_CLIENT_TIMEOUT_SECONDS,
     MODEL_GATEWAY_TIMEOUT_SECONDS,
     REVIEWER_MAX_OUTPUT_TOKENS,
+    VISION_MAX_OUTPUT_TOKENS,
     VISION_ROUTE,
     FakeProvider,
     GatewayMisconfigurationError,
@@ -408,6 +409,40 @@ def test_output_ceiling_malformed_tool_call_continues_without_retry(monkeypatch)
     assert completion.tool_calls == ()
     assert completion.message_fields == ("response_failure_class=output limit",)
     assert "response_exception=ValueError" in completion.response_diagnostics[0]
+
+
+def test_vision_output_ceiling_has_rubric_headroom(monkeypatch) -> None:
+    response = httpx.Response(
+        200,
+        request=httpx.Request("POST", "http://gateway"),
+        json={
+            "model": "glm-4.6v-flashx",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": '{"verdict":"pass"}'},
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        },
+    )
+    calls = []
+
+    class Client(_Client):
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return response
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    asyncio.run(
+        LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+            [{"role": "user", "content": "inspect"}],
+            VISION_ROUTE,
+        )
+    )
+
+    assert VISION_MAX_OUTPUT_TOKENS == 4096
+    assert calls[0][1]["json"]["max_tokens"] == VISION_MAX_OUTPUT_TOKENS
 
 
 def test_agent_completion_retries_408(monkeypatch) -> None:

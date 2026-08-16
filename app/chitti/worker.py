@@ -55,6 +55,7 @@ from .provider import (
     ModelToolCall,
     ModelTransportError,
 )
+from .run_status import validate_run_event_status
 from .runner_access import application_only_sql, runner_sql
 from .settings import get_settings
 
@@ -1807,6 +1808,17 @@ class DockerSandboxDispatcher:
             kind="visual_critique",
             prompt=json.dumps(persisted_messages, separators=(",", ":")),
         )
+        if completion.finish_reason == "length" or any(
+            item == "response_failure_class=output limit"
+            for item in completion.message_fields
+        ):
+            diagnostics = "; ".join(completion.response_diagnostics) or "none retained"
+            raise VisualReviewInconclusive(
+                "visual critique response exceeded the output limit before a "
+                "complete JSON verdict; increase concision and return exactly "
+                "the required rubric fields; diagnostics: "
+                f"{diagnostics}"
+            )
         try:
             verdict = json.loads(completion.content)
         except json.JSONDecodeError as exc:
@@ -2801,6 +2813,7 @@ class DockerSandboxDispatcher:
         self, run_id: int, status: str, detail: str,
         operation_index: int | None = None, task_id: str | None = None,
     ) -> None:
+        validate_run_event_status(status)
         async with self.database.sessions() as session:
             await session.execute(
                 runner_sql(text(

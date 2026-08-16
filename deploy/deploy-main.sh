@@ -664,6 +664,29 @@ docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
   -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<'SQL' >/dev/null
 DO $$
 DECLARE
+  definition text;
+BEGIN
+  SELECT pg_get_constraintdef(oid)
+  INTO definition
+  FROM pg_constraint
+  WHERE conname = 'worker_run_event_status_ck'
+    AND conrelid = 'worker_run_events'::regclass;
+  IF definition IS NULL
+     OR definition NOT LIKE '%visual_review_failed%'
+     OR definition NOT LIKE '%visual_review_passed%'
+     OR definition NOT LIKE '%visual_review_inconclusive%' THEN
+    RAISE EXCEPTION
+      'run-event status contract is missing visual-review statuses: %',
+      COALESCE(definition, '<missing>');
+  END IF;
+END
+$$;
+SQL
+echo "Run-event status contract migration proof passed."
+docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
+  -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<'SQL' >/dev/null
+DO $$
+DECLARE
   required_table text;
 BEGIN
   FOREACH required_table IN ARRAY ARRAY[

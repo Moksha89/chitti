@@ -268,6 +268,62 @@ async def test_visual_critique_caps_two_failing_cycles(tmp_path: Path) -> None:
     assert state["cycles"] == 2
 
 
+@pytest.mark.asyncio
+async def test_visual_critique_output_limit_is_inconclusive_with_diagnostics(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "artifacts" / "poster.png"
+    image.parent.mkdir()
+    image.write_bytes(_visual_png())
+    generated = tmp_path / "out" / "generated"
+    generated.mkdir(parents=True)
+    (generated / "stadium.png").write_bytes(_visual_png())
+    recorded: list[dict[str, object]] = []
+
+    class Provider:
+        async def agent_completion(self, messages, role, tools=None, tool_choice=None):
+            return ModelCompletion(
+                content="",
+                model="fake:vision",
+                prompt_tokens=10,
+                completion_tokens=4096,
+                total_tokens=4106,
+                cost_usd=0.001,
+                finish_reason="length",
+                message_fields=("response_failure_class=output limit",),
+                response_diagnostics=(
+                    "response_finish_reason=length",
+                    "response_tail={}",
+                ),
+            )
+
+    dispatcher = object.__new__(DockerSandboxDispatcher)
+    dispatcher.model_provider = Provider()
+    dispatcher._event = lambda *args, **kwargs: asyncio.sleep(0)
+
+    async def record(*args, **kwargs):
+        recorded.append(kwargs)
+
+    dispatcher._record_model_call = record
+    state = {
+        "cycles": 0,
+        "cost": 0.0,
+        "tokens": 0,
+        "accounted_cost": 0.0,
+        "accounted_tokens": 0,
+        "last_failed_digest": None,
+    }
+
+    with pytest.raises(
+        VisualReviewInconclusive, match="exceeded the output limit"
+    ) as raised:
+        await dispatcher._visual_critique(
+            1, "task", 1, tmp_path, WorkerLimits(), state, "fixture brief", None
+        )
+    assert "response_finish_reason=length" in str(raised.value)
+    assert recorded
+
+
 def test_worker_limits_are_recorded_as_explicit_sandbox_contract() -> None:
     limits = WorkerLimits()
     values = limits.as_json()
