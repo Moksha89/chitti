@@ -138,6 +138,7 @@ def _scan_privileges(
             privileges.setdefault(table, set()).add("SELECT")
         if re.search(r"\bON\s+CONFLICT\b[\s\S]*?\bDO\s+UPDATE\b", statement, re.I):
             privileges.setdefault(table, set()).add("UPDATE")
+            privileges.setdefault(table, set()).add("SELECT")
     for match in _DELETE_USING.finditer(source):
         privileges.setdefault(match.group(1).lower(), set()).add("SELECT")
     return privileges

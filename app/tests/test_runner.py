@@ -222,6 +222,18 @@ def test_runner_access_accounts_for_upsert_and_returning_privileges() -> None:
     ) == {"runner_health": {"INSERT", "SELECT", "UPDATE"}}
 
 
+def test_runner_access_accounts_for_upsert_conflict_reads() -> None:
+    assert required_privileges(
+        [
+            (
+                "INSERT INTO runner_health (component) VALUES ('sweep') "
+                "ON CONFLICT (component) DO UPDATE SET status = EXCLUDED.status"
+            )
+        ],
+        {"runner_health"},
+    ) == {"runner_health": {"INSERT", "SELECT", "UPDATE"}}
+
+
 def test_runner_access_accounts_for_unaliased_for_update() -> None:
     assert required_privileges(
         ["SELECT id FROM worker_runs FOR UPDATE"],
