@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import logging
+import shlex
 import shutil
 import subprocess
 import time
@@ -1589,9 +1590,14 @@ class DockerSandboxDispatcher:
                     f"--scale {requested['scale']} "
                 )
                 capture_command = (
+                    "test -f \"$CHITTI_POSTER_ARTIFACT\" && "
+                    "if [ \"$CHITTI_POSTER_ARTIFACT\" = \"index.html\" ] || "
+                    "grep -F -- \"$CHITTI_POSTER_ARTIFACT\" out/index.html; then "
                     "python3 /opt/next_screenshot.py "
                     + capture_args
-                    + "--poster"
+                    + f"--poster --artifact {shlex.quote(str(requested['artifact']))}; "
+                    "else echo \"poster capture requires out/index.html to reference "
+                    "the declared artifact $CHITTI_POSTER_ARTIFACT\" >&2; exit 1; fi"
                 )
             else:
                 capture_command = "python3 /opt/next_screenshot.py"
@@ -1784,48 +1790,72 @@ class DockerSandboxDispatcher:
             },
         ]
         assert self.model_provider is not None
+        compliance_reask = False
+        prompt_messages = persisted_messages
+        while True:
+            try:
+                completion = await self.model_provider.agent_completion(
+                    messages, VISION_ROUTE
+                )
+            except ModelTransportError as exc:
+                raise VisualReviewInconclusive(
+                    f"visual critique provider accounting failed: {exc}"
+                ) from exc
+            visual_state["cost"] += completion.cost_usd
+            visual_state["tokens"] += completion.total_tokens
+            if visual_state["cost"] > VISUAL_REVIEW_SPEND_CAP_USD:
+                raise RunBudgetExceeded("visual model spend")
+            if "data:image" in completion.content.lower() or "base64" in completion.content.lower():
+                raise VisualReviewInconclusive(
+                    "visual critique response contained image data"
+                )
+            await self._record_model_call(
+                run_id,
+                task_id,
+                iteration,
+                VISION_ROUTE,
+                completion,
+                kind="visual_critique",
+                prompt=json.dumps(prompt_messages, separators=(",", ":")),
+            )
+            if completion.finish_reason == "length" or any(
+                item == "response_failure_class=output limit"
+                for item in completion.message_fields
+            ):
+                diagnostics = "; ".join(completion.response_diagnostics) or "none retained"
+                raise VisualReviewInconclusive(
+                    "visual critique response exceeded the output limit before a "
+                    "complete JSON verdict; increase concision and return exactly "
+                    "the required rubric fields; diagnostics: "
+                    f"{diagnostics}"
+                )
+            try:
+                verdict = json.loads(completion.content)
+                parsed = _parse_visual_verdict(verdict, image_digest)
+            except json.JSONDecodeError as exc:
+                parse_error = VisualReviewInconclusive(
+                    f"visual critique returned invalid JSON: {exc}"
+                )
+            except VisualReviewInconclusive as exc:
+                parse_error = exc
+            else:
+                break
+            if compliance_reask:
+                raise parse_error
+            compliance_reask = True
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Your previous visual verdict was structurally non-compliant: "
+                        f"{parse_error}. Re-ask: return exactly one compliant JSON "
+                        "object with every required field, every failed criterion "
+                        "paired with a concrete finding, and no markdown."
+                    ),
+                }
+            )
+            prompt_messages = [*persisted_messages, *messages[2:]]
         visual_state["cycles"] += 1
-        try:
-            completion = await self.model_provider.agent_completion(messages, VISION_ROUTE)
-        except ModelTransportError as exc:
-            raise VisualReviewInconclusive(
-                f"visual critique provider accounting failed: {exc}"
-            ) from exc
-        visual_state["cost"] += completion.cost_usd
-        visual_state["tokens"] += completion.total_tokens
-        if visual_state["cost"] > VISUAL_REVIEW_SPEND_CAP_USD:
-            raise RunBudgetExceeded("visual model spend")
-        if "data:image" in completion.content.lower() or "base64" in completion.content.lower():
-            raise VisualReviewInconclusive(
-                "visual critique response contained image data"
-            )
-        await self._record_model_call(
-            run_id,
-            task_id,
-            iteration,
-            VISION_ROUTE,
-            completion,
-            kind="visual_critique",
-            prompt=json.dumps(persisted_messages, separators=(",", ":")),
-        )
-        if completion.finish_reason == "length" or any(
-            item == "response_failure_class=output limit"
-            for item in completion.message_fields
-        ):
-            diagnostics = "; ".join(completion.response_diagnostics) or "none retained"
-            raise VisualReviewInconclusive(
-                "visual critique response exceeded the output limit before a "
-                "complete JSON verdict; increase concision and return exactly "
-                "the required rubric fields; diagnostics: "
-                f"{diagnostics}"
-            )
-        try:
-            verdict = json.loads(completion.content)
-        except json.JSONDecodeError as exc:
-            raise VisualReviewInconclusive(
-                f"visual critique returned invalid JSON: {exc}"
-            ) from exc
-        parsed = _parse_visual_verdict(verdict, image_digest)
         if generated_asset_count == 0 and parsed["verdict"] == "pass":
             parsed = {
                 **parsed,
@@ -3630,8 +3660,10 @@ def _model_system_prompt(
             "audience, or typography. Create the declared artifact under out/. "
             f"The coder output ceiling is {CODER_MAX_OUTPUT_TOKENS} tokens; split "
             "large file writes across multiple tool calls rather than emitting one "
-            "enormous tool call. Create an out/index.html entry that renders it "
-            "for the cage capture. Run "
+            "enormous tool call. Create an out/index.html entry that references and "
+            "renders the declared artifact for the cage capture. The capture opens "
+            "the declared artifact itself, not the directory root; if the declared "
+            "artifact or its index entry is missing, capture is refused. Run "
             "poster-export, then capture_screenshot using exactly the approved poster "
             f"artifact {approved['artifact']} at width {approved['width']}, height "
             f"{approved['height']}, and device scale {approved['scale']}. These "
@@ -3827,17 +3859,24 @@ def fixed_operations(
                     "test -f \"$CHITTI_POSTER_ARTIFACT\"",
                 ),
             ),
-            FixedOperation(
-                first.id,
-                "browser-preview",
-                (
-                    "sh",
-                    "-c",
-                    "python3 /opt/next_screenshot.py "
-                    f"--width {config['width']} --height {config['height']} "
-                    f"--scale {config['scale']} --poster",
+                FixedOperation(
+                    first.id,
+                    "browser-preview",
+                    (
+                        "sh",
+                        "-c",
+                        "test -f \"$CHITTI_POSTER_ARTIFACT\" && "
+                        "if [ \"$CHITTI_POSTER_ARTIFACT\" = \"index.html\" ] || "
+                        "grep -F -- \"$CHITTI_POSTER_ARTIFACT\" out/index.html; then "
+                        "python3 /opt/next_screenshot.py "
+                        f"--width {config['width']} --height {config['height']} "
+                        f"--scale {config['scale']} --poster "
+                        f"--artifact {shlex.quote(str(config['artifact']))}; "
+                        "else echo \"poster capture requires out/index.html to "
+                        "reference the declared artifact $CHITTI_POSTER_ARTIFACT\" "
+                        ">&2; exit 1; fi",
+                    ),
                 ),
-            ),
             FixedOperation(
                 first.id,
                 "git-diff",

@@ -269,6 +269,56 @@ async def test_visual_critique_caps_two_failing_cycles(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_visual_critique_reasks_once_for_noncompliant_fail(tmp_path: Path) -> None:
+    image = tmp_path / "artifacts" / "poster.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(_visual_png())
+    generated = tmp_path / "out" / "generated"
+    generated.mkdir(parents=True)
+    (generated / "stadium.png").write_bytes(_visual_png())
+    calls = 0
+
+    class Provider:
+        async def agent_completion(self, messages, role, tools=None, tool_choice=None):
+            nonlocal calls
+            calls += 1
+            text = messages[1]["content"][0]["text"]
+            digest = text.split("IMAGE SHA-256: ", 1)[1].splitlines()[0]
+            verdict = json.loads(_visual_verdict(digest, "fail"))
+            if calls == 1:
+                verdict["findings"] = []
+            return ModelCompletion(
+                content=json.dumps(verdict),
+                model="fake:vision",
+                prompt_tokens=10,
+                completion_tokens=10,
+                total_tokens=20,
+                cost_usd=0.001,
+            )
+
+    dispatcher = object.__new__(DockerSandboxDispatcher)
+    dispatcher.model_provider = Provider()
+    dispatcher._event = lambda *args, **kwargs: asyncio.sleep(0)
+    dispatcher._record_model_call = lambda *args, **kwargs: asyncio.sleep(0)
+    state = {
+        "cycles": 0,
+        "cost": 0.0,
+        "tokens": 0,
+        "accounted_cost": 0.0,
+        "accounted_tokens": 0,
+        "last_failed_digest": None,
+    }
+
+    result = await dispatcher._visual_critique(
+        1, "task", 1, tmp_path, WorkerLimits(), state, "fixture brief", None
+    )
+
+    assert result[0].startswith("VISUAL_REVIEW_FAIL")
+    assert calls == 2
+    assert state["cycles"] == 1
+
+
+@pytest.mark.asyncio
 async def test_visual_critique_output_limit_is_inconclusive_with_diagnostics(
     tmp_path: Path,
 ) -> None:
@@ -356,6 +406,14 @@ def test_fixed_operations_are_deterministic_and_include_preview() -> None:
     assert "node_modules" in operations[-1].command[-1]
     assert ".next" in operations[-1].command[-1]
     assert ".npm-cache" in operations[-1].command[-1]
+    poster_operations = fixed_operations(
+        revision(),
+        POSTER_POLICY,
+        {"artifact": "poster.html", "width": 1080, "height": 1350, "scale": 1},
+    )
+    capture_command = poster_operations[3].command[-1]
+    assert "grep -F -- \"$CHITTI_POSTER_ARTIFACT\" out/index.html" in capture_command
+    assert "--artifact poster.html" in capture_command
 
 
 def _capture_module():

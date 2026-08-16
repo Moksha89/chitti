@@ -660,29 +660,46 @@ if [[ "${live_migration}" != "${expected_migration}" ]]; then
     "expected ${expected_migration}" >&2
   exit 1
 fi
+expected_run_event_statuses="$(
+  docker run --rm --entrypoint python "${runner_image}" -c '
+import json
+from chitti.run_status import RUN_EVENT_STATUSES
+print(json.dumps(sorted(RUN_EVENT_STATUSES), separators=(",", ":")))
+'
+)"
 docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
+  -v "expected_run_event_statuses=${expected_run_event_statuses}" \
   -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<'SQL' >/dev/null
 DO $$
 DECLARE
-  definition text;
+  expected_statuses text;
+  live_statuses text;
 BEGIN
-  SELECT pg_get_constraintdef(oid)
-  INTO definition
-  FROM pg_constraint
-  WHERE conname = 'worker_run_event_status_ck'
-    AND conrelid = 'worker_run_events'::regclass;
-  IF definition IS NULL
-     OR definition NOT LIKE '%visual_review_failed%'
-     OR definition NOT LIKE '%visual_review_passed%'
-     OR definition NOT LIKE '%visual_review_inconclusive%' THEN
+  SELECT string_agg(status, E'\n' ORDER BY status)
+  INTO expected_statuses
+  FROM json_array_elements_text(
+    :'expected_run_event_statuses'::json
+  ) AS statuses(status);
+  SELECT string_agg(captures[1], E'\n' ORDER BY captures[1])
+  INTO live_statuses
+  FROM (
+    SELECT regexp_matches(
+      pg_get_constraintdef(oid), '''([^'']+)''', 'g'
+    ) AS captures
+    FROM pg_constraint
+    WHERE conname = 'worker_run_event_status_ck'
+      AND conrelid = 'worker_run_events'::regclass
+  ) AS constraint_statuses;
+  IF live_statuses IS DISTINCT FROM expected_statuses THEN
     RAISE EXCEPTION
-      'run-event status contract is missing visual-review statuses: %',
-      COALESCE(definition, '<missing>');
+      'run-event status contract drift: expected %, live %',
+      COALESCE(expected_statuses, '<empty>'),
+      COALESCE(live_statuses, '<empty>');
   END IF;
 END
 $$;
 SQL
-echo "Run-event status contract migration proof passed."
+echo "Run-event status contract full-set proof passed."
 docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
   -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<'SQL' >/dev/null
 DO $$
