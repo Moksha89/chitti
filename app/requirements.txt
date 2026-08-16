@@ -16,6 +16,9 @@ python-multipart==0.0.20
 fastembed==0.7.3
 markdown-it-py==3.0.0
 markdown-it-py==3.0.0
+numpy==2.2.6
+onnxruntime==1.22.0
+Pillow==11.3.0
 sqlalchemy[asyncio]==2.0.39
 testcontainers[postgres]==4.10.0
 uvicorn[standard]==0.34.0
