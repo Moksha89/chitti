@@ -9,6 +9,7 @@ the runner-only database URL:
 DATABASE_URL=postgresql+asyncpg://chitti_runner:<secret>@127.0.0.1:5432/chitti
 LITELLM_BASE_URL=http://127.0.0.1:4000
 LITELLM_MASTER_KEY=<from the application environment>
+CHITTI_MATTE_MODEL_PATH=/opt/chitti-runner-models/u2net.onnx
 ```
 
 ## Repeatable deployment
@@ -19,6 +20,14 @@ migration path runs, builds `chitti-sandbox:latest`, installs this unit,
 provisions the runner-only database role on first use, and verifies the schema
 and container boundaries. Re-running it preserves the existing runner
 environment file and does not rotate that role's password.
+
+The deployment installs the runner environment directly from
+`app/requirements.txt`, so imports used by the host runner cannot silently
+drift from the application dependency declaration. It extracts the verified
+U-2-Net weights from the built application image into the configured
+`CHITTI_MATTE_MODEL_PATH`, then checks the expected SHA-256 digest in both the
+image and host copy before starting the runner. The host runner never
+downloads model weights.
 
 For a remote deployment, copy the script to the host and execute that file;
 do not stream it into `bash -s`. The repository wrapper performs that safe

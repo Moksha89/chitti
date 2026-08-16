@@ -11,6 +11,9 @@ RUNNER_ROLE_SQL="${RUNNER_ROLE_SQL:-deploy/worker-runner/runner-role.sql}"
 RUNNER_UNIT_SOURCE="${RUNNER_UNIT_SOURCE:-deploy/worker-runner/chitti-worker-runner.service}"
 RUNNER_VENV_DIR="${RUNNER_VENV_DIR:-/opt/chitti-runner}"
 RUNNER_PYTHON="${RUNNER_PYTHON:-/opt/chitti-runner/bin/python}"
+MATTE_MODEL_PATH="${MATTE_MODEL_PATH:-/opt/chitti-runner-models/u2net.onnx}"
+MATTE_MODEL_IMAGE_PATH="/app/models/u2net.onnx"
+MATTE_MODEL_SHA256="8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491"
 GOOGLE_SYNC_ENV="${GOOGLE_SYNC_ENV:-/etc/chitti/google-sync.env}"
 GOOGLE_SYNC_UNIT="chitti-google-sync.service"
 GOOGLE_SYNC_UNIT_SOURCE="${GOOGLE_SYNC_UNIT_SOURCE:-deploy/google-sync/chitti-google-sync.service}"
@@ -152,6 +155,31 @@ docker compose ps --status running --services | grep -qx chitti
 
 docker build --quiet -t chitti-sandbox:latest sandbox >/dev/null
 runner_image="chitti-chitti:latest"
+matte_model_container="$(docker create "${runner_image}")"
+matte_model_tmp="${MATTE_MODEL_PATH}.tmp"
+trap 'docker rm -f "${matte_model_container:-}" >/dev/null 2>&1 || true; rm -f "${matte_model_tmp:-}"' EXIT
+install -d -o root -g root -m 0755 "$(dirname "${MATTE_MODEL_PATH}")"
+docker cp "${matte_model_container}:${MATTE_MODEL_IMAGE_PATH}" "${matte_model_tmp}"
+docker rm -f "${matte_model_container}" >/dev/null
+matte_model_container=""
+echo "${MATTE_MODEL_SHA256}  ${matte_model_tmp}" | sha256sum -c -
+install -o root -g root -m 0644 "${matte_model_tmp}" "${MATTE_MODEL_PATH}"
+rm -f "${matte_model_tmp}"
+trap - EXIT
+image_matte_digest="$(
+  docker run --rm --entrypoint sha256sum "${runner_image}" "${MATTE_MODEL_IMAGE_PATH}" |
+    awk '{print $1}'
+)"
+if [[ "${image_matte_digest}" != "${MATTE_MODEL_SHA256}" ]]; then
+  echo "application image matting weights digest mismatch" >&2
+  exit 1
+fi
+host_matte_digest="$(sha256sum "${MATTE_MODEL_PATH}" | awk '{print $1}')"
+if [[ "${host_matte_digest}" != "${MATTE_MODEL_SHA256}" ]]; then
+  echo "host runner matting weights digest mismatch" >&2
+  exit 1
+fi
+echo "U-2-Net weights are digest-matched in the application image and host runner."
 
 declared_app_settings="$(
   docker run --rm --entrypoint python "${runner_image}" -c '
@@ -286,14 +314,7 @@ if [[ ! -x "${RUNNER_PYTHON}" ]]; then
   fi
 fi
 "${RUNNER_PYTHON}" -m pip install --quiet --disable-pip-version-check \
-  "asyncpg==0.30.0" \
-  "cryptography==44.0.2" \
-  "google-api-python-client==2.169.0" \
-  "google-auth==2.38.0" \
-  "google-auth-oauthlib==1.2.1" \
-  "httpx==0.28.1" \
-  "pydantic-settings==2.8.1" \
-  "SQLAlchemy[asyncio]==2.0.39"
+  -r "${INSTALL_DIR}/app/requirements.txt"
 
 install -d -m 0755 /etc/chitti
 umask 077
@@ -326,10 +347,12 @@ if [[ "${role_exists}" == "1" ]]; then
     -e '/^RUNPOD_API_KEY=/d' \
     -e '/^RUNPOD_ENDPOINT_ID=/d' \
     -e '/^RUNPOD_GPU_RATE_USD=/d' \
+    -e '/^CHITTI_MATTE_MODEL_PATH=/d' \
     "${RUNNER_ENV}" >"${runner_env_tmp}"
-  printf 'LITELLM_BASE_URL=http://127.0.0.1:%s\nLITELLM_MASTER_KEY=%s\nRUNPOD_API_KEY=%s\nRUNPOD_ENDPOINT_ID=%s\nRUNPOD_GPU_RATE_USD=%s\n' \
+  printf 'LITELLM_BASE_URL=http://127.0.0.1:%s\nLITELLM_MASTER_KEY=%s\nRUNPOD_API_KEY=%s\nRUNPOD_ENDPOINT_ID=%s\nRUNPOD_GPU_RATE_USD=%s\nCHITTI_MATTE_MODEL_PATH=%s\n' \
     "${LITELLM_PORT:-4000}" "${LITELLM_MASTER_KEY}" \
     "${RUNPOD_API_KEY:-}" "${RUNPOD_ENDPOINT_ID:-}" "${RUNPOD_GPU_RATE_USD:-0.34}" \
+    "${MATTE_MODEL_PATH}" \
     >>"${runner_env_tmp}"
   chmod 0600 "${runner_env_tmp}"
   install -o root -g root -m 0600 "${runner_env_tmp}" "${RUNNER_ENV}"
@@ -341,9 +364,10 @@ else
   runner_sql_tmp="$(mktemp /etc/chitti/runner-role.sql.XXXXXX)"
   trap 'rm -f "${runner_env_tmp:-}" "${runner_sql_tmp:-}"' EXIT
 
-  printf 'DATABASE_URL=postgresql+asyncpg://chitti_runner:%s@127.0.0.1:5432/%s\nPREVIEW_ROOT=/var/lib/chitti-previews\nPREVIEW_STAGING_ROOT=/var/lib/chitti-preview-staging\nLITELLM_BASE_URL=http://127.0.0.1:%s\nLITELLM_MASTER_KEY=%s\nRUNPOD_API_KEY=%s\nRUNPOD_ENDPOINT_ID=%s\nRUNPOD_GPU_RATE_USD=%s\n' \
+  printf 'DATABASE_URL=postgresql+asyncpg://chitti_runner:%s@127.0.0.1:5432/%s\nPREVIEW_ROOT=/var/lib/chitti-previews\nPREVIEW_STAGING_ROOT=/var/lib/chitti-preview-staging\nLITELLM_BASE_URL=http://127.0.0.1:%s\nLITELLM_MASTER_KEY=%s\nRUNPOD_API_KEY=%s\nRUNPOD_ENDPOINT_ID=%s\nRUNPOD_GPU_RATE_USD=%s\nCHITTI_MATTE_MODEL_PATH=%s\n' \
     "${runner_password}" "${POSTGRES_DB}" "${LITELLM_PORT:-4000}" "${LITELLM_MASTER_KEY}" \
-    "${RUNPOD_API_KEY:-}" "${RUNPOD_ENDPOINT_ID:-}" "${RUNPOD_GPU_RATE_USD:-0.34}" >"${runner_env_tmp}"
+    "${RUNPOD_API_KEY:-}" "${RUNPOD_ENDPOINT_ID:-}" "${RUNPOD_GPU_RATE_USD:-0.34}" \
+    "${MATTE_MODEL_PATH}" >"${runner_env_tmp}"
   chmod 0600 "${runner_env_tmp}"
 
   sed "s/REPLACE_WITH_A_RANDOM_SECRET/${runner_password}/" \
@@ -477,6 +501,9 @@ install -o root -g root -m 0644 \
   "/etc/systemd/system/${RUNNER_UNIT}"
 systemctl daemon-reload
 systemctl enable "${RUNNER_UNIT}"
+CHITTI_MATTE_MODEL_PATH="${MATTE_MODEL_PATH}" \
+  PYTHONPATH="${INSTALL_DIR}/app" "${RUNNER_PYTHON}" -c \
+  'import chitti.runner; print("Runner module import assertion passed.")'
 expected_runner_digest="$(
   PYTHONPATH="${INSTALL_DIR}/app" CHITTI_CODE_IDENTITY_PATH=/run/chitti-worker/loaded-code.json \
     "${RUNNER_PYTHON}" -c \
@@ -511,8 +538,18 @@ if identity.get("digest") != os.environ["EXPECTED_RUNNER_DIGEST"]:
     raise SystemExit("runner loaded-code identity does not match deployed code")
 PY
 echo "Runner loaded-code identity assertion passed."
+runner_restarts_after_start="$(systemctl show --property=NRestarts --value "${RUNNER_UNIT}")"
+sleep 3
+if [[ "$(systemctl show --property=MainPID --value "${RUNNER_UNIT}")" != "${runner_pid}" ]] ||
+  [[ "$(systemctl show --property=NRestarts --value "${RUNNER_UNIT}")" != "${runner_restarts_after_start}" ]]; then
+  echo "runner restarted after its active-state proof" >&2
+  exit 1
+fi
+systemctl is-active --quiet "${RUNNER_UNIT}"
+echo "Runner remained active with zero restarts during the stability window."
 
-for runner_setting in RUNPOD_API_KEY RUNPOD_ENDPOINT_ID RUNPOD_GPU_RATE_USD; do
+for runner_setting in RUNPOD_API_KEY RUNPOD_ENDPOINT_ID RUNPOD_GPU_RATE_USD \
+  CHITTI_MATTE_MODEL_PATH; do
   assert_process_setting_forwarded "${runner_pid}" "${runner_setting}"
 done
 sync_pid="$(systemctl show --property=MainPID --value "${GOOGLE_SYNC_UNIT}")"
@@ -541,7 +578,8 @@ if docker inspect "${app_container}" \
 fi
 docker exec "${app_container}" test ! -S /var/run/docker.sock
 
-for runner_setting in RUNPOD_API_KEY RUNPOD_ENDPOINT_ID RUNPOD_GPU_RATE_USD; do
+for runner_setting in RUNPOD_API_KEY RUNPOD_ENDPOINT_ID RUNPOD_GPU_RATE_USD \
+  CHITTI_MATTE_MODEL_PATH; do
   if [[ -n "${!runner_setting:-}" ]] &&
     ! grep -Eq "^${runner_setting}=" "${RUNNER_ENV}"; then
     echo "configured ${runner_setting} was not written to ${RUNNER_ENV}" >&2
