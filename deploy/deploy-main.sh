@@ -670,6 +670,10 @@ print(json.dumps(sorted(RUN_EVENT_STATUSES), separators=(",", ":")))
 docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
   -v "expected_run_event_statuses=${expected_run_event_statuses}" \
   -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<'SQL' >/dev/null
+CREATE TEMP TABLE expected_run_event_status_values(status text);
+INSERT INTO expected_run_event_status_values(status)
+SELECT value
+FROM json_array_elements_text(:'expected_run_event_statuses'::json);
 DO $$
 DECLARE
   expected_statuses text;
@@ -677,9 +681,7 @@ DECLARE
 BEGIN
   SELECT string_agg(status, E'\n' ORDER BY status)
   INTO expected_statuses
-  FROM json_array_elements_text(
-    :'expected_run_event_statuses'::json
-  ) AS statuses(status);
+  FROM expected_run_event_status_values;
   SELECT string_agg(captures[1], E'\n' ORDER BY captures[1])
   INTO live_statuses
   FROM (
