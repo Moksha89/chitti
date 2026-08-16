@@ -412,6 +412,7 @@ def test_fixed_operations_are_deterministic_and_include_preview() -> None:
         {"artifact": "poster.html", "width": 1080, "height": 1350, "scale": 1},
     )
     capture_command = poster_operations[3].command[-1]
+    assert 'test -f "out/$CHITTI_POSTER_ARTIFACT"' in capture_command
     assert "grep -F -- \"$CHITTI_POSTER_ARTIFACT\" out/index.html" in capture_command
     assert "--artifact poster.html" in capture_command
 

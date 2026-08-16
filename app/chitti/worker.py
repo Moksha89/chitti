@@ -1590,7 +1590,7 @@ class DockerSandboxDispatcher:
                     f"--scale {requested['scale']} "
                 )
                 capture_command = (
-                    "test -f \"$CHITTI_POSTER_ARTIFACT\" && "
+                    "test -f \"out/$CHITTI_POSTER_ARTIFACT\" && "
                     "if [ \"$CHITTI_POSTER_ARTIFACT\" = \"index.html\" ] || "
                     "grep -F -- \"$CHITTI_POSTER_ARTIFACT\" out/index.html; then "
                     "python3 /opt/next_screenshot.py "
@@ -3856,7 +3856,7 @@ def fixed_operations(
                 (
                     "sh",
                     "-c",
-                    "test -f \"$CHITTI_POSTER_ARTIFACT\"",
+                    "test -f \"out/$CHITTI_POSTER_ARTIFACT\"",
                 ),
             ),
                 FixedOperation(
@@ -3865,7 +3865,7 @@ def fixed_operations(
                     (
                         "sh",
                         "-c",
-                        "test -f \"$CHITTI_POSTER_ARTIFACT\" && "
+                        "test -f \"out/$CHITTI_POSTER_ARTIFACT\" && "
                         "if [ \"$CHITTI_POSTER_ARTIFACT\" = \"index.html\" ] || "
                         "grep -F -- \"$CHITTI_POSTER_ARTIFACT\" out/index.html; then "
                         "python3 /opt/next_screenshot.py "
