@@ -31,6 +31,7 @@ MODEL_CLIENT_TIMEOUT_SECONDS = 660
 MODEL_CALL_MAX_ATTEMPTS = 3
 MODEL_CALL_RETRY_BACKOFF_SECONDS = 1.0
 MODEL_CALL_MAX_RETRY_AFTER_SECONDS = 30.0
+MODEL_RESPONSE_DIAGNOSTIC_TAIL_CHARS = 2048
 
 
 class GatewayValidationError(RuntimeError):
@@ -72,6 +73,7 @@ class ModelProviderError(RuntimeError):
         total_tokens: int = 0,
         cost_usd: float = 0.0,
         retry_after_seconds: float | None = None,
+        response_diagnostics: tuple[str, ...] = (),
     ) -> None:
         self.failure_class = failure_class
         self.attempts = attempts
@@ -81,6 +83,7 @@ class ModelProviderError(RuntimeError):
         self.total_tokens = total_tokens
         self.cost_usd = cost_usd
         self.retry_after_seconds = retry_after_seconds
+        self.response_diagnostics = response_diagnostics
         super().__init__(message)
 
 
@@ -182,6 +185,7 @@ class ModelCompletion:
     retry_completion_tokens: int = 0
     retry_total_tokens: int = 0
     retry_cost_usd: float = 0.0
+    response_diagnostics: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -302,6 +306,30 @@ def _response_usage(response: httpx.Response) -> tuple[int, int, int, float]:
     except (TypeError, ValueError):
         cost = 0.0
     return prompt_tokens, completion_tokens, total_tokens, cost
+
+
+def _response_diagnostics(
+    response: httpx.Response,
+    exc: Exception,
+    *,
+    finish_reason: object = None,
+) -> tuple[str, ...]:
+    try:
+        body = response.text
+    except (TypeError, ValueError):
+        body = ""
+    body = re.sub(
+        r"(?i)(authorization|api[_-]?key|password|secret|token)\s*[:=]\s*\S+",
+        r"\1=[REDACTED]",
+        body,
+    )
+    body = re.sub(r"https?://[^\s\"'<>]+", "[URL REDACTED]", body)
+    tail = body[-MODEL_RESPONSE_DIAGNOSTIC_TAIL_CHARS:]
+    return (
+        f"response_exception={type(exc).__name__}: {str(exc)[:300]}",
+        f"response_finish_reason={finish_reason if finish_reason is not None else 'unknown'}",
+        f"response_body_tail={tail}",
+    )
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:
@@ -443,6 +471,7 @@ class LiteLLMProvider:
                         ),
                         total_tokens=retry_total_tokens + exc.total_tokens,
                         cost_usd=retry_cost_usd + exc.cost_usd,
+                        response_diagnostics=exc.response_diagnostics,
                     ) from exc
                 retry_prompt_tokens += exc.prompt_tokens
                 retry_completion_tokens += exc.completion_tokens
@@ -534,6 +563,7 @@ class LiteLLMProvider:
                 cost_usd=cost_usd,
             )
         response.raise_for_status()
+        finish_reason: object = None
         try:
             body = response.json()
             error = body.get("error")
@@ -559,6 +589,7 @@ class LiteLLMProvider:
             message = choice.get("message") or {}
             if not isinstance(message, dict):
                 raise TypeError("model message was not an object")
+            finish_reason = choice.get("finish_reason")
             refusal = message.get("refusal")
             if refusal:
                 raise ModelPolicyRefusal(
@@ -628,6 +659,29 @@ class LiteLLMProvider:
             prompt_tokens, completion_tokens, total_tokens, cost_usd = (
                 _response_usage(response)
             )
+            diagnostics = _response_diagnostics(
+                response,
+                exc,
+                finish_reason=finish_reason,
+            )
+            requested_max_tokens = request.get("max_tokens")
+            reached_output_ceiling = (
+                isinstance(requested_max_tokens, int)
+                and requested_max_tokens > 0
+                and completion_tokens >= requested_max_tokens
+            )
+            if finish_reason == "length" or reached_output_ceiling:
+                return ModelCompletion(
+                    content="",
+                    model=role,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    cost_usd=cost_usd,
+                    finish_reason="length",
+                    message_fields=("response_failure_class=output limit",),
+                    response_diagnostics=diagnostics,
+                )
             raise ModelProviderError(
                 "gateway returned a malformed response",
                 failure_class="malformed response",
@@ -635,6 +689,7 @@ class LiteLLMProvider:
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
                 cost_usd=cost_usd,
+                response_diagnostics=diagnostics,
             ) from exc
 
     async def chat(self, system: str, messages: list[dict[str, object]], role: str) -> str:

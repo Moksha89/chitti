@@ -319,6 +319,97 @@ def test_agent_completion_retries_truncated_body_then_succeeds(monkeypatch) -> N
     assert completion.retry_failures == ("malformed response",)
 
 
+def test_malformed_response_retains_bounded_diagnostics(monkeypatch) -> None:
+    response = httpx.Response(
+        200,
+        request=httpx.Request("POST", "http://gateway"),
+        content=(
+            b'{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":'
+            b'[{"function":{"name":"write_file","arguments":"not-json"}}]}}],'
+            b'"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5},'
+            b'"debug":"secret=should-not-be-retained"}'
+        ),
+    )
+
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            return response
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    with pytest.raises(ModelProviderError) as raised:
+        asyncio.run(
+            LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+                [{"role": "user", "content": "work"}],
+                "coder",
+                tools=[{"type": "function", "function": {"name": "write_file"}}],
+                tool_choice="required",
+            )
+        )
+
+    assert raised.value.failure_class == "malformed response"
+    assert raised.value.response_diagnostics[0].startswith(
+        "response_exception=ValueError:"
+    )
+    assert "response_finish_reason=tool_calls" in raised.value.response_diagnostics
+    assert "not-json" in raised.value.response_diagnostics[-1]
+    assert "should-not-be-retained" not in raised.value.response_diagnostics[-1]
+    assert len(raised.value.response_diagnostics[-1]) <= 2060
+
+
+def test_output_ceiling_malformed_tool_call_continues_without_retry(monkeypatch) -> None:
+    response = httpx.Response(
+        200,
+        request=httpx.Request("POST", "http://gateway"),
+        json={
+            "model": "glm-5.2",
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": "not-json",
+                                }
+                            }
+                        ],
+                    },
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 2,
+                "completion_tokens": CODER_MAX_OUTPUT_TOKENS,
+                "total_tokens": CODER_MAX_OUTPUT_TOKENS + 2,
+            },
+        },
+    )
+    calls = 0
+
+    class Client(_Client):
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return response
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    completion = asyncio.run(
+        LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+            [{"role": "user", "content": "work"}],
+            "coder",
+            tools=[{"type": "function", "function": {"name": "write_file"}}],
+            tool_choice="required",
+        )
+    )
+
+    assert calls == 1
+    assert completion.finish_reason == "length"
+    assert completion.tool_calls == ()
+    assert completion.message_fields == ("response_failure_class=output limit",)
+    assert "response_exception=ValueError" in completion.response_diagnostics[0]
+
+
 def test_agent_completion_retries_408(monkeypatch) -> None:
     calls = 0
 
