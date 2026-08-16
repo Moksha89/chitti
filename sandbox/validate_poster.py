@@ -69,6 +69,30 @@ def validate_poster_source(
         raise SystemExit(f"poster source omits declared sandbox font: {font}")
 
 
+def validate_export_assets(export_root: Path, declared_assets: set[str]) -> None:
+    allowed_extensions = {".html", ".css", ".svg", ".png", ".jpg", ".jpeg", ".webp"}
+    for output in export_root.rglob("*"):
+        relative = str(output.relative_to(export_root)).replace("\\", "/")
+        if not output.is_file():
+            continue
+        if output.suffix.lower() not in allowed_extensions:
+            raise SystemExit(
+                f"poster export contains a non-publishable file at "
+                f"'{relative}'; remove it from out/ or move working notes to "
+                "artifacts/ (only HTML, CSS, SVG, and declared raster assets "
+                "may ship)"
+            )
+        if (
+            output.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+            and relative not in declared_assets
+        ):
+            raise SystemExit(
+                f"poster export contains an unverified raster asset at "
+                f"'{relative}'; declare it in image_manifest.json and rerun "
+                "generate-images, or remove it from out/"
+            )
+
+
 def main() -> None:
     artifact = os.environ.get("CHITTI_POSTER_ARTIFACT", "")
     if not artifact or Path(artifact).is_absolute() or ".." in Path(artifact).parts:
@@ -90,19 +114,7 @@ def main() -> None:
             }
         except (OSError, json.JSONDecodeError, KeyError, TypeError):
             raise SystemExit("poster resolved image manifest is invalid")
-    allowed_extensions = {".html", ".css", ".svg", ".png", ".jpg", ".jpeg", ".webp"}
-    for output in Path("/workspace/out").rglob("*"):
-        relative = str(output.relative_to("/workspace/out")).replace("\\", "/")
-        if output.is_file() and (
-            output.suffix.lower() not in allowed_extensions
-            or (
-                output.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
-                and relative not in declared_assets
-            )
-        ):
-            raise SystemExit(
-                f"poster export contains an undeclared binary asset: {output.name}"
-            )
+    validate_export_assets(Path("/workspace/out"), declared_assets)
     source = path.read_text(encoding="utf-8", errors="replace")
     available = {
         line.strip().casefold()

@@ -72,3 +72,23 @@ def test_undeclared_svg_image_href_is_refused() -> None:
             {"freesans"},
             assets={"generated/stadium.png"},
         )
+
+
+def test_export_notes_name_relative_path_and_artifacts_remedy(tmp_path: Path) -> None:
+    output = tmp_path / "nested" / "evidence.json"
+    output.parent.mkdir()
+    output.write_text("{}")
+    with pytest.raises(SystemExit, match="nested/evidence.json"):
+        MODULE.validate_export_assets(tmp_path, set())
+    with pytest.raises(SystemExit, match="artifacts/"):
+        MODULE.validate_export_assets(tmp_path, set())
+
+
+def test_export_raster_refusal_names_manifest_remedy(tmp_path: Path) -> None:
+    output = tmp_path / "generated" / "figure.png"
+    output.parent.mkdir()
+    output.write_bytes(b"png")
+    with pytest.raises(SystemExit, match="generated/figure.png"):
+        MODULE.validate_export_assets(tmp_path, set())
+    with pytest.raises(SystemExit, match="rerun generate-images"):
+        MODULE.validate_export_assets(tmp_path, set())

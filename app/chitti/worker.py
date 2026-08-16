@@ -75,6 +75,7 @@ MAX_PROGRESS_LEDGER_ITEM_CHARS = 160
 MAX_FILE_REWRITES_WITHOUT_COMMAND = 4
 MODEL_TOOL_CALL_BUDGET = 240
 MAX_FILE_WRITES_WITHOUT_COMMAND = 24
+IDENTICAL_TOOL_FAILURE_LIMIT = 3
 REQUIRED_GATE_COMMANDS = ("build", "test", "export")
 VISUAL_REVIEW_MAX_CYCLES = 2
 VISUAL_REVIEW_SPEND_CAP_USD = 0.10
@@ -209,6 +210,28 @@ def _progress_counters(
     if workspace_changed:
         return 0, 0
     return failures + int(failure), nonproductive_turns + 1
+
+
+def _identical_tool_failure_detail(
+    task_id: str,
+    tool: str,
+    detail: str,
+    last_failure: tuple[str, str] | None,
+    consecutive_failures: int,
+) -> tuple[str, tuple[str, str], int]:
+    failure = (tool, detail)
+    count = consecutive_failures + 1 if failure == last_failure else 1
+    if count >= IDENTICAL_TOOL_FAILURE_LIMIT:
+        raise ModelProgressError(
+            f"task {task_id} stopped after {count} consecutive identical "
+            f"failures from {tool}: {detail}"
+        )
+    if count == IDENTICAL_TOOL_FAILURE_LIMIT - 1:
+        detail = (
+            f"{detail} This identical failure has occurred {count} "
+            "consecutive times; repeating it once more will end the run."
+        )
+    return detail, failure, count
 
 
 def _remember_progress_ledger(
@@ -889,6 +912,31 @@ class DockerSandboxDispatcher:
                             f"{command} ({'passed' if succeeded else 'failed'})",
                         )
 
+            last_tool_failure: tuple[str, str] | None = None
+            consecutive_tool_failures = 0
+
+            def repeated_tool_failure_detail(
+                tool: str, detail: str, task_id: str = task.id
+            ) -> str:
+                nonlocal last_tool_failure, consecutive_tool_failures
+                (
+                    detail,
+                    last_tool_failure,
+                    consecutive_tool_failures,
+                ) = _identical_tool_failure_detail(
+                    task_id,
+                    tool,
+                    detail,
+                    last_tool_failure,
+                    consecutive_tool_failures,
+                )
+                return detail
+
+            def reset_tool_failure_streak() -> None:
+                nonlocal last_tool_failure, consecutive_tool_failures
+                last_tool_failure = None
+                consecutive_tool_failures = 0
+
             for iteration in range(1, limits.model_iterations + 1):
                 self._raise_if_cancelled(run_id)
                 if time.monotonic() - started > limits.run_timeout_seconds:
@@ -1043,6 +1091,7 @@ class DockerSandboxDispatcher:
                                     if writes > limits.model_write_bytes:
                                         raise RunBudgetExceeded("model write-byte")
                                     remember_tool_result(tool, arguments, succeeded=True)
+                                    reset_tool_failure_streak()
                                     if tool == "run_command":
                                         command_name = str(arguments.get("name", ""))
                                         _record_gate_command(completed_commands, command_name)
@@ -1124,8 +1173,9 @@ class DockerSandboxDispatcher:
                                         file_write_counts,
                                     )
                                     remember_tool_result(tool, arguments, succeeded=False)
-                                    result_text = (
-                                        f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
+                                    result_text = repeated_tool_failure_detail(
+                                        tool,
+                                        f"TOOL FAILURE: {tool}: {str(exc)[:1000]}",
                                     )
                                     batch_failure = result_text
                                     messages.append(
@@ -1253,6 +1303,7 @@ class DockerSandboxDispatcher:
                     if writes > limits.model_write_bytes:
                         raise RunBudgetExceeded("model write-byte")
                     remember_tool_result(tool, arguments, succeeded=True)
+                    reset_tool_failure_streak()
                     if tool == "run_command":
                         command_name = str(arguments.get("name", ""))
                         _record_gate_command(completed_commands, command_name)
@@ -1327,7 +1378,9 @@ class DockerSandboxDispatcher:
                         file_write_counts,
                     )
                     remember_tool_result(tool, arguments, succeeded=False)
-                    result_text = f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
+                    result_text = repeated_tool_failure_detail(
+                        tool, f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
+                    )
                     await record_nonproductive(result_text)
                     if failures >= 2 and route == CODER_ROUTE:
                         route = REVIEWER_ROUTE
@@ -3585,6 +3638,11 @@ def _model_system_prompt(
             f"${WorkerLimits().image_spend_usd:.2f}; cache hits do not rebill. "
             "Undeclared local assets, remote URLs, data URLs, and runtime fetches "
             "are refused. Never write workflow JSON or provider credentials.\n"
+            "The out/ directory is the publishable export only: keep it limited "
+            "to the approved HTML artifact, its index entry, CSS/SVG, and "
+            "manifest-declared raster assets. Put working notes, evidence JSON, "
+            "and other scratch files under artifacts/ (or another workspace-root "
+            "path), never under out/; notes are not export assets.\n"
             f"BRAND PROFILE:\n{json.dumps(profile_data, default=str)}"
         )
     return (
