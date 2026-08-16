@@ -69,11 +69,11 @@ async def sweep_reminders(
                 latest_occurrence_id: int | None = None
                 for scheduled_due in scheduled:
                     inserted = await session.execute(
-                        text(
+                        runner_sql(text(
                             "INSERT INTO reminder_occurrences (reminder_id, due_at) "
                             "VALUES (:reminder, :due_at) ON CONFLICT DO NOTHING "
                             "RETURNING id"
-                        ),
+                        )),
                         {"reminder": int(reminder["id"]), "due_at": scheduled_due},
                     )
                     occurrence_id = inserted.scalar_one_or_none()
@@ -87,11 +87,11 @@ async def sweep_reminders(
                         else ""
                     )
                     await session.execute(
-                        text(
+                        runner_sql(text(
                             "INSERT INTO notifications "
                             "(namespace, kind, title, body, reminder_occurrence_id) "
                             "VALUES (:namespace, 'reminder', 'Reminder', :body, :occurrence)"
-                        ),
+                        )),
                         {
                             "namespace": str(reminder["namespace"]),
                             "body": f"{reminder['text']}{suffix}",

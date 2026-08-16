@@ -634,7 +634,7 @@ class DockerSandboxDispatcher:
                 return
             async with self.database.sessions() as session:
                 run_result = await session.execute(
-                    text("SELECT job_type, job_config FROM worker_runs WHERE id = :run_id"),
+                    runner_sql(text("SELECT job_type, job_config FROM worker_runs WHERE id = :run_id")),
                     {"run_id": run_id},
                 )
                 run_row = run_result.mappings().one()
@@ -1475,11 +1475,11 @@ class DockerSandboxDispatcher:
             manifest = await asyncio.to_thread(copy_export, export_root, staging)
             async with self.database.sessions() as session:
                 artifacts = await session.execute(
-                    text(
+                    runner_sql(text(
                         "SELECT id, kind, sha256 FROM worker_artifacts "
                         "WHERE run_id = :run_id AND kind IN ('diff', 'reviewer_report') "
                         "ORDER BY id"
-                    ),
+                    )),
                     {"run_id": run_id},
                 )
                 rows = list(artifacts.mappings())
@@ -1495,7 +1495,7 @@ class DockerSandboxDispatcher:
                         "run is not promotable: reviewer or diff evidence is missing"
                     )
                 await session.execute(
-                    text(
+                    runner_sql(text(
                         "INSERT INTO export_manifests "
                         "(run_id, revision_id, revision_content_hash, "
                         "reviewer_artifact_id, diff_artifact_id, manifest, digest, "
@@ -1503,7 +1503,7 @@ class DockerSandboxDispatcher:
                         "(:run_id, :revision_id, :revision_hash, :reviewer, :diff, "
                         "CAST(:manifest AS json), :digest, :total_bytes, :file_count, "
                         ":max_depth, :staging_path)"
-                    ),
+                    )),
                     {
                         "run_id": run_id,
                         "revision_id": revision.id,
@@ -1934,11 +1934,11 @@ class DockerSandboxDispatcher:
     async def _review_evidence(self, run_id: int, workspace: Path) -> str:
         async with self.database.sessions() as session:
             operations = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT name, status, stdout, stderr, exit_code "
                     "FROM worker_operations WHERE run_id = :run_id "
                     "ORDER BY operation_index"
-                ),
+                )),
                 {"run_id": run_id},
             )
             rows = [
@@ -2043,7 +2043,7 @@ class DockerSandboxDispatcher:
         content, content_size, content_truncated = _bounded_artifact(response_content)
         async with self.database.sessions() as session:
             result = await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO worker_model_calls "
                     "(run_id, task_id, iteration, route, model, prompt_tokens, "
                     "completion_tokens, total_tokens, reasoning_tokens, cost_usd, "
@@ -2053,7 +2053,7 @@ class DockerSandboxDispatcher:
                     ":completion_tokens, :total_tokens, :reasoning_tokens, :cost_usd, "
                     ":finish_reason, "
                     "CAST(:message_fields AS jsonb)) RETURNING id"
-                ),
+                )),
                 {
                     "run_id": run_id, "task_id": task_id, "iteration": iteration,
                     "route": route, "model": completion.model,
@@ -2075,12 +2075,12 @@ class DockerSandboxDispatcher:
             )
             call_id = int(result.scalar_one())
             artifact = await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO worker_artifacts "
                     "(run_id, kind, path, sha256, byte_size, original_byte_size, truncated) "
                     "VALUES (:run_id, :kind, :path, :sha256, :byte_size, "
                     ":original_byte_size, :truncated) RETURNING id"
-                ),
+                )),
                 {
                     "run_id": run_id, "kind": kind,
                     "path": f"model_calls/{call_id}/response.json",
@@ -2091,20 +2091,20 @@ class DockerSandboxDispatcher:
                 },
             )
             await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO worker_artifact_payloads (artifact_id, content) "
                     "VALUES (:artifact_id, :content)"
-                ),
+                )),
                 {"artifact_id": int(artifact.scalar_one()), "content": content},
             )
             prompt_artifact = await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO worker_artifacts "
                     "(run_id, kind, path, sha256, byte_size, original_byte_size, truncated) "
                     "VALUES (:run_id, 'model_prompt', :path, :sha256, :byte_size, "
                     ":original_byte_size, :truncated) "
                     "RETURNING id"
-                ),
+                )),
                 {
                     "run_id": run_id,
                     "path": f"model_calls/{call_id}/prompt.json",
@@ -2115,10 +2115,10 @@ class DockerSandboxDispatcher:
                 },
             )
             await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO worker_artifact_payloads (artifact_id, content) "
                     "VALUES (:artifact_id, :content)"
-                ),
+                )),
                 {
                     "artifact_id": int(prompt_artifact.scalar_one()),
                     "content": prompt_bytes,
@@ -2431,7 +2431,7 @@ class DockerSandboxDispatcher:
         self.preview_staging_root.mkdir(parents=True, exist_ok=True)
         async with self.database.sessions() as session:
             manifests = await session.execute(
-                text("SELECT staging_path, created_at FROM export_manifests")
+                runner_sql(text("SELECT staging_path, created_at FROM export_manifests"))
             )
             cutoff = datetime.now(UTC).timestamp() - self.preview_ttl_hours * 3600
             known_staging = {
@@ -2440,7 +2440,7 @@ class DockerSandboxDispatcher:
                 if row.created_at.timestamp() >= cutoff
             }
             previews = await session.execute(
-                text("SELECT preview_id, expires_at FROM previews")
+                runner_sql(text("SELECT preview_id, expires_at FROM previews"))
             )
             now = datetime.now(UTC)
             known_previews = {
@@ -2467,10 +2467,10 @@ class DockerSandboxDispatcher:
         try:
             async with self.database.sessions() as session:
                 await session.execute(
-                    text(
+                    runner_sql(text(
                         "INSERT INTO worker_run_events (run_id, status, detail) "
                         "VALUES (:run_id, 'failed', :detail)"
-                    ),
+                    )),
                     {"run_id": numeric_run_id, "detail": detail},
                 )
                 await session.commit()
@@ -2482,7 +2482,7 @@ class DockerSandboxDispatcher:
             return
         async with self.database.sessions() as session:
             result = await session.execute(
-                text("SELECT preview_id FROM previews WHERE expires_at <= now()")
+                runner_sql(text("SELECT preview_id FROM previews WHERE expires_at <= now()"))
             )
             expired = [str(row.preview_id) for row in result]
         for identifier in expired:
@@ -2701,12 +2701,12 @@ class DockerSandboxDispatcher:
             return
         async with self.database.sessions() as session:
             await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO worker_operation_output_chunks "
                     "(run_id, operation_index, stream, sequence, byte_offset, content) "
                     "VALUES (:run_id, :operation_index, :stream, :sequence, "
                     ":byte_offset, :content)"
-                ),
+                )),
                 {
                     "run_id": run_id,
                     "operation_index": operation_index,
@@ -2717,7 +2717,7 @@ class DockerSandboxDispatcher:
                 },
             )
             await session.execute(
-                text(
+                runner_sql(text(
                     "WITH retained AS ("
                     "SELECT id, COALESCE(SUM(octet_length(content)) OVER ("
                     "PARTITION BY run_id, operation_index ORDER BY id DESC"
@@ -2727,7 +2727,7 @@ class DockerSandboxDispatcher:
                     ") DELETE FROM worker_operation_output_chunks c "
                     "USING retained r WHERE c.id = r.id "
                     "AND r.retained_bytes > :maximum"
-                ),
+                )),
                 {
                     "run_id": run_id,
                     "operation_index": operation_index,
@@ -2739,10 +2739,10 @@ class DockerSandboxDispatcher:
     async def _prune_output_chunks(self, run_id: int, operation_index: int) -> None:
         async with self.database.sessions() as session:
             await session.execute(
-                text(
+                runner_sql(text(
                     "DELETE FROM worker_operation_output_chunks "
                     "WHERE run_id = :run_id AND operation_index = :operation_index"
-                ),
+                )),
                 {"run_id": run_id, "operation_index": operation_index},
             )
             await session.commit()
@@ -2803,11 +2803,11 @@ class DockerSandboxDispatcher:
     ) -> None:
         async with self.database.sessions() as session:
             await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO worker_run_events "
                     "(run_id, status, detail, operation_index, task_id) "
                     "VALUES (:run_id, :status, :detail, :operation_index, :task_id)"
-                ),
+                )),
                 {
                     "run_id": run_id, "status": status, "detail": detail,
                     "operation_index": operation_index, "task_id": task_id,
@@ -2839,13 +2839,13 @@ class DockerSandboxDispatcher:
     ) -> None:
         async with self.database.sessions() as session:
             result = await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO worker_operations "
                     "(run_id, task_id, operation_index, name, status, stdout, stderr, "
                     "exit_code, started_at, finished_at) VALUES "
                     "(:run_id, :task_id, :operation_index, :name, :status, :stdout, "
                     ":stderr, :exit_code, :started_at, now()) RETURNING id"
-                ),
+                )),
                 {
                     "run_id": run_id, "task_id": operation.task_id,
                     "operation_index": index, "name": operation.name,
@@ -2856,12 +2856,12 @@ class DockerSandboxDispatcher:
             operation_id = int(result.scalar_one())
             for kind, content in (("stdout", stdout), ("stderr", stderr)):
                 artifact = await session.execute(
-                    text(
+                    runner_sql(text(
                         "INSERT INTO worker_artifacts "
                         "(run_id, operation_id, kind, path, sha256, byte_size) "
                         "VALUES (:run_id, :operation_id, :kind, :path, :sha256, "
                         ":size) RETURNING id"
-                    ),
+                    )),
                     {
                         "run_id": run_id, "operation_id": operation_id,
                         "kind": kind,
@@ -2872,10 +2872,10 @@ class DockerSandboxDispatcher:
                 )
                 artifact_id = int(artifact.scalar_one())
                 await session.execute(
-                    text(
+                    runner_sql(text(
                         "INSERT INTO worker_artifact_payloads "
                         "(artifact_id, content) VALUES (:artifact_id, :content)"
-                    ),
+                    )),
                     {"artifact_id": artifact_id, "content": content.encode()},
                 )
             await session.commit()
@@ -2916,22 +2916,22 @@ class DockerSandboxDispatcher:
             async with self.database.sessions() as session:
                 if kind in {"screenshot", "browser_evidence"}:
                     capture_count = await session.execute(
-                        text(
+                        runner_sql(text(
                             "SELECT COUNT(*) FROM worker_artifacts "
                             "WHERE run_id = :run_id "
                             "AND kind IN ('screenshot', 'browser_evidence')"
-                        ),
+                        )),
                         {"run_id": run_id},
                     )
                     if int(capture_count.scalar_one()) >= MAX_CAPTURE_ARTIFACTS_PER_RUN:
                         continue
                 artifact = await session.execute(
-                    text(
+                    runner_sql(text(
                         "INSERT INTO worker_artifacts "
                         "(run_id, kind, path, sha256, byte_size) "
                         "VALUES (:run_id, :kind, :path, :sha256, :byte_size) "
                         "RETURNING id"
-                    ),
+                    )),
                     {
                         "run_id": run_id,
                         "kind": kind,
@@ -2942,10 +2942,10 @@ class DockerSandboxDispatcher:
                 )
                 artifact_id = int(artifact.scalar_one())
                 await session.execute(
-                    text(
+                    runner_sql(text(
                         "INSERT INTO worker_artifact_payloads "
                         "(artifact_id, content) VALUES (:artifact_id, :content)"
-                    ),
+                    )),
                     {"artifact_id": artifact_id, "content": content},
                 )
                 await session.commit()
@@ -2962,12 +2962,12 @@ class DockerSandboxDispatcher:
             content = path.read_bytes()
             async with self.database.sessions() as session:
                 artifact = await session.execute(
-                    text(
+                    runner_sql(text(
                         "INSERT INTO worker_artifacts "
                         "(run_id, kind, path, sha256, byte_size) "
                         "VALUES (:run_id, 'generated_image', :path, :sha256, :size) "
                         "RETURNING id"
-                    ),
+                    )),
                     {
                         "run_id": run_id,
                         "path": str(path.relative_to(workspace)),
@@ -2976,10 +2976,10 @@ class DockerSandboxDispatcher:
                     },
                 )
                 await session.execute(
-                    text(
+                    runner_sql(text(
                         "INSERT INTO worker_artifact_payloads (artifact_id, content) "
                         "VALUES (:artifact_id, :content)"
-                    ),
+                    )),
                     {"artifact_id": int(artifact.scalar_one()), "content": content},
                 )
                 await session.commit()
@@ -3069,10 +3069,10 @@ class WorkerRunManager:
             )
             run_id = int(result.scalar_one())
             await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO worker_run_events (run_id, status, detail) "
                     "VALUES (:run_id, 'queued', 'awaiting sandbox slot')"
-                ),
+                )),
                 {"run_id": run_id},
             )
             await session.commit()
@@ -3084,10 +3084,10 @@ class WorkerRunManager:
     async def _record(self, run_id: int, status: str, detail: str) -> None:
         async with self.database.sessions() as session:
             await session.execute(
-                text(
+                runner_sql(text(
                     "INSERT INTO worker_run_events (run_id, status, detail) "
                     "VALUES (:run_id, :status, :detail)"
-                ),
+                )),
                 {"run_id": run_id, "status": status, "detail": detail},
             )
             await session.commit()
@@ -3095,47 +3095,47 @@ class WorkerRunManager:
     async def detail(self, run_id: int) -> dict[str, object] | None:
         async with self.database.sessions() as session:
             run_result = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT r.id, r.revision_id, r.limits, r.workspace_id, r.job_type, "
                     "r.job_config, r.created_at, "
                     "p.namespace "
                     "FROM worker_runs r JOIN plan_revisions p ON p.id = r.revision_id "
                     "WHERE r.id = :run_id"
-                ),
+                )),
                 {"run_id": run_id},
             )
             run = run_result.mappings().one_or_none()
             if run is None:
                 return None
             events = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT id, status, detail, operation_index, task_id, created_at "
                     "FROM worker_run_events WHERE run_id = :run_id ORDER BY id"
-                ),
+                )),
                 {"run_id": run_id},
             )
             operations = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT id, task_id, operation_index, name, status, stdout, stderr, "
                     "exit_code, started_at, finished_at FROM worker_operations "
                     "WHERE run_id = :run_id ORDER BY operation_index"
-                ),
+                )),
                 {"run_id": run_id},
             )
             artifacts = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT id, operation_id, kind, path, sha256, byte_size, "
                     "original_byte_size, truncated "
                     "FROM worker_artifacts WHERE run_id = :run_id ORDER BY id"
-                ),
+                )),
                 {"run_id": run_id},
             )
             model_calls = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT id, task_id, iteration, route, model, prompt_tokens, "
                     "completion_tokens, total_tokens, reasoning_tokens, cost_usd, created_at "
                     "FROM worker_model_calls WHERE run_id = :run_id ORDER BY id"
-                ),
+                )),
                 {"run_id": run_id},
             )
             model_call_rows = [dict(row._mapping) for row in model_calls]
@@ -3155,10 +3155,10 @@ class WorkerRunManager:
     async def latest_status(self, run_id: int) -> str | None:
         async with self.database.sessions() as session:
             result = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT status FROM worker_run_events "
                     "WHERE run_id = :run_id ORDER BY id DESC LIMIT 1"
-                ),
+                )),
                 {"run_id": run_id},
             )
             status = result.scalar_one_or_none()
@@ -3167,11 +3167,11 @@ class WorkerRunManager:
     async def events_after(self, run_id: int, event_id: int) -> list[dict[str, object]]:
         async with self.database.sessions() as session:
             result = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT id, status, detail, operation_index, task_id, created_at "
                     "FROM worker_run_events "
                     "WHERE run_id = :run_id AND id > :event_id ORDER BY id"
-                ),
+                )),
                 {"run_id": run_id, "event_id": event_id},
             )
             return [dict(row._mapping) for row in result]
@@ -3181,12 +3181,12 @@ class WorkerRunManager:
     ) -> list[dict[str, object]]:
         async with self.database.sessions() as session:
             result = await session.execute(
-                text(
+                runner_sql(text(
                     "SELECT id, operation_index, stream, sequence, byte_offset, "
                     "content, created_at "
                     "FROM worker_operation_output_chunks "
                     "WHERE run_id = :run_id AND id > :chunk_id ORDER BY id"
-                ),
+                )),
                 {"run_id": run_id, "chunk_id": chunk_id},
             )
             return [
@@ -3907,11 +3907,11 @@ async def approved_revision(
     if revision is None:
         raise ValueError("plan revision not found")
     result = await session.execute(
-        text(
+        runner_sql(text(
             "SELECT revision_id, content_hash FROM plan_approvals "
             "WHERE revision_id = :revision AND decision = 'approved' "
             "ORDER BY id DESC LIMIT 1"
-        ),
+        )),
         {"revision": revision_id},
     )
     row = result.mappings().one_or_none()

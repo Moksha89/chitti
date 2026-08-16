@@ -721,6 +721,7 @@ docker run --rm --network host --env-file "${RUNNER_ENV}" \
   --entrypoint python "${runner_image}" -c '
 import asyncio
 import os
+from pathlib import Path
 import asyncpg
 
 async def main():
@@ -735,10 +736,41 @@ async def main():
     from chitti.runner_access import assert_runner_privileges
     await assert_runner_privileges(conn)
 
+    from chitti.runner import best_effort_preview_maintenance
+    from chitti.settings import get_settings
+    from chitti.worker import DockerSandboxDispatcher
+    from chitti.db import Database
+
+    database = Database(get_settings())
+    class FailingDispatcher:
+        async def cleanup_expired_previews(self):
+            raise RuntimeError("deployment maintenance resilience proof")
+
+    await best_effort_preview_maintenance(database, FailingDispatcher())
+    health = await conn.fetchrow(
+        "SELECT status, detail FROM runner_health "
+        "WHERE component = '\''preview_cleanup'\''"
+    )
+    if health is None or health["status"] != "failed" or \
+       "deployment maintenance resilience proof" not in health["detail"]:
+        raise SystemExit("maintenance failure was not durably recorded")
+
+    preview_root = Path("/tmp/chitti-preview-proof")
+    preview_root.mkdir(parents=True, exist_ok=True)
+    dispatcher = DockerSandboxDispatcher(database, preview_root=preview_root)
+    await best_effort_preview_maintenance(database, dispatcher)
+    health = await conn.fetchrow(
+        "SELECT status FROM runner_health "
+        "WHERE component = '\''preview_cleanup'\''"
+    )
+    if health is None or health["status"] != "healthy":
+        raise SystemExit("preview maintenance success was not recorded")
+    await database.close()
     await conn.close()
 
 asyncio.run(main())
 '
+echo "Runner maintenance path and failure isolation proof passed."
 
 systemctl is-enabled --quiet "${RUNNER_UNIT}"
 systemctl is-active --quiet "${RUNNER_UNIT}"

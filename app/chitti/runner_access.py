@@ -138,6 +138,7 @@ def _scan_privileges(
             privileges.setdefault(table, set()).add("SELECT")
         if re.search(r"\bON\s+CONFLICT\b[\s\S]*?\bDO\s+UPDATE\b", statement, re.I):
             privileges.setdefault(table, set()).add("UPDATE")
+            privileges.setdefault(table, set()).add("SELECT")
     for match in _DELETE_USING.finditer(source):
         privileges.setdefault(match.group(1).lower(), set()).add("SELECT")
     return privileges
@@ -161,6 +162,55 @@ def _declared_segments(source: str, marker: str) -> list[str]:
             if segment is not None:
                 segments.append(segment)
     return segments
+
+
+def _unmarked_sql_calls(source: str) -> list[int]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    parents: dict[int, list[ast.AST]] = {}
+
+    def visit(node: ast.AST, ancestors: list[ast.AST]) -> None:
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = ancestors + [node]
+            visit(child, ancestors + [node])
+
+    visit(tree, [])
+    markers = {"application_only_sql", "runner_sql", "sync_sql"}
+    unmarked: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (
+            (isinstance(node.func, ast.Name) and node.func.id == "text")
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == "text")
+        ):
+            continue
+        if any(
+            isinstance(parent, ast.Call)
+            and isinstance(parent.func, ast.Name)
+            and parent.func.id in markers
+            for parent in parents.get(id(node), [])
+        ):
+            continue
+        unmarked.append(node.lineno)
+    return unmarked
+
+
+def _validate_sql_markers(source_texts: list[str]) -> None:
+    # This rejects every statically visible sqlalchemy.text(...) call. SQL
+    # assembled dynamically or passed to execute without text(...) is outside
+    # this source-level check and must remain covered by the runtime boundary.
+    for source in source_texts:
+        lines = _unmarked_sql_calls(source)
+        if lines:
+            values = ", ".join(str(line) for line in sorted(lines))
+            raise SystemExit(
+                "runner privilege source contains unmarked SQL; wrap each "
+                f"text(...) call in runner_sql(...) or application_only_sql(...): "
+                f"lines {values}"
+            )
 
 
 def _declared_privileges(
@@ -223,6 +273,7 @@ def required_privileges(
 def derived_grants(
     source_texts: list[str], known_tables: set[str]
 ) -> dict[str, set[str]]:
+    _validate_sql_markers(source_texts)
     required = required_privileges(source_texts, known_tables)
     if not required:
         raise SystemExit("runner privilege derivation produced no table expectations")

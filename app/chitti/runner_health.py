@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import text
 
 from .db import Database
-from .runner_access import runner_sql
+from .runner_access import application_only_sql, runner_sql
 
 
 async def record_runner_health_failure(
@@ -53,10 +53,10 @@ async def record_runner_health_success(database: Database, component: str) -> No
 async def recent_runner_health(database: Database) -> list[dict[str, object]]:
     async with database.sessions() as session:
         result = await session.execute(
-            text(
+            application_only_sql(text(
                 "SELECT component, status, detail, first_failed_at, last_failed_at, "
                 "consecutive_failures, last_succeeded_at FROM runner_health "
                 "ORDER BY COALESCE(last_succeeded_at, last_failed_at) DESC"
-            )
+            ))
         )
         return [dict(row) for row in result.mappings()]
