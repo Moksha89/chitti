@@ -72,6 +72,13 @@ def test_install_mismatch_feedback_names_lockfile_sync_operation() -> None:
     assert "sync-lockfile" in _model_system_prompt()
 
 
+def test_poster_prompt_keeps_working_notes_out_of_export() -> None:
+    prompt = _model_system_prompt(POSTER_POLICY, job_config={})
+    assert "working notes, evidence JSON" in prompt
+    assert "under artifacts/" in prompt
+    assert "never under out/" in prompt
+
+
 def test_starter_context_summarizes_direct_dependencies(tmp_path) -> None:
     (tmp_path / "package.json").write_text(
         '{"dependencies":{"next":"14.2.35"},'
@@ -280,6 +287,23 @@ def test_repeated_failures_survive_inspection_until_failure_limit() -> None:
     assert _progress_counters(
         failures, turns, workspace_changed=False, failure=True
     ) == (2, 3)
+
+
+def test_identical_tool_failures_warn_then_stop() -> None:
+    from chitti.worker import _identical_tool_failure_detail
+
+    detail, failure, count = _identical_tool_failure_detail(
+        "T1", "run_command", "same failure", None, 0
+    )
+    assert (detail, failure, count) == ("same failure", ("run_command", "same failure"), 1)
+    detail, failure, count = _identical_tool_failure_detail(
+        "T1", "run_command", "same failure", failure, count
+    )
+    assert "repeating it once more" in detail
+    with pytest.raises(RuntimeError, match="consecutive identical"):
+        _identical_tool_failure_detail(
+            "T1", "run_command", "same failure", failure, count
+        )
 
 
 def test_model_token_budget_round_trip() -> None:

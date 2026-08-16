@@ -20,6 +20,14 @@ grep -Fq 'fields = Settings.model_fields' "${script}"
 grep -Fq 'Settings model fields are empty or unavailable' "${script}"
 grep -Fq 'could not derive application settings from the Settings model' "${script}"
 ! grep -Fq 'required_app_settings=(' "${script}"
+grep -Fq 'pip install --quiet --disable-pip-version-check \' "${script}"
+grep -Fq -- '-r "${INSTALL_DIR}/app/requirements.txt"' "${script}"
+grep -Fq 'docker cp "${matte_model_container}:${MATTE_MODEL_IMAGE_PATH}"' "${script}"
+grep -Fq 'application image matting weights digest mismatch' "${script}"
+grep -Fq 'host runner matting weights digest mismatch' "${script}"
+grep -Fq 'CHITTI_MATTE_MODEL_PATH' "${script}"
+grep -Fq 'could not derive matting model digest from app/Dockerfile' "${script}"
+! grep -Eq '[[:xdigit:]]{64}' "${script}"
 gateway_input='{"data":[{"id":"chitti-chat"}]}'
 parsed_gateway_input="$(
   CHITTI_GATEWAY_MODELS_JSON="${gateway_input}" \

@@ -15,9 +15,6 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
-import numpy as np
-import onnxruntime
-from PIL import Image, ImageFilter
 from sqlalchemy import text
 
 from .runner_access import runner_sql
@@ -37,7 +34,7 @@ MATTE_MODEL_PATH = Path(os.getenv("CHITTI_MATTE_MODEL_PATH", "/app/models/u2net.
 MATTE_INPUT_SIZE = 320
 MATTE_MIN_SUBJECT_AREA = 0.005
 MATTE_MAX_SUBJECT_AREA = 0.95
-_matte_session: onnxruntime.InferenceSession | None = None
+_matte_session: Any = None
 _matte_lock = threading.Lock()
 
 
@@ -88,6 +85,14 @@ def _cutout_image(
     *,
     feather_radius: float = 1.25,
 ) -> tuple[bytes, dict[str, object]]:
+    try:
+        import numpy as np
+        import onnxruntime
+        from PIL import Image, ImageFilter
+    except ImportError as exc:
+        raise ImageManifestRefused(
+            f"matting runtime unavailable: {exc.name or 'required dependency'}"
+        ) from exc
     try:
         image = Image.open(BytesIO(raw)).convert("RGBA")
     except Exception as exc:
