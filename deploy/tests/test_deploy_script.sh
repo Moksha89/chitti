@@ -26,6 +26,8 @@ grep -Fq 'docker cp "${matte_model_container}:${MATTE_MODEL_IMAGE_PATH}"' "${scr
 grep -Fq 'application image matting weights digest mismatch' "${script}"
 grep -Fq 'host runner matting weights digest mismatch' "${script}"
 grep -Fq 'CHITTI_MATTE_MODEL_PATH' "${script}"
+grep -Fq 'could not derive matting model digest from app/Dockerfile' "${script}"
+! grep -Eq '[[:xdigit:]]{64}' "${script}"
 gateway_input='{"data":[{"id":"chitti-chat"}]}'
 parsed_gateway_input="$(
   CHITTI_GATEWAY_MODELS_JSON="${gateway_input}" \

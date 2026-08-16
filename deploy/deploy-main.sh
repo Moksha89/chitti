@@ -13,7 +13,6 @@ RUNNER_VENV_DIR="${RUNNER_VENV_DIR:-/opt/chitti-runner}"
 RUNNER_PYTHON="${RUNNER_PYTHON:-/opt/chitti-runner/bin/python}"
 MATTE_MODEL_PATH="${MATTE_MODEL_PATH:-/opt/chitti-runner-models/u2net.onnx}"
 MATTE_MODEL_IMAGE_PATH="/app/models/u2net.onnx"
-MATTE_MODEL_SHA256="8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491"
 GOOGLE_SYNC_ENV="${GOOGLE_SYNC_ENV:-/etc/chitti/google-sync.env}"
 GOOGLE_SYNC_UNIT="chitti-google-sync.service"
 GOOGLE_SYNC_UNIT_SOURCE="${GOOGLE_SYNC_UNIT_SOURCE:-deploy/google-sync/chitti-google-sync.service}"
@@ -138,6 +137,18 @@ assert_process_setting_forwarded() {
 
 git -c safe.directory="${INSTALL_DIR}" fetch --quiet origin "${REMOTE_BRANCH}"
 git -c safe.directory="${INSTALL_DIR}" checkout --quiet --detach "origin/${REMOTE_BRANCH}"
+
+mapfile -t matte_model_digests < <(
+  sed -nE \
+    's/.*echo "([[:xdigit:]]{64})  \/app\/models\/u2net\.onnx".*/\1/p' \
+    app/Dockerfile
+)
+if [[ "${#matte_model_digests[@]}" -ne 1 ]] ||
+  [[ -z "${matte_model_digests[0]:-}" ]]; then
+  echo "could not derive matting model digest from app/Dockerfile" >&2
+  exit 1
+fi
+MATTE_MODEL_SHA256="${matte_model_digests[0]}"
 
 install -d -o root -g root -m 0750 \
   /var/lib/chitti-previews /var/lib/chitti-preview-staging
