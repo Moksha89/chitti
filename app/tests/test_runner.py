@@ -90,6 +90,25 @@ def test_reminder_sweep_failure_is_isolated(monkeypatch) -> None:
     assert reported == [("reminder_sweep", "RuntimeError: database unavailable")]
 
 
+def test_preview_maintenance_failure_is_isolated(monkeypatch) -> None:
+    class Dispatcher:
+        async def cleanup_expired_previews(self) -> None:
+            raise RuntimeError("database unavailable")
+
+    reported: list[tuple[str, str]] = []
+
+    async def report(_database, component, detail) -> None:
+        reported.append((component, detail))
+
+    monkeypatch.setattr("chitti.runner.record_runner_health_failure", report)
+    asyncio.run(
+        runner.best_effort_preview_maintenance(
+            None, Dispatcher()  # type: ignore[arg-type]
+        )
+    )
+    assert reported == [("preview_cleanup", "RuntimeError: database unavailable")]
+
+
 def test_successful_reminder_sweep_health_write_is_throttled(monkeypatch) -> None:
     async def sweep(_database, **_kwargs) -> int:
         return 0
@@ -112,6 +131,16 @@ def test_runner_access_derives_new_schema_table_without_table_list() -> None:
         ["SELECT id FROM newly_added_table"],
         {"newly_added_table"},
     ) == {"newly_added_table": {"SELECT"}}
+
+
+def test_runner_access_rejects_unmarked_sql() -> None:
+    with pytest.raises(
+        SystemExit, match="contains unmarked SQL.*lines 1"
+    ):
+        derived_grants(
+            ["text('SELECT id FROM newly_added_table')"],
+            {"newly_added_table"},
+        )
 
 
 def test_runner_access_follows_newly_imported_module(tmp_path, monkeypatch) -> None:

@@ -96,6 +96,22 @@ async def best_effort_reminder_sweep(
             logger.exception("reminder sweep health reporting failed")
 
 
+async def best_effort_preview_maintenance(
+    database: Database, dispatcher: DockerSandboxDispatcher
+) -> None:
+    try:
+        await dispatcher.cleanup_expired_previews()
+        await record_runner_health_success(database, "preview_cleanup")
+    except Exception as exc:
+        logger.exception("preview cleanup failed")
+        try:
+            await record_runner_health_failure(
+                database, "preview_cleanup", f"{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            logger.exception("preview cleanup health reporting failed")
+
+
 async def next_queued_run(
     database: Database, runner_id: str = "legacy-runner"
 ) -> Mapping[str, object] | None:
@@ -639,7 +655,7 @@ async def run_forever() -> None:
         if interrupted:
             logger.warning("marked interrupted worker runs after restart: %s", interrupted)
         while True:
-            await dispatcher.cleanup_expired_previews()
+            await best_effort_preview_maintenance(database, dispatcher)
             await publish_approved_previews(database, settings)
             await reconcile_cancelled_run(database)
             await best_effort_reminder_sweep(database, settings.display_timezone)
