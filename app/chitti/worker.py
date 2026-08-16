@@ -45,6 +45,7 @@ from .plans import (
 )
 from .previews import copy_export, remove_preview
 from .provider import (
+    CODER_MAX_OUTPUT_TOKENS,
     CODER_ROUTE,
     REVIEWER_ROUTE,
     VISION_ROUTE,
@@ -157,10 +158,13 @@ def _model_call_failure_detail(route: str, exc: Exception) -> str:
             if exc.retry_failures
             else ""
         )
-        return (
+        detail = (
             f"model provider failure on route {route}: "
             f"class={exc.failure_class} attempts={exc.attempts}{retry_detail}: {exc}"
         )
+        if exc.response_diagnostics:
+            detail += " diagnostics=" + " | ".join(exc.response_diagnostics)
+        return detail
     return f"model response processing failed on route {route}: {exc}"
 
 
@@ -197,6 +201,7 @@ def _model_failure_completion(route: str, exc: Exception) -> ModelCompletion:
             if provider
             else ()
         ),
+        response_diagnostics=provider.response_diagnostics if provider else (),
     )
 
 
@@ -370,8 +375,9 @@ def _gate_refusal_progress(
 def _model_response_failure(completion: ModelCompletion) -> str | None:
     if completion.finish_reason == "length":
         detail = (
-            "model response was truncated before a complete tool call; "
-            "be brief and split large file writes across multiple tool calls"
+            "model response exceeded the output limit before a complete tool call; "
+            f"the {CODER_MAX_OUTPUT_TOKENS}-token ceiling was reached, so split "
+            "large file writes across multiple tool calls and be brief"
         )
     elif not completion.content.strip() and not completion.tool_calls:
         detail = "model response had no visible content"
@@ -2026,6 +2032,14 @@ class DockerSandboxDispatcher:
                 },
                 separators=(",", ":"),
             )
+        if completion.response_diagnostics:
+            response_content = json.dumps(
+                {
+                    "content": completion.content,
+                    "diagnostics": list(completion.response_diagnostics),
+                },
+                separators=(",", ":"),
+            )
         content, content_size, content_truncated = _bounded_artifact(response_content)
         async with self.database.sessions() as session:
             result = await session.execute(
@@ -3600,8 +3614,11 @@ def _model_system_prompt(
             f"{manifest}\n"
             "The owner brand profile is "
             "authoritative and must be reflected exactly; do not invent colours, voice, "
-            "audience, or typography. Create the declared artifact under out/ and an "
-            "out/index.html entry that renders it for the cage capture. Run "
+            "audience, or typography. Create the declared artifact under out/. "
+            f"The coder output ceiling is {CODER_MAX_OUTPUT_TOKENS} tokens; split "
+            "large file writes across multiple tool calls rather than emitting one "
+            "enormous tool call. Create an out/index.html entry that renders it "
+            "for the cage capture. Run "
             "poster-export, then capture_screenshot using exactly the approved poster "
             f"artifact {approved['artifact']} at width {approved['width']}, height "
             f"{approved['height']}, and device scale {approved['scale']}. These "
@@ -3653,6 +3670,9 @@ def _model_system_prompt(
         "credentials, arbitrary argv, shell passthrough, or network tool exists. "
         "Write useful code early, then iterate using build and test feedback; do not "
         "read the entire workspace before making a first change."
+        f" The coder output ceiling is {CODER_MAX_OUTPUT_TOKENS} tokens; "
+        "if a response would exceed it, split large file writes across multiple "
+        "tool calls instead of emitting one enormous call."
         " Browser capture runs with no network: do not use remote assets, Drei "
         "Environment presets, Drei Text, remote fonts, external URLs, or runtime "
         "fetches. "

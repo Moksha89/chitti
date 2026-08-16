@@ -70,6 +70,7 @@ def test_install_mismatch_feedback_names_lockfile_sync_operation() -> None:
     assert "sync-lockfile" in _install_failure_detail("install", detail)
     assert _install_failure_detail("build", detail) == detail
     assert "sync-lockfile" in _model_system_prompt()
+    assert "output ceiling" in _model_system_prompt()
 
 
 def test_poster_prompt_keeps_working_notes_out_of_export() -> None:
@@ -77,6 +78,7 @@ def test_poster_prompt_keeps_working_notes_out_of_export() -> None:
     assert "working notes, evidence JSON" in prompt
     assert "under artifacts/" in prompt
     assert "never under out/" in prompt
+    assert "output ceiling" in prompt
 
 
 def test_starter_context_summarizes_direct_dependencies(tmp_path) -> None:
@@ -521,6 +523,8 @@ def test_truncated_model_response_is_reported_distinctly() -> None:
     )
     detail = _model_response_failure(completion)
     assert detail is not None
+    assert "output limit" in detail
+    assert "32768-token ceiling" in detail
     assert "be brief" in detail
     assert not completion.message_fields
 
