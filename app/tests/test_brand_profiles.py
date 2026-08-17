@@ -137,5 +137,5 @@ def test_brand_color_rejects_invalid_hex_length() -> None:
 def test_brand_color_accepts_only_supported_renderable_forms() -> None:
     assert validate_brand_color("#1234") == "#1234"
     assert validate_brand_color("rgb(1, 2, 3)") == "rgb(1, 2, 3)"
-    with pytest.raises(ValueError):
-        validate_brand_color("crimson")
+    assert validate_brand_color("crimson") == "crimson"
+    assert validate_brand_color("beige") == "beige"

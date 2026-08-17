@@ -279,12 +279,17 @@ async def test_visual_critique_caps_two_failing_cycles(tmp_path: Path) -> None:
     await dispatcher._visual_critique(
         1, "task", 1, tmp_path, WorkerLimits(), state, "fixture brief", None
     )
-    image.write_bytes(_visual_png() + b"changed")
+    for iteration in range(2, 5):
+        image.write_bytes(_visual_png() + f"changed-{iteration}".encode())
+        if iteration < 4:
+            await dispatcher._visual_critique(
+                1, "task", iteration, tmp_path, WorkerLimits(), state, "fixture brief", None
+            )
     with pytest.raises(VisualReviewInconclusive, match="maximum repair cycles"):
         await dispatcher._visual_critique(
-            1, "task", 2, tmp_path, WorkerLimits(), state, "fixture brief", None
+            1, "task", 5, tmp_path, WorkerLimits(), state, "fixture brief", None
         )
-    assert state["cycles"] == 2
+    assert state["cycles"] == 4
 
 
 @pytest.mark.asyncio

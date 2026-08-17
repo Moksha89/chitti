@@ -13,6 +13,7 @@ from chitti.job_types import (
     WEBSITE_POLICY,
     policy_for,
     poster_config,
+    poster_config_within_ceiling,
 )
 from chitti.worker import (
     WorkerRunManager,
@@ -68,6 +69,41 @@ def test_poster_dimensions_and_scale_are_bounded() -> None:
         poster_config({"artifact": "poster.png"})
 
 
+def test_run_config_preserves_approved_research_context() -> None:
+    approved = {
+        "artifact": "poster.html",
+        "width": 1080,
+        "height": 1350,
+        "scale": 1,
+        "likeness_policy": "real_likeness_permitted",
+        "research_package_id": 4,
+        "research_facts": {"fixture": [{"value": "15 February 2026"}]},
+    }
+    result = poster_config_within_ceiling(
+        {"artifact": "poster.html", "width": 1080, "height": 1350, "scale": 1,
+         "likeness_policy": "real_likeness_permitted",
+         "research_package_id": 4},
+        approved,
+    )
+    assert result["research_package_id"] == 4
+    assert result["research_facts"] == approved["research_facts"]
+
+
+def test_run_config_refuses_missing_approved_research_package() -> None:
+    approved = {
+        "artifact": "poster.html",
+        "width": 1080,
+        "height": 1350,
+        "scale": 1,
+        "research_package_id": 4,
+    }
+    with pytest.raises(ValueError, match="research package is missing"):
+        poster_config_within_ceiling(
+            {"artifact": "poster.html", "width": 1080, "height": 1350, "scale": 1},
+            approved,
+        )
+
+
 def test_poster_prompts_require_brand_and_honest_visual_review() -> None:
     prompt = _model_system_prompt(
         POSTER_POLICY,
@@ -88,6 +124,8 @@ def test_poster_prompts_require_brand_and_honest_visual_review() -> None:
     assert "between 64 and 1024 pixels" in prompt
     assert "1080x1350" in prompt
     assert "useful source aspect ratio" in prompt
+    assert "full-body with visible feet" in prompt
+    assert "plain unbranded kits" in prompt
     assert "cinematic treatment as required" in prompt
     assert "every text block must maintain clear contrast" in prompt
     assert "generic figures by default" in prompt
