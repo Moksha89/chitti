@@ -87,6 +87,7 @@ def _visual_verdict(digest: str, verdict: str = "pass") -> str:
             "text_redundancy": "pass",
             "asset_sharpness": "pass",
             "kit_fidelity": "pass",
+            "research_copy": "pass",
             },
             "findings": (
                 []

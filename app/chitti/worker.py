@@ -126,7 +126,7 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "criteria must contain exactly these keys, each pass or fail: fixture_text, "
         "visual_hierarchy, readability, generated_imagery, composite_integrity, "
         "brand_constraints, text_contrast, cinematic_treatment, subject_scale, "
-        "text_redundancy, asset_sharpness, kit_fidelity.",
+        "text_redundancy, asset_sharpness, kit_fidelity, research_copy.",
         "composite_integrity fails when any placed image reads as a pasted rectangle: "
         "a visible box, panel or seam around it, a background inside it that differs "
         "from the poster background, or a washed-out block where the element sits. "
@@ -139,12 +139,20 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "empty areas, especially when the composition leaves a substantial dead "
         "middle or lower third.",
         "text_redundancy fails when the same fixture, matchup, date, venue, or "
-        "other information is stated twice in materially duplicated text blocks.",
+        "other information is stated twice in materially duplicated text blocks. "
+        "Treat case, punctuation, separators, and a versus marker as irrelevant: "
+        "'INDIA PAKISTAN' and 'India v Pakistan' are the same matchup and must fail "
+        "when both are visible.",
         "asset_sharpness fails when placed imagery is visibly blurry, soft, pixelated, "
         "upscaled, or cartoonish where photographic realism was requested.",
         "kit_fidelity fails when approved research facts describe kit colours and "
         "the visible figures contradict those colours; compare the image to the "
         "approved facts, not to invented palette names.",
+        "research_copy fails when a descriptive research value such as 'rich blue "
+        "foundation with striking orange panels' or 'traditional light green "
+        "colour scheme' is rendered as visible poster copy. Research descriptions "
+        "may guide imagery and styling, but only fixture facts—teams, competition, "
+        "date, time, and venue—may appear as text.",
         "text_contrast fails when any required text block is low-contrast against "
         "its immediate background, including a title or team name that becomes "
         "difficult to read because its colour is too close to the background. "
@@ -3502,6 +3510,7 @@ def _parse_visual_verdict(value: object, image_digest: str) -> dict[str, object]
         "text_redundancy",
         "asset_sharpness",
         "kit_fidelity",
+        "research_copy",
     )
     if not isinstance(value, dict):
         raise VisualReviewInconclusive("visual critique returned a non-object verdict")
@@ -3839,6 +3848,12 @@ def _model_system_prompt(
             "reported by image_manifest.resolved.json; request a larger asset instead. "
             "When research states kit colours, make the visible figures match those "
             "colours exactly and do not substitute invented panels or accents. "
+            "Research descriptions are design inputs, not poster copy: render only "
+            "fixture facts as text—teams, competition, date, time, and venue. Never "
+            "print descriptive kit values such as 'RICH BLUE & ORANGE' or "
+            "'TRADITIONAL LIGHT GREEN' under a team name. State the matchup only "
+            "once; 'INDIA PAKISTAN' and 'India v Pakistan' are duplicate matchup "
+            "copy even when capitalization or separators differ. "
             f"The coder output ceiling is {CODER_MAX_OUTPUT_TOKENS} tokens; split "
             "large file writes across multiple tool calls rather than emitting one "
             "enormous tool call. Create an out/index.html entry that references and "
