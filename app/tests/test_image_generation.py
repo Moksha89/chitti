@@ -19,6 +19,7 @@ from chitti.image_generation import (
     ImageProviderFailure,
     _call_runpod,
     _cutout_image,
+    _measure_kit_colour,
     _request_digest,
     _request_payload,
     generate_manifest_images,
@@ -40,6 +41,34 @@ class _ProviderResponse:
 
     def read(self) -> bytes:
         return self.content
+
+
+def test_kit_colour_measurement_prefers_blue_foundation() -> None:
+    from PIL import Image
+
+    image = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+    for x in range(20, 80):
+        for y in range(20, 70):
+            image.putpixel((x, y), (20, 70, 190, 255))
+    for x in range(50, 55):
+        for y in range(35, 40):
+            image.putpixel((x, y), (220, 70, 20, 255))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    measurement = _measure_kit_colour(buffer.getvalue(), "blue")
+    assert measurement["inconclusive"] is False
+    assert measurement["observed_plurality"] == "blue"
+
+
+def test_kit_colour_measurement_is_inconclusive_for_sparse_pixels() -> None:
+    from PIL import Image
+
+    image = Image.new("RGBA", (20, 20), (0, 0, 0, 0))
+    image.putpixel((10, 10), (20, 70, 190, 255))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    measurement = _measure_kit_colour(buffer.getvalue(), "blue")
+    assert measurement["inconclusive"] is True
 
 
 def test_runpod_polls_pending_job_until_completed(monkeypatch) -> None:

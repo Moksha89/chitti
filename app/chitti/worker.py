@@ -48,8 +48,10 @@ from .plans import (
 )
 from .previews import copy_export, remove_preview
 from .provider import (
+    CODER_FALLBACK_ROUTE,
     CODER_MAX_OUTPUT_TOKENS,
     CODER_ROUTE,
+    CODER_ROUTES,
     REVIEWER_ROUTE,
     VISION_FALLBACK_ROUTE,
     VISION_ROUTE,
@@ -85,6 +87,8 @@ IDENTICAL_TOOL_FAILURE_LIMIT = 3
 REQUIRED_GATE_COMMANDS = ("build", "test", "export")
 VISUAL_REVIEW_MAX_CYCLES = 4
 VISUAL_REVIEW_SPEND_CAP_USD = 0.20
+MODEL_TOKEN_BUDGET = 1_000_000
+MODEL_SPEND_BUDGET_USD = 1.50
 
 
 class RunBudgetExceeded(RuntimeError):
@@ -105,6 +109,17 @@ class ModelProgressError(RuntimeError):
 
 class VisualReviewInconclusive(RuntimeError):
     """The poster could not reach a trustworthy visual verdict."""
+
+
+MALFORMED_TOOL_RESPONSE = "model response was not valid JSON"
+PROSE_TOOL_RESPONSE = "model returned prose instead of a required tool call"
+
+
+def _is_malformed_tool_response(detail: str) -> bool:
+    return (
+        MALFORMED_TOOL_RESPONSE in detail
+        or PROSE_TOOL_RESPONSE in detail
+    )
 
 
 VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
@@ -137,7 +152,13 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "low-contrast that the poster would read as flat colour without it.",
         "subject_scale fails when focal subjects are small or soft against large "
         "empty areas, especially when the composition leaves a substantial dead "
-        "middle or lower third. Fail when the focal figures occupy only a minor "
+        "middle or lower third. Treat an empty lower third occupying roughly a "
+        "quarter or more of the canvas as substantial and fail it every time. "
+        "Estimate the unused lower-third percentage and the visible subject height "
+        "in your observations; use those measurements consistently rather than "
+        "changing the verdict for the same image digest. If the digest is unchanged, "
+        "the criterion verdict must be unchanged. "
+        "Fail when the focal figures occupy only a minor "
         "portion of the canvas rather than carrying the composition; estimate "
         "their visible height and reject figures that are plainly undersized. "
         "Fail when a subject floats in mid-air, is cropped across the body with "
@@ -173,8 +194,10 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "the policy is an owner decision carried in the run configuration. Generic "
         "figures are the default; real likenesses are permitted only when the "
         "recorded policy says so. Fabricated board "
-        "logos and fabricated trophy imagery remain prohibited regardless of likeness "
-        "policy.",
+        "logos, sponsor marks, crests, badges, and fabricated trophy imagery remain "
+        "prohibited regardless of likeness policy. Permitted real likenesses, real "
+        "faces, or real kits are not themselves brand violations and must not be "
+        "failed merely for being photographic or identifiable.",
         "verdict must be pass or fail, and must be fail if any criterion is fail. "
         "image_sha256 must exactly match the supplied digest. findings must be a list "
         "of objects with criterion, issue and action fields; every failed criterion "
@@ -492,7 +515,9 @@ def _reset_file_write_counters(
     total: int,
     per_file: dict[str, int],
 ) -> tuple[int, dict[str, int]]:
-    if not _run_command_was_executed(tool, arguments):
+    if tool != "capture_screenshot" and not _run_command_was_executed(
+        tool, arguments
+    ):
         return total, per_file
     return 0, {}
 
@@ -532,9 +557,9 @@ class WorkerLimits:
     shm_size: str = "256m"
     model_iterations: int = 40
     model_tool_calls: int = MODEL_TOOL_CALL_BUDGET
-    model_tokens: int = 500000
+    model_tokens: int = MODEL_TOKEN_BUDGET
     model_write_bytes: int = 2 * 1024 * 1024
-    model_spend_usd: float = 0.75
+    model_spend_usd: float = MODEL_SPEND_BUDGET_USD
     image_spend_usd: float = 0.10
     image_request_count: int = 12
     run_timeout_seconds: int = 7200
@@ -579,9 +604,11 @@ class WorkerLimits:
             model_tool_calls=int(
                 cast(int, values.get("model_tool_calls", MODEL_TOOL_CALL_BUDGET))
             ),
-            model_tokens=int(cast(int, values.get("model_tokens", 500000))),
+            model_tokens=int(cast(int, values.get("model_tokens", MODEL_TOKEN_BUDGET))),
             model_write_bytes=int(cast(int, values.get("model_write_bytes", 2 * 1024 * 1024))),
-            model_spend_usd=float(cast(float, values.get("model_spend_usd", 0.75))),
+            model_spend_usd=float(
+                cast(float, values.get("model_spend_usd", MODEL_SPEND_BUDGET_USD))
+            ),
             image_spend_usd=float(cast(float, values.get("image_spend_usd", 0.10))),
             image_request_count=int(cast(int, values.get("image_request_count", 12))),
             run_timeout_seconds=int(cast(int, values.get("run_timeout_seconds", 7200))),
@@ -904,6 +931,7 @@ class DockerSandboxDispatcher:
             command_outcomes: list[str] = []
             route = CODER_ROUTE
             failures = 0
+            malformed_responses = 0
             messages: list[dict[str, object]] = [
                 {"role": "system", "content": stable},
                 {
@@ -1039,8 +1067,8 @@ class DockerSandboxDispatcher:
                     completion = await self.model_provider.agent_completion(
                         messages,
                         route,
-                        tools=model_tool_schemas() if route == CODER_ROUTE else None,
-                        tool_choice="required" if route == CODER_ROUTE else None,
+                        tools=model_tool_schemas() if route in CODER_ROUTES else None,
+                        tool_choice="required" if route in CODER_ROUTES else None,
                     )
                 except Exception as exc:
                     if self._is_cancelled(run_id):
@@ -1055,6 +1083,30 @@ class DockerSandboxDispatcher:
                         run_id, task.id, iteration, route, failure,
                         prompt=json.dumps(messages, separators=(",", ":")),
                     )
+                    if (
+                        isinstance(exc, ModelProviderError)
+                        and exc.failure_class == "http 429"
+                        and route == CODER_ROUTE
+                    ):
+                        route = CODER_FALLBACK_ROUTE
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "TOOL FAILURE: coder route returned sustained "
+                                    "HTTP 429 capacity responses; continue using "
+                                    "the independent coder fallback route."
+                                ),
+                            }
+                        )
+                        await self._event(
+                            run_id,
+                            "model_route_switched",
+                            "switched to coder fallback after sustained HTTP 429 responses",
+                            task_id=task.id,
+                        )
+                        await compact_history()
+                        continue
                     await self._event(
                         run_id, "model_tool_failed",
                         detail[:1000],
@@ -1075,9 +1127,28 @@ class DockerSandboxDispatcher:
                 if spent > limits.model_spend_usd:
                     raise RunBudgetExceeded("model spend")
                 response_failure = _model_response_failure(completion)
+                if (
+                    response_failure is None
+                    and route in CODER_ROUTES
+                    and completion.finish_reason == "stop"
+                    and not completion.tool_calls
+                ):
+                    response_failure = PROSE_TOOL_RESPONSE
                 if response_failure is not None:
                     detail = response_failure
+                    if _is_malformed_tool_response(detail):
+                        malformed_responses += 1
+                    else:
+                        malformed_responses = 0
                     await record_nonproductive(detail)
+                    if malformed_responses >= 2 and route == CODER_ROUTE:
+                        route = CODER_FALLBACK_ROUTE
+                        await self._event(
+                            run_id,
+                            "model_route_switched",
+                            "switched to coder fallback after two malformed responses",
+                            task_id=task.id,
+                        )
                     messages.extend(
                         _tool_rejection_exchange(completion, f"TOOL FAILURE: {detail}")
                     )
@@ -1298,17 +1369,33 @@ class DockerSandboxDispatcher:
                                 batch_workspace_changed and batch_refusal_progress
                             ),
                         )
+                        malformed_batch_failure = _is_malformed_tool_response(
+                            batch_failure
+                        )
+                        if malformed_batch_failure:
+                            malformed_responses += 1
+                        else:
+                            malformed_responses = 0
                         if failures >= 2 and route == CODER_ROUTE:
-                            route = REVIEWER_ROUTE
-                            messages = _reviewer_diagnosis_messages(
-                                task.title, task.description,
-                                completion.tool_calls[0].name, batch_failure,
-                            )
-                            await self._event(
-                                run_id, "model_route_switched",
-                                "switched to reviewer after two failures on the same task",
-                                task_id=task.id,
-                            )
+                            if malformed_responses >= 2 and malformed_batch_failure:
+                                route = CODER_FALLBACK_ROUTE
+                                await self._event(
+                                    run_id,
+                                    "model_route_switched",
+                                    "switched to coder fallback after two malformed responses",
+                                    task_id=task.id,
+                                )
+                            else:
+                                route = REVIEWER_ROUTE
+                                messages = _reviewer_diagnosis_messages(
+                                    task.title, task.description,
+                                    completion.tool_calls[0].name, batch_failure,
+                                )
+                                await self._event(
+                                    run_id, "model_route_switched",
+                                    "switched to reviewer after two failures on the same task",
+                                    task_id=task.id,
+                                )
                             continue
                     elif batch_completed:
                         if batch_workspace_changed:
@@ -1475,16 +1562,30 @@ class DockerSandboxDispatcher:
                         tool, f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
                     )
                     await record_nonproductive(result_text)
+                    malformed_tool_failure = _is_malformed_tool_response(result_text)
+                    if malformed_tool_failure:
+                        malformed_responses += 1
+                    else:
+                        malformed_responses = 0
                     if failures >= 2 and route == CODER_ROUTE:
-                        route = REVIEWER_ROUTE
-                        messages = _reviewer_diagnosis_messages(
-                            task.title, task.description, tool, result_text
-                        )
-                        await self._event(
-                            run_id, "model_route_switched",
-                            "switched to reviewer after two failures on the same task",
-                            task_id=task.id,
-                        )
+                        if malformed_responses >= 2 and malformed_tool_failure:
+                            route = CODER_FALLBACK_ROUTE
+                            await self._event(
+                                run_id,
+                                "model_route_switched",
+                                "switched to coder fallback after two malformed responses",
+                                task_id=task.id,
+                            )
+                        else:
+                            route = REVIEWER_ROUTE
+                            messages = _reviewer_diagnosis_messages(
+                                task.title, task.description, tool, result_text
+                            )
+                            await self._event(
+                                run_id, "model_route_switched",
+                                "switched to reviewer after two failures on the same task",
+                                task_id=task.id,
+                            )
                         continue
                 messages.extend(
                     _tool_exchange(completion, result_text[:16000], native_call)
@@ -1630,7 +1731,7 @@ class DockerSandboxDispatcher:
         if tool == "visual_critique":
             if not policy.is_poster:
                 raise ValueError("visual critique is only available to poster jobs")
-            if route != CODER_ROUTE:
+            if route not in CODER_ROUTES:
                 raise ValueError("only the coder route may request visual critique")
             if visual_state is None:
                 raise ValueError("visual critique state was not initialized")
@@ -1646,8 +1747,8 @@ class DockerSandboxDispatcher:
                 job_config,
             )
         if tool == "write_file":
-            if route != CODER_ROUTE:
-                raise ValueError("reviewer route cannot write files")
+            if route not in CODER_ROUTES:
+                raise ValueError("only a coder route may write files")
             if (
                 policy.is_poster
                 and visual_state is not None
@@ -3819,6 +3920,28 @@ def _model_system_prompt(
         profile_data = getattr(profile, "__dict__", {})
         manifest = "\n".join(available_font_families()) or "(empty)"
         approved = poster_config(job_config or {})
+        india_player = "Suryakumar Yadav"
+        pakistan_player = "Babar Azam"
+        research_facts = approved.get("research_facts", {})
+        if isinstance(research_facts, dict):
+            squads = research_facts.get("squads", [])
+            if isinstance(squads, list):
+                for item in squads:
+                    if not isinstance(item, dict):
+                        continue
+                    key = str(item.get("key", "")).casefold()
+                    value = str(item.get("value", "")).strip()
+                    if key.startswith("india_squad_") and value:
+                        india_player = value
+                        break
+                for item in squads:
+                    if not isinstance(item, dict):
+                        continue
+                    key = str(item.get("key", "")).casefold()
+                    value = str(item.get("value", "")).strip()
+                    if key.startswith("pakistan_squad_") and value:
+                        pakistan_player = value
+                        break
         color_values = []
         for color in getattr(profile, "brand_colors", ()):
             label, value = split_brand_color(str(color))
@@ -3866,12 +3989,27 @@ def _model_system_prompt(
             "reported by image_manifest.resolved.json; request a larger asset instead. "
             "When research states kit colours, make the visible figures match those "
             "colours exactly and do not substitute invented panels or accents. "
+            f"Request a full-body photographic real likeness of {india_player} for "
+            "India and make that jersey predominantly rich blue with striking orange "
+            "panels; explicitly exclude white, cream, and orange-dominant jerseys. "
+            f"Request a full-body photographic real likeness of {pakistan_player} "
+            "for Pakistan and make that kit predominantly traditional light green; "
+            "exclude generic European-looking faces and white- or black-dominant "
+            "kits. Use only researched player names and do not invent appearance "
+            "facts or fabricated marks. "
             "Research descriptions are design inputs, not poster copy: render only "
             "fixture facts as text—teams, competition, date, time, and venue. Never "
             "print descriptive kit values such as 'RICH BLUE & ORANGE' or "
             "'TRADITIONAL LIGHT GREEN' under a team name. State the matchup only "
             "once; 'INDIA PAKISTAN' and 'India v Pakistan' are duplicate matchup "
             "copy even when capitalization or separators differ. "
+            "Repair findings are targeted: a kit_fidelity finding must regenerate "
+            "the named subject image through generate-images because CSS and layout "
+            "cannot change jersey pixels. A likeness or asset_sharpness finding must "
+            "regenerate the named subject asset. Subject-scale, cinematic, and "
+            "typography findings should preserve subjects that passed imagery "
+            "criteria and change composition or styling instead of regenerating all "
+            "figures. "
             f"The coder output ceiling is {CODER_MAX_OUTPUT_TOKENS} tokens; split "
             "large file writes across multiple tool calls rather than emitting one "
             "enormous tool call. Create an out/index.html entry that references and "
@@ -3897,7 +4035,13 @@ def _model_system_prompt(
             "generated asset; then run generate-images. The host owns the ComfyUI "
             "workflow and provider credentials, writes assets under out/generated, "
             "and resolves /workspace/image_manifest.resolved.json with real dimensions. The "
-            "manifest may set cutout=true for a subject asset; the host runs an "
+            "The manifest must include a generated full-bleed background plate with "
+            "purpose containing 'background'; a CSS gradient is not a substitute. "
+            "The background asset must be placed visibly across the poster canvas. "
+            "Every subject figure must set cutout=true; place the resolved matted "
+            "RGBA asset, never the raw generated PNG. Do not put a border, rounded "
+            "panel, card, or frame around a subject image. "
+            "The manifest may set cutout=true for a subject asset; the host runs an "
             "offline segmentation model and returns RGBA with feathered transparency, "
             "so do not fake transparency with opacity or screen blending. If a figure "
             "cannot be matted, compose it as an intentional full-bleed or framed panel "
@@ -3916,12 +4060,21 @@ def _model_system_prompt(
             "background plates are exempt from that subject rule and should be "
             "judged against the final canvas using cropping, background-size cover, "
             "or layout treatment. "
+            "Use a fixed-canvas layout contract: reserve a title band at the top, "
+            "a subject band occupying the lower two-thirds with figures meeting "
+            "the title and fixture zone, and a footer band inside the canvas for "
+            "the venue. Keep every band within the 1080x1350 canvas; never position "
+            "the footer below the canvas and trim it into view. "
             "image budget is "
             f"{WorkerLimits().image_request_count} requests and "
             f"${WorkerLimits().image_spend_usd:.2f}; cache hits do not rebill. "
+            f"The run model budget is {WorkerLimits().model_tokens} tokens and "
+            f"${WorkerLimits().model_spend_usd:.2f}; keep repairs concise so the "
+            "four-cycle visual loop fits inside those caps. "
             "When research states kit colours, copy each approved kit-colour "
-            "description literally into that figure's image_manifest prompt; do not "
-            "paraphrase or invert it. Request plain unbranded kits with no sponsor "
+            "description literally into that figure's image_manifest prompt, then "
+            "apply the concrete dominant-colour and exclusion directions above; do "
+            "not paraphrase or invert it. Request plain unbranded kits with no sponsor "
             "marks, board logos, crests, badges, or trophies. Undeclared local "
             "assets, remote URLs, data URLs, and runtime fetches "
             "are refused. Never write workflow JSON or provider credentials.\n"

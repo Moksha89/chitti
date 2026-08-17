@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import colorsys
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
+from PIL import Image
 from sqlalchemy import text
 
 from .runner_access import runner_sql
@@ -34,8 +36,80 @@ MATTE_MODEL_PATH = Path(os.getenv("CHITTI_MATTE_MODEL_PATH", "/app/models/u2net.
 MATTE_INPUT_SIZE = 320
 MATTE_MIN_SUBJECT_AREA = 0.005
 MATTE_MAX_SUBJECT_AREA = 0.95
+KIT_HUE_FAMILIES = (
+    ("red/orange", 0, 45),
+    ("yellow", 45, 70),
+    ("green", 70, 170),
+    ("cyan", 170, 200),
+    ("blue", 200, 260),
+    ("purple/magenta", 260, 330),
+    ("red/orange", 330, 360),
+)
 _matte_session: Any = None
 _matte_lock = threading.Lock()
+
+
+def _kit_family(description: str) -> str | None:
+    value = description.casefold()
+    if "blue" in value:
+        return "blue"
+    if "green" in value:
+        return "green"
+    if "orange" in value or "red" in value:
+        return "red/orange"
+    if "yellow" in value:
+        return "yellow"
+    return None
+
+
+def _measure_kit_colour(raw: bytes, expected: str) -> dict[str, object]:
+    image = Image.open(BytesIO(raw)).convert("RGBA")
+    alpha = image.getchannel("A")
+    bbox = alpha.getbbox()
+    if bbox is None:
+        return {
+            "expected_family": expected,
+            "observed_plurality": None,
+            "qualifying_pixels": 0,
+            "inconclusive": True,
+        }
+    left, top, right, bottom = bbox
+    width = right - left
+    height = bottom - top
+    crop = image.crop(
+        (
+            left + int(width * 0.30),
+            top + int(height * 0.25),
+            left + int(width * 0.70),
+            top + int(height * 0.55),
+        )
+    )
+    buckets: dict[str, int] = {}
+    qualifying = 0
+    pixels = list(crop.getdata())
+    for red, green, blue, alpha_value in pixels:
+        if alpha_value < 250:
+            continue
+        hue, saturation, _value = colorsys.rgb_to_hsv(
+            red / 255, green / 255, blue / 255
+        )
+        if saturation < 0.25:
+            continue
+        degrees = hue * 360
+        family = next(
+            name for name, start, end in KIT_HUE_FAMILIES
+            if start <= degrees < end
+        )
+        buckets[family] = buckets.get(family, 0) + 1
+        qualifying += 1
+    plurality = max(buckets, key=lambda name: buckets[name]) if buckets else None
+    return {
+        "expected_family": expected,
+        "observed_plurality": plurality,
+        "qualifying_pixels": qualifying,
+        "buckets": buckets,
+        "inconclusive": qualifying < 250,
+    }
 
 
 class ImageManifestRefused(RuntimeError):
@@ -399,6 +473,29 @@ async def generate_manifest_images(
         )
     output_dir = workspace / "out" / "generated"
     output_dir.mkdir(parents=True, exist_ok=True)
+    job_config: object = {}
+    if hasattr(database, "engine"):
+        async with database.sessions() as session:
+            run_row = await session.execute(
+                runner_sql(text("SELECT job_config FROM worker_runs WHERE id = :run_id")),
+                {"run_id": run_id},
+            )
+            row = run_row.mappings().first()
+            job_config = row["job_config"] if row else {}
+    research_facts = (
+        job_config.get("research_facts", {})
+        if isinstance(job_config, dict)
+        else {}
+    )
+    kit_descriptions = {
+        str(item.get("key", "")): str(item.get("value", ""))
+        for item in (
+            research_facts.get("kit_colours", [])
+            if isinstance(research_facts, dict)
+            else []
+        )
+        if isinstance(item, dict)
+    }
     resolved: list[dict[str, Any]] = []
     for item in images:
         if not isinstance(item, dict) or set(item) - {
@@ -435,6 +532,17 @@ async def generate_manifest_images(
         else:
             seed = int(item["seed"])
         digest = _digest(request_item, source_digest)
+        identifier_text = f"{identifier} {item.get('purpose', '')}".casefold()
+        expected_description = None
+        if "india" in identifier_text:
+            expected_description = kit_descriptions.get("india_kit_colour")
+        elif "pakistan" in identifier_text:
+            expected_description = kit_descriptions.get("pakistan_kit_colour")
+        expected_family = (
+            _kit_family(expected_description)
+            if expected_description is not None
+            else None
+        )
         async with database.sessions() as session:
             cached = await session.execute(
                 runner_sql(
@@ -452,6 +560,21 @@ async def generate_manifest_images(
             if cached_row["content"]:
                 content = bytes(cached_row["content"])
                 target.write_bytes(content)
+                kit_measurement = (
+                    _measure_kit_colour(content, expected_family)
+                    if expected_family is not None and item.get("cutout", False)
+                    else None
+                )
+                if (
+                    kit_measurement
+                    and not kit_measurement["inconclusive"]
+                    and kit_measurement["observed_plurality"] != expected_family
+                ):
+                    raise ImageManifestRefused(
+                        f"kit colour mismatch for {identifier}: expected "
+                        f"{expected_family}, observed plurality "
+                        f"{kit_measurement['observed_plurality']}"
+                    )
                 cached_parameters = cached_row.get("parameters")
                 async with database.sessions() as session:
                     await session.execute(
@@ -509,6 +632,7 @@ async def generate_manifest_images(
                             and isinstance(cached_row.get("parameters"), dict)
                             else {}
                         ),
+                        "kit_colour_measurement": kit_measurement,
                     }
                 )
                 continue
@@ -553,6 +677,20 @@ async def generate_manifest_images(
         if item.get("cutout", False):
             raw, cutout_parameters = await asyncio.to_thread(_cutout_image, raw)
             width, height = _png_size(raw)
+        kit_measurement = (
+            _measure_kit_colour(raw, expected_family)
+            if expected_family is not None and item.get("cutout", False)
+            else None
+        )
+        if (
+            kit_measurement
+            and not kit_measurement["inconclusive"]
+            and kit_measurement["observed_plurality"] != expected_family
+        ):
+            raise ImageManifestRefused(
+                f"kit colour mismatch for {identifier}: expected {expected_family}, "
+                f"observed plurality {kit_measurement['observed_plurality']}"
+            )
         written_sha256 = hashlib.sha256(raw).hexdigest()
         target.write_bytes(raw)
         delay = int(result.get("delayTime") or 0)
@@ -584,6 +722,7 @@ async def generate_manifest_images(
                             "cutout_parameters": cutout_parameters,
                             "source_sha256": source_sha256,
                             "written_sha256": written_sha256,
+                            "kit_colour_measurement": kit_measurement,
                         }
                     ),
                     "template": WORKFLOW_TEMPLATE_ID,
@@ -614,6 +753,7 @@ async def generate_manifest_images(
                 "cutout": bool(item.get("cutout", False)),
                 "cutout_applied": bool(item.get("cutout", False)),
                 "cutout_parameters": cutout_parameters,
+                "kit_colour_measurement": kit_measurement,
             }
         )
     resolved_path = workspace / "image_manifest.resolved.json"

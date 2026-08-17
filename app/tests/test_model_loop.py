@@ -81,6 +81,27 @@ def test_poster_prompt_keeps_working_notes_out_of_export() -> None:
     assert "output ceiling" in prompt
 
 
+def test_poster_prompt_makes_researched_subject_direction_concrete() -> None:
+    prompt = _model_system_prompt(
+        POSTER_POLICY,
+        job_config={
+            "likeness_policy": "real_likeness_permitted",
+            "research_facts": {
+                "squads": [
+                    {"key": "india_squad_01", "value": "Suryakumar Yadav"},
+                    {"key": "pakistan_squad_03", "value": "Babar Azam"},
+                ]
+            },
+        },
+    )
+    assert "Suryakumar Yadav" in prompt
+    assert "predominantly rich blue" in prompt
+    assert "exclude white, cream" in prompt
+    assert "Babar Azam" in prompt
+    assert "generic European-looking faces" in prompt
+    assert "kit_fidelity finding must regenerate" in prompt
+
+
 def test_starter_context_summarizes_direct_dependencies(tmp_path) -> None:
     (tmp_path / "package.json").write_text(
         '{"dependencies":{"next":"14.2.35"},'
@@ -96,7 +117,7 @@ def test_model_limits_round_trip() -> None:
     limits = WorkerLimits(model_iterations=3, model_tool_calls=7, model_write_bytes=1234)
     assert WorkerLimits.from_json(limits.as_json()) == limits
     assert WorkerLimits().run_timeout_seconds == 7200
-    assert WorkerLimits().model_tokens == 500000
+    assert WorkerLimits().model_tokens == 1_000_000
     assert WorkerLimits().model_tool_calls == 240
 
 

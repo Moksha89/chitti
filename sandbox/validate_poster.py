@@ -82,6 +82,59 @@ def _first_line_containing(source: str, value: str) -> int | None:
     return None
 
 
+def _asset_references(source: str) -> set[str]:
+    references: set[str] = set()
+    for match in re.finditer(
+        r"<img\b[^>]*\bsrc\s*=\s*[\"']([^\"']+)[\"']",
+        source,
+        re.IGNORECASE,
+    ):
+        references.add(match.group(1).strip().replace("\\", "/").lstrip("./"))
+    for match in re.finditer(
+        r"<image\b[^>]*\b(?:href|xlink:href)\s*=\s*[\"']([^\"']+)[\"']",
+        source,
+        re.IGNORECASE,
+    ):
+        references.add(match.group(1).strip().replace("\\", "/").lstrip("./"))
+    for match in re.finditer(r"url\s*\(([^)]*)\)", source, re.IGNORECASE):
+        value = match.group(1).strip().strip("'\"").strip()
+        if not value.startswith("#"):
+            references.add(value.replace("\\", "/").lstrip("./"))
+    return references
+
+
+def _validate_generated_image_usage(
+    source: str,
+    resolved_images: list[dict[str, object]],
+) -> None:
+    references = _asset_references(source)
+    background_paths: set[str] = set()
+    for item in resolved_images:
+        path = item.get("path")
+        if not isinstance(path, str):
+            continue
+        normalized = path.replace("\\", "/").lstrip("./")
+        purpose = str(item.get("purpose", "")).casefold()
+        if "background" in purpose:
+            background_paths.add(normalized)
+            continue
+        if normalized in references and not bool(item.get("cutout", False)):
+            raise SystemExit(
+                f"poster places subject asset without a matted cutout: {normalized}; "
+                "set cutout=true and rerun generate-images"
+            )
+    if not background_paths:
+        raise SystemExit(
+            "poster requires a generated full-bleed background plate; declare an "
+            "image with purpose containing 'background' and rerun generate-images"
+        )
+    if not background_paths & references:
+        raise SystemExit(
+            "poster declares a generated background plate but does not place it; "
+            "use the resolved background asset as the full-bleed poster backdrop"
+        )
+
+
 def validate_poster_source(
     source: str,
     available: set[str],
@@ -209,36 +262,40 @@ def main() -> None:
     declared_assets: set[str] = set()
     dimensions: dict[str, tuple[int, int]] = {}
     subject_paths: set[str] = set()
+    resolved_images: list[dict[str, object]] = []
     if manifest_path.is_file():
         try:
             resolved = json.loads(manifest_path.read_text(encoding="utf-8"))
+            resolved_images = [
+                item for item in resolved.get("images", [])
+                if isinstance(item, dict)
+            ]
             declared_assets = {
                 str(item["path"]).replace("\\", "/").lstrip("./")
-                for item in resolved.get("images", [])
-                if isinstance(item, dict) and isinstance(item.get("path"), str)
+                for item in resolved_images
+                if isinstance(item.get("path"), str)
             }
             dimensions = {
                 str(item["path"]).replace("\\", "/").lstrip("./"): (
                     int(item["width"]),
                     int(item["height"]),
                 )
-                for item in resolved.get("images", [])
-                if isinstance(item, dict)
-                and isinstance(item.get("path"), str)
+                for item in resolved_images
+                if isinstance(item.get("path"), str)
                 and isinstance(item.get("width"), int)
                 and isinstance(item.get("height"), int)
             }
             subject_paths = {
                 str(item["path"]).replace("\\", "/").lstrip("./")
-                for item in resolved.get("images", [])
-                if isinstance(item, dict)
-                and isinstance(item.get("path"), str)
+                for item in resolved_images
+                if isinstance(item.get("path"), str)
                 and bool(item.get("cutout", False))
             }
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
             raise SystemExit("poster resolved image manifest is invalid") from exc
     validate_export_assets(Path("/workspace/out"), declared_assets)
     source = path.read_text(encoding="utf-8", errors="replace")
+    _validate_generated_image_usage(source, resolved_images)
     _validate_asset_scale(source, dimensions, subject_paths)
     available = {
         line.strip().casefold()

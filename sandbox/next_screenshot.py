@@ -38,6 +38,7 @@ POSTER_LAYOUT_SCRIPT = """() => {
     right: viewportWidth,
     bottom: viewportHeight,
   };
+  const labels = [];
   for (const element of candidates) {
     const rect = element.getBoundingClientRect();
     if (!rect.width && !rect.height) continue;
@@ -45,6 +46,18 @@ POSTER_LAYOUT_SCRIPT = """() => {
     bounds.top = Math.min(bounds.top, rect.top);
     bounds.right = Math.max(bounds.right, rect.right);
     bounds.bottom = Math.max(bounds.bottom, rect.bottom);
+    const label =
+      element.getAttribute("data-name") ||
+      element.id ||
+      (typeof element.className === "string" ? element.className : "") ||
+      element.tagName.toLowerCase();
+    labels.push({
+      label,
+      left: Math.round(rect.left * 100) / 100,
+      top: Math.round(rect.top * 100) / 100,
+      right: Math.round(rect.right * 100) / 100,
+      bottom: Math.round(rect.bottom * 100) / 100,
+    });
   }
   const horizontal = Math.max(
     0,
@@ -65,20 +78,32 @@ POSTER_LAYOUT_SCRIPT = """() => {
   const errors = [];
   if (horizontal > tolerance) {
     const amount = Math.round(horizontal * 100) / 100;
+    const offenders = labels.filter(
+      (item) => item.left < -tolerance || item.right > viewportWidth + tolerance,
+    );
     errors.push({
       kind: "poster-overflow",
       axis: "horizontal",
       overflow: amount,
-      message: `poster overflow: horizontal by ${amount} CSS pixels`,
+      message: `poster overflow: horizontal by ${amount} CSS pixels in ${offenders
+        .map((item) => `${item.label} [${item.left},${item.top},${item.right},${item.bottom}]`)
+        .join(", ")}`,
+      elements: offenders,
     });
   }
   if (vertical > tolerance) {
     const amount = Math.round(vertical * 100) / 100;
+    const offenders = labels.filter(
+      (item) => item.top < -tolerance || item.bottom > viewportHeight + tolerance,
+    );
     errors.push({
       kind: "poster-overflow",
       axis: "vertical",
-      message: `poster overflow: vertical by ${amount} CSS pixels`,
+      message: `poster overflow: vertical by ${amount} CSS pixels in ${offenders
+        .map((item) => `${item.label} [${item.left},${item.top},${item.right},${item.bottom}]`)
+        .join(", ")}`,
       overflow: amount,
+      elements: offenders,
     });
   }
   return errors;
