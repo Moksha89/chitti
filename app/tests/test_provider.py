@@ -11,6 +11,7 @@ from chitti.provider import (
     MODEL_CLIENT_TIMEOUT_SECONDS,
     MODEL_GATEWAY_TIMEOUT_SECONDS,
     REVIEWER_MAX_OUTPUT_TOKENS,
+    VISION_FALLBACK_ROUTE,
     VISION_MAX_OUTPUT_TOKENS,
     VISION_ROUTE,
     FakeProvider,
@@ -451,6 +452,34 @@ def test_vision_output_ceiling_has_rubric_headroom(monkeypatch) -> None:
     )
 
     assert VISION_MAX_OUTPUT_TOKENS == 4096
+    assert calls[0][1]["json"]["max_tokens"] == VISION_MAX_OUTPUT_TOKENS
+
+
+def test_vision_fallback_uses_vision_output_ceiling(monkeypatch) -> None:
+    response = httpx.Response(
+        200,
+        request=httpx.Request("POST", "http://gateway"),
+        json={
+            "model": "google/gemini-2.5-flash",
+            "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
+    )
+    calls = []
+
+    class Client(_Client):
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return response
+
+    monkeypatch.setattr("chitti.provider.httpx.AsyncClient", lambda **_kwargs: Client())
+    asyncio.run(
+        LiteLLMProvider("http://127.0.0.1:4000", "configured").agent_completion(
+            [{"role": "user", "content": "inspect"}],
+            VISION_FALLBACK_ROUTE,
+        )
+    )
+
     assert calls[0][1]["json"]["max_tokens"] == VISION_MAX_OUTPUT_TOKENS
 
 

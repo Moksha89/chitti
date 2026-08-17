@@ -88,6 +88,21 @@ def test_declared_relative_raster_asset_is_allowed() -> None:
     )
 
 
+def test_height_only_asset_placement_uses_height_dimension() -> None:
+    MODULE._validate_asset_scale(
+        '<img src="generated/figure.png" height="1024">',
+        {"generated/figure.png": (768, 1024)},
+    )
+
+
+def test_height_only_asset_placement_rejects_oversize_height() -> None:
+    with pytest.raises(SystemExit, match="above its pixels"):
+        MODULE._validate_asset_scale(
+            '<img src="generated/figure.png" height="1025">',
+            {"generated/figure.png": (768, 1024)},
+        )
+
+
 def test_undeclared_relative_raster_asset_is_refused() -> None:
     with pytest.raises(SystemExit, match="remote URL or runtime fetch"):
         MODULE.validate_poster_source(

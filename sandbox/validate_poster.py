@@ -29,7 +29,7 @@ def _validate_asset_scale(source: str, dimensions: dict[str, tuple[int, int]]) -
         actual = dimensions.get(relative)
         if actual is None:
             continue
-        requested: list[int] = []
+        requested: dict[str, int] = {}
         for name in ("width", "height"):
             value = re.search(
                 rf"\b{name}\s*=\s*[\"'](\d+)(?:px)?[\"']",
@@ -37,7 +37,7 @@ def _validate_asset_scale(source: str, dimensions: dict[str, tuple[int, int]]) -
                 re.IGNORECASE,
             )
             if value:
-                requested.append(int(value.group(1)))
+                requested[name] = int(value.group(1))
         style = re.search(r"\bstyle\s*=\s*[\"']([^\"']+)", attributes, re.IGNORECASE)
         if style:
             for name in ("width", "height"):
@@ -45,8 +45,11 @@ def _validate_asset_scale(source: str, dimensions: dict[str, tuple[int, int]]) -
                     rf"\b{name}\s*:\s*(\d+)px", style.group(1), re.IGNORECASE
                 )
                 if value:
-                    requested.append(int(value.group(1)))
-        if requested and any(size > limit for size, limit in zip(requested, actual)):
+                    requested[name] = int(value.group(1))
+        limits = {"width": actual[0], "height": actual[1]}
+        if requested and any(
+            requested[name] > limits[name] for name in requested
+        ):
             raise SystemExit(
                 f"poster places generated asset above its pixels: {relative}; "
                 f"generated {actual[0]}x{actual[1]}, requested {requested}; "

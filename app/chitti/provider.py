@@ -445,7 +445,7 @@ class LiteLLMProvider:
                 REVIEWER_MAX_OUTPUT_TOKENS
                 if role == "reviewer"
                 else VISION_MAX_OUTPUT_TOKENS
-                if role == VISION_ROUTE
+                if role in VISION_ROUTES
                 else CODER_MAX_OUTPUT_TOKENS
             ),
         }
