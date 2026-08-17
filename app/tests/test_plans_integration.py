@@ -206,6 +206,7 @@ async def test_poster_planning_requires_brand_profile_and_generates_poster_revis
         "width": 1080,
         "height": 1350,
         "scale": 1,
+        "likeness_policy": "generic_figures",
     }
     assert {task.id for task in revision.document.tasks} == {"brief", "review"}
     assert "poster" in revision.document.tasks[0].title.lower()

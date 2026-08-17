@@ -38,6 +38,18 @@ def test_network_and_fetch_forms_are_refused(source: str) -> None:
         MODULE.validate_poster_source(source, {"freesans"})
 
 
+def test_network_refusal_names_source_line_and_offline_alternative() -> None:
+    with pytest.raises(
+        SystemExit,
+        match=r"line 2:.*declared local asset.*url\(#gradient\)",
+    ):
+        MODULE.validate_poster_source(
+            "<style>body { color: white; }</style>\n"
+            '<img src="https://example.test/image.png">',
+            {"freesans"},
+        )
+
+
 def test_missing_colour_error_separates_declared_colours() -> None:
     with pytest.raises(SystemExit, match="TRIAL TEAL, TRIAL GOLD"):
         MODULE.validate_poster_source(

@@ -12,12 +12,24 @@ def validate_poster_source(
     font: str = "",
     assets: set[str] | None = None,
 ) -> None:
-    if re.search(r"(?:https?:)?//|data:|fetch\s*\(", source, re.IGNORECASE):
-        raise SystemExit("poster source contains a remote URL or runtime fetch")
+    def offline_refusal(match: re.Match[str]) -> SystemExit:
+        line = source.count("\n", 0, match.start()) + 1
+        snippet = source.splitlines()[line - 1].strip()[:180]
+        return SystemExit(
+            "poster source contains a remote URL or runtime fetch at line "
+            f"{line}: {snippet!r}; use a declared local asset under out/generated "
+            "or an offline CSS/SVG fragment such as url(#gradient)"
+        )
+
+    network_match = re.search(
+        r"(?:https?:)?//|data:|fetch\s*\(", source, re.IGNORECASE
+    )
+    if network_match:
+        raise offline_refusal(network_match)
     url_starts = list(re.finditer(r"url\s*\(", source, flags=re.IGNORECASE))
     url_matches = list(re.finditer(r"url\s*\(([^)]*)\)", source, flags=re.IGNORECASE))
     if len(url_matches) != len(url_starts):
-        raise SystemExit("poster source contains a remote URL or runtime fetch")
+        raise offline_refusal(url_starts[-1])
     declared_assets = assets or set()
     references: list[str] = []
     for match in re.finditer(
@@ -39,7 +51,8 @@ def validate_poster_source(
         references.append(value)
     for value in references:
         if value.startswith(("/", "\\")) or value not in declared_assets:
-            raise SystemExit("poster source contains a remote URL or runtime fetch")
+            match = re.search(re.escape(value), source)
+            raise offline_refusal(match or re.search(r"\S+", source))
     for declaration in re.findall(
         r"font-family\s*:\s*([^;}]+)", source, flags=re.IGNORECASE
     ):

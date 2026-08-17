@@ -491,8 +491,17 @@ class LiteLLMProvider:
                 )
                 continue
             else:
+                served_model_evidence = (
+                    (f"gateway_served_model={completion.model}",)
+                    if completion.model != role
+                    else ()
+                )
                 if attempt == 1:
-                    return completion
+                    return replace(
+                        completion,
+                        message_fields=completion.message_fields
+                        + served_model_evidence,
+                    )
                 return replace(
                     completion,
                     prompt_tokens=completion.prompt_tokens + retry_prompt_tokens,
@@ -507,6 +516,7 @@ class LiteLLMProvider:
                     retry_completion_tokens=retry_completion_tokens,
                     retry_total_tokens=retry_total_tokens,
                     retry_cost_usd=retry_cost_usd,
+                    message_fields=completion.message_fields + served_model_evidence,
                 )
         raise AssertionError("model completion retry loop did not return")
 
@@ -678,6 +688,11 @@ class LiteLLMProvider:
                 and completion_tokens >= requested_max_tokens
             )
             if finish_reason == "length" or reached_output_ceiling:
+                served_model_evidence = (
+                    (f"gateway_served_model={str(body.get('model', role))}",)
+                    if str(body.get("model", role)) != role
+                    else ()
+                )
                 return ModelCompletion(
                     content="",
                     model=role,
@@ -686,7 +701,9 @@ class LiteLLMProvider:
                     total_tokens=total_tokens,
                     cost_usd=cost_usd,
                     finish_reason="length",
-                    message_fields=("response_failure_class=output limit",),
+                    message_fields=(
+                        "response_failure_class=output limit",
+                    ) + served_model_evidence,
                     response_diagnostics=diagnostics,
                 )
             raise ModelProviderError(

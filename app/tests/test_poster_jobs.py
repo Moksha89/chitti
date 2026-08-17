@@ -162,7 +162,10 @@ async def test_poster_job_config_persists_only_declared_configuration(monkeypatc
     )
 
     insert = database.session.calls[0]["params"]
-    assert json.loads(str(insert["job_config"])) == declared
+    assert json.loads(str(insert["job_config"])) == {
+        **declared,
+        "likeness_policy": "generic_figures",
+    }
     assert all(not key.startswith("_") for key in json.loads(str(insert["job_config"])))
 
 

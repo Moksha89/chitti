@@ -8,6 +8,9 @@ POSTER_JOB = "poster"
 DEFAULT_JOB = WEBSITE_JOB
 MAX_POSTER_CSS_DIMENSION = 2048
 MAX_POSTER_SCALE = 2
+POSTER_LIKENESS_POLICIES = frozenset(
+    {"generic_figures", "real_likeness_permitted"}
+)
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,25 @@ def poster_config(value: object) -> dict[str, object]:
     width = int(value.get("width", 1080))
     height = int(value.get("height", 1350))
     scale = int(value.get("scale", 1))
+    likeness_policy = str(
+        value.get("likeness_policy", "generic_figures")
+    ).strip().lower()
+    if likeness_policy not in POSTER_LIKENESS_POLICIES:
+        raise ValueError(
+            "poster likeness_policy must be generic_figures or "
+            "real_likeness_permitted"
+        )
+    research_package_id = value.get("research_package_id")
+    if research_package_id is not None:
+        try:
+            research_package_id = int(research_package_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("research_package_id must be an integer") from exc
+        if research_package_id < 1:
+            raise ValueError("research_package_id must be positive")
+    research_facts = value.get("research_facts")
+    if research_facts is not None and not isinstance(research_facts, dict):
+        raise ValueError("research_facts must be an object")
     if not artifact or artifact.startswith("/") or ".." in artifact.split("/"):
         raise ValueError("poster artifact must be a relative export path")
     if not artifact.lower().endswith((".html", ".svg")):
@@ -72,7 +94,18 @@ def poster_config(value: object) -> dict[str, object]:
         raise ValueError(f"poster device scale must be between 1 and {MAX_POSTER_SCALE}")
     if width * height * scale * scale * 4 > 256 * 1024 * 1024:
         raise ValueError("poster dimensions exceed the 256 MiB browser cage budget")
-    return {"artifact": artifact, "width": width, "height": height, "scale": scale}
+    config: dict[str, object] = {
+        "artifact": artifact,
+        "width": width,
+        "height": height,
+        "scale": scale,
+        "likeness_policy": likeness_policy,
+    }
+    if research_package_id is not None:
+        config["research_package_id"] = research_package_id
+    if research_facts is not None:
+        config["research_facts"] = research_facts
+    return config
 
 
 def config_json(value: object) -> str:

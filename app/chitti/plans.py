@@ -109,6 +109,7 @@ class PlanRevision:
     namespace: str = SHARED_NAMESPACE
     job_type: str = WEBSITE_JOB
     job_config: dict[str, object] | None = None
+    research_package_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -136,10 +137,36 @@ async def create_revision(
     namespace: str = SHARED_NAMESPACE,
     job_type: str = WEBSITE_JOB,
     job_config: object | None = None,
+    research_package_id: int | None = None,
 ) -> int:
     namespace = normalize_namespace(namespace)
     job_type = normalize_job_type(job_type)
     normalized_config = poster_config(job_config) if job_type == "poster" else {}
+    research_package_id = (
+        int(normalized_config["research_package_id"])
+        if "research_package_id" in normalized_config
+        else None
+    )
+    if research_package_id is not None:
+        package_result = await session.execute(
+            application_only_sql(text(
+                "SELECT 1 FROM research_packages "
+                "WHERE id = :id AND namespace = :namespace AND approved_at IS NOT NULL"
+            )),
+            {"id": research_package_id, "namespace": namespace},
+        )
+        if package_result.scalar_one_or_none() is None:
+            raise ValueError(
+                "poster research package must exist in the plan namespace and be approved"
+            )
+        package_data = await session.execute(
+            application_only_sql(text(
+                "SELECT facts FROM research_packages WHERE id = :id"
+            )),
+            {"id": research_package_id},
+        )
+        package_facts = package_data.scalar_one()
+        normalized_config["research_facts"] = package_facts
     content = document.model_dump(mode="json")
     digest = plan_hash(document)
     revision_result = await session.execute(
@@ -154,9 +181,10 @@ async def create_revision(
         application_only_sql(text(
             "INSERT INTO plan_revisions "
             "(project, namespace, brief, revision, content, content_hash, parent_revision_id, "
-            "job_type, job_config) "
+            "job_type, job_config, research_package_id) "
             "VALUES (:project, :namespace, :brief, :revision, CAST(:content AS jsonb), "
-            ":content_hash, :parent_revision_id, :job_type, CAST(:job_config AS jsonb)) "
+            ":content_hash, :parent_revision_id, :job_type, CAST(:job_config AS jsonb), "
+            ":research_package_id) "
             "RETURNING id"
         )),
         {
@@ -169,6 +197,7 @@ async def create_revision(
             "parent_revision_id": parent_revision_id,
             "job_type": job_type,
             "job_config": config_json(normalized_config),
+            "research_package_id": research_package_id,
         },
     )
     revision_id = int(result.scalar_one())
@@ -354,7 +383,8 @@ async def latest_revisions(
     result = await session.execute(
         application_only_sql(text(
             "SELECT DISTINCT ON (project) id, project, namespace, revision, content, "
-            "content_hash, created_at, parent_revision_id, job_type, job_config FROM plan_revisions "
+            "content_hash, created_at, parent_revision_id, job_type, job_config, "
+            "research_package_id FROM plan_revisions "
             "WHERE namespace IN (:namespace, :shared) "
             "ORDER BY project, namespace = :namespace DESC, revision DESC"
         )),
@@ -388,7 +418,8 @@ async def revision_by_id(
     result = await session.execute(
         runner_sql(text(
             "SELECT id, project, namespace, brief, revision, content, content_hash, "
-            "created_at, parent_revision_id, job_type, job_config FROM plan_revisions "
+            "created_at, parent_revision_id, job_type, job_config, research_package_id "
+            "FROM plan_revisions "
             "WHERE id = :id AND namespace IN (:namespace, :shared)"
         )),
         {"id": revision_id, "namespace": namespace, "shared": SHARED_NAMESPACE},
@@ -408,6 +439,11 @@ async def revision_by_id(
         parent_revision_id=int(row["parent_revision_id"]) if row["parent_revision_id"] else None,
         job_type=normalize_job_type(row["job_type"]),
         job_config=dict(row["job_config"]) if isinstance(row["job_config"], dict) else json.loads(str(row["job_config"])),
+        research_package_id=(
+            int(row["research_package_id"])
+            if row["research_package_id"] is not None
+            else None
+        ),
     )
 
 
