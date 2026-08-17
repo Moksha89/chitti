@@ -223,22 +223,22 @@ def _identical_tool_failure_detail(
     task_id: str,
     tool: str,
     detail: str,
-    last_failure: tuple[str, str] | None,
-    consecutive_failures: int,
-) -> tuple[str, tuple[str, str], int]:
+    failure_counts: dict[tuple[str, str], int],
+) -> tuple[str, int]:
     failure = (tool, detail)
-    count = consecutive_failures + 1 if failure == last_failure else 1
+    count = failure_counts.get(failure, 0) + 1
+    failure_counts[failure] = count
     if count >= IDENTICAL_TOOL_FAILURE_LIMIT:
         raise ModelProgressError(
-            f"task {task_id} stopped after {count} consecutive identical "
+            f"task {task_id} stopped after {count} identical "
             f"failures from {tool}: {detail}"
         )
     if count == IDENTICAL_TOOL_FAILURE_LIMIT - 1:
         detail = (
             f"{detail} This identical failure has occurred {count} "
-            "consecutive times; repeating it once more will end the run."
+            "times in this run; repeating it once more will end the run."
         )
-    return detail, failure, count
+    return detail, count
 
 
 def _remember_progress_ledger(
@@ -920,30 +920,29 @@ class DockerSandboxDispatcher:
                             f"{command} ({'passed' if succeeded else 'failed'})",
                         )
 
-            last_tool_failure: tuple[str, str] | None = None
-            consecutive_tool_failures = 0
+            tool_failure_counts: dict[tuple[str, str], int] = {}
 
             def repeated_tool_failure_detail(
-                tool: str, detail: str, task_id: str = task.id
+                tool: str,
+                detail: str,
+                task_id: str = task.id,
+                failure_counts: dict[tuple[str, str], int] = tool_failure_counts,
             ) -> str:
-                nonlocal last_tool_failure, consecutive_tool_failures
                 (
                     detail,
-                    last_tool_failure,
-                    consecutive_tool_failures,
+                    _count,
                 ) = _identical_tool_failure_detail(
                     task_id,
                     tool,
                     detail,
-                    last_tool_failure,
-                    consecutive_tool_failures,
+                    failure_counts,
                 )
                 return detail
 
-            def reset_tool_failure_streak() -> None:
-                nonlocal last_tool_failure, consecutive_tool_failures
-                last_tool_failure = None
-                consecutive_tool_failures = 0
+            def reset_tool_failure_streak(
+                failure_counts: dict[tuple[str, str], int] = tool_failure_counts,
+            ) -> None:
+                failure_counts.clear()
 
             for iteration in range(1, limits.model_iterations + 1):
                 self._raise_if_cancelled(run_id)
@@ -3676,7 +3675,8 @@ def _model_system_prompt(
             "inspect source facts and dimensions, not visual quality, which still "
             "requires owner approval.\n"
             "Generated imagery is available through the host-only generate-images "
-            "allowlisted operation. First write image_manifest.json with only these "
+            "allowlisted operation. First write /workspace/image_manifest.json "
+            "(the workspace root, never out/) with only these "
             "fields per image: id, purpose, prompt, negative_prompt, width, height, "
             "optional seed, optional denoise, and optional reference to an existing "
             "generated asset; then run generate-images. The host owns the ComfyUI "
