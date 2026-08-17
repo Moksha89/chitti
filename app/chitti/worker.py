@@ -109,6 +109,17 @@ class VisualReviewInconclusive(RuntimeError):
     """The poster could not reach a trustworthy visual verdict."""
 
 
+MALFORMED_TOOL_RESPONSE = "model response was not valid JSON"
+PROSE_TOOL_RESPONSE = "model returned prose instead of a required tool call"
+
+
+def _is_malformed_tool_response(detail: str) -> bool:
+    return (
+        MALFORMED_TOOL_RESPONSE in detail
+        or PROSE_TOOL_RESPONSE in detail
+    )
+
+
 VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
     (
         "You are judging one captured poster PNG. Describe before you judge: "
@@ -139,7 +150,9 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "low-contrast that the poster would read as flat colour without it.",
         "subject_scale fails when focal subjects are small or soft against large "
         "empty areas, especially when the composition leaves a substantial dead "
-        "middle or lower third. Fail when the focal figures occupy only a minor "
+        "middle or lower third. Treat an empty lower third occupying roughly a "
+        "quarter or more of the canvas as substantial and fail it every time. "
+        "Fail when the focal figures occupy only a minor "
         "portion of the canvas rather than carrying the composition; estimate "
         "their visible height and reject figures that are plainly undersized. "
         "Fail when a subject floats in mid-air, is cropped across the body with "
@@ -175,8 +188,10 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "the policy is an owner decision carried in the run configuration. Generic "
         "figures are the default; real likenesses are permitted only when the "
         "recorded policy says so. Fabricated board "
-        "logos and fabricated trophy imagery remain prohibited regardless of likeness "
-        "policy.",
+        "logos, sponsor marks, crests, badges, and fabricated trophy imagery remain "
+        "prohibited regardless of likeness policy. Permitted real likenesses, real "
+        "faces, or real kits are not themselves brand violations and must not be "
+        "failed merely for being photographic or identifiable.",
         "verdict must be pass or fail, and must be fail if any criterion is fail. "
         "image_sha256 must exactly match the supplied digest. findings must be a list "
         "of objects with criterion, issue and action fields; every failed criterion "
@@ -1108,10 +1123,10 @@ class DockerSandboxDispatcher:
                     and completion.finish_reason == "stop"
                     and not completion.tool_calls
                 ):
-                    response_failure = "model response was not valid JSON"
+                    response_failure = PROSE_TOOL_RESPONSE
                 if response_failure is not None:
                     detail = response_failure
-                    if "model response was not valid JSON" in detail:
+                    if _is_malformed_tool_response(detail):
                         malformed_responses += 1
                     else:
                         malformed_responses = 0
@@ -1344,14 +1359,15 @@ class DockerSandboxDispatcher:
                                 batch_workspace_changed and batch_refusal_progress
                             ),
                         )
-                        if (
-                            "model response was not valid JSON" in batch_failure
-                        ):
+                        malformed_batch_failure = _is_malformed_tool_response(
+                            batch_failure
+                        )
+                        if malformed_batch_failure:
                             malformed_responses += 1
                         else:
                             malformed_responses = 0
-                        if malformed_responses >= 2 and route == CODER_ROUTE:
-                            if "model response was not valid JSON" in batch_failure:
+                        if failures >= 2 and route == CODER_ROUTE:
+                            if malformed_responses >= 2 and malformed_batch_failure:
                                 route = CODER_FALLBACK_ROUTE
                                 await self._event(
                                     run_id,
@@ -1536,12 +1552,13 @@ class DockerSandboxDispatcher:
                         tool, f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
                     )
                     await record_nonproductive(result_text)
-                    if "model response was not valid JSON" in result_text:
+                    malformed_tool_failure = _is_malformed_tool_response(result_text)
+                    if malformed_tool_failure:
                         malformed_responses += 1
                     else:
                         malformed_responses = 0
-                    if malformed_responses >= 2 and route == CODER_ROUTE:
-                        if "model response was not valid JSON" in result_text:
+                    if failures >= 2 and route == CODER_ROUTE:
+                        if malformed_responses >= 2 and malformed_tool_failure:
                             route = CODER_FALLBACK_ROUTE
                             await self._event(
                                 run_id,
@@ -3971,7 +3988,13 @@ def _model_system_prompt(
             "generated asset; then run generate-images. The host owns the ComfyUI "
             "workflow and provider credentials, writes assets under out/generated, "
             "and resolves /workspace/image_manifest.resolved.json with real dimensions. The "
-            "manifest may set cutout=true for a subject asset; the host runs an "
+            "The manifest must include a generated full-bleed background plate with "
+            "purpose containing 'background'; a CSS gradient is not a substitute. "
+            "The background asset must be placed visibly across the poster canvas. "
+            "Every subject figure must set cutout=true; place the resolved matted "
+            "RGBA asset, never the raw generated PNG. Do not put a border, rounded "
+            "panel, card, or frame around a subject image. "
+            "The manifest may set cutout=true for a subject asset; the host runs an "
             "offline segmentation model and returns RGBA with feathered transparency, "
             "so do not fake transparency with opacity or screen blending. If a figure "
             "cannot be matted, compose it as an intentional full-bleed or framed panel "

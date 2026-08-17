@@ -111,6 +111,58 @@ def test_max_width_and_min_height_are_not_placements() -> None:
     )
 
 
+def test_generated_background_plate_is_required_and_used() -> None:
+    MODULE._validate_generated_image_usage(
+        '<img src="generated/stadium.png">'
+        '<img src="generated/figure.png">',
+        [
+            {
+                "path": "generated/stadium.png",
+                "purpose": "full-bleed background plate",
+                "cutout": False,
+            },
+            {
+                "path": "generated/figure.png",
+                "purpose": "India subject",
+                "cutout": True,
+            },
+        ],
+    )
+
+
+def test_missing_generated_background_plate_is_refused() -> None:
+    with pytest.raises(SystemExit, match="generated full-bleed background plate"):
+        MODULE._validate_generated_image_usage(
+            '<img src="generated/figure.png">',
+            [
+                {
+                    "path": "generated/figure.png",
+                    "purpose": "India subject",
+                    "cutout": True,
+                }
+            ],
+        )
+
+
+def test_subject_raw_png_is_refused_without_matted_cutout() -> None:
+    with pytest.raises(SystemExit, match="without a matted cutout"):
+        MODULE._validate_generated_image_usage(
+            '<img src="generated/figure.png">',
+            [
+                {
+                    "path": "generated/stadium.png",
+                    "purpose": "background plate",
+                    "cutout": False,
+                },
+                {
+                    "path": "generated/figure.png",
+                    "purpose": "India subject",
+                    "cutout": False,
+                },
+            ],
+        )
+
+
 def test_scale_validation_without_manifest_is_noop() -> None:
     MODULE._validate_asset_scale(
         '<img src="generated/figure.png" width="2000">',
