@@ -19,6 +19,41 @@ def _split_brand_color(value: str) -> tuple[str | None, str]:
     return None, candidate
 
 
+def _validate_asset_scale(source: str, dimensions: dict[str, tuple[int, int]]) -> None:
+    for match in re.finditer(r"<img\b([^>]+)>", source, re.IGNORECASE):
+        attributes = match.group(1)
+        src_match = re.search(r"\bsrc\s*=\s*[\"']([^\"']+)", attributes, re.IGNORECASE)
+        if src_match is None:
+            continue
+        relative = src_match.group(1).replace("\\", "/").lstrip("./")
+        actual = dimensions.get(relative)
+        if actual is None:
+            continue
+        requested: list[int] = []
+        for name in ("width", "height"):
+            value = re.search(
+                rf"\b{name}\s*=\s*[\"'](\d+)(?:px)?[\"']",
+                attributes,
+                re.IGNORECASE,
+            )
+            if value:
+                requested.append(int(value.group(1)))
+        style = re.search(r"\bstyle\s*=\s*[\"']([^\"']+)", attributes, re.IGNORECASE)
+        if style:
+            for name in ("width", "height"):
+                value = re.search(
+                    rf"\b{name}\s*:\s*(\d+)px", style.group(1), re.IGNORECASE
+                )
+                if value:
+                    requested.append(int(value.group(1)))
+        if requested and any(size > limit for size, limit in zip(requested, actual)):
+            raise SystemExit(
+                f"poster places generated asset above its pixels: {relative}; "
+                f"generated {actual[0]}x{actual[1]}, requested {requested}; "
+                "request a larger generated asset instead"
+            )
+
+
 def _contains_declared_value(source: str, value: str) -> bool:
     _, value = _split_brand_color(value)
     if value.casefold() in source.casefold():
@@ -162,6 +197,7 @@ def main() -> None:
         raise SystemExit("poster artifact must be HTML or SVG")
     manifest_path = Path("/workspace/image_manifest.resolved.json")
     declared_assets: set[str] = set()
+    dimensions: dict[str, tuple[int, int]] = {}
     if manifest_path.is_file():
         try:
             resolved = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -170,10 +206,22 @@ def main() -> None:
                 for item in resolved.get("images", [])
                 if isinstance(item, dict) and isinstance(item.get("path"), str)
             }
+            dimensions = {
+                str(item["path"]).replace("\\", "/").lstrip("./"): (
+                    int(item["width"]),
+                    int(item["height"]),
+                )
+                for item in resolved.get("images", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("path"), str)
+                and isinstance(item.get("width"), int)
+                and isinstance(item.get("height"), int)
+            }
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
             raise SystemExit("poster resolved image manifest is invalid") from exc
     validate_export_assets(Path("/workspace/out"), declared_assets)
     source = path.read_text(encoding="utf-8", errors="replace")
+    _validate_asset_scale(source, dimensions)
     available = {
         line.strip().casefold()
         for line in Path("/opt/available_fonts.txt").read_text().splitlines()

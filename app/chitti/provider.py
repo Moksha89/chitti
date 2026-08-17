@@ -15,6 +15,8 @@ CODER_ROUTE = "coder"
 REVIEWER_ROUTE = "reviewer"
 BULK_ROUTE = "bulk"
 VISION_ROUTE = "vision"
+VISION_FALLBACK_ROUTE = "vision-fallback"
+VISION_FALLBACK_ROUTE = "vision-fallback"
 DEPLOYMENT_GATEWAY_ROUTES = frozenset(
     {"chitti-chat", "planner", CODER_ROUTE, REVIEWER_ROUTE, BULK_ROUTE, VISION_ROUTE}
 )

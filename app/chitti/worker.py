@@ -51,6 +51,7 @@ from .provider import (
     CODER_MAX_OUTPUT_TOKENS,
     CODER_ROUTE,
     REVIEWER_ROUTE,
+    VISION_FALLBACK_ROUTE,
     VISION_ROUTE,
     ModelCompletion,
     ModelProvider,
@@ -114,8 +115,8 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "observations, verdict, image_sha256, criteria, findings, summary, "
         "evidence_limitations.",
         "observations must be an object with exactly these keys, each a plain-language "
-        "description of what the image actually shows: background, imagery, "
-        "imagery_edges, text_blocks, colour_use. imagery_edges must describe, for "
+        "description of what the image actually shows: imagery_edges, background, "
+        "imagery, text_blocks, colour_use. imagery_edges must describe, for "
         "every placed photographic or illustrated element, only boundaries visibly "
         "present against the surrounding design. Distinguish a visible seam, halo, "
         "background rectangle or panel from an intentional crop at the canvas edge; "
@@ -124,7 +125,8 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "exists.",
         "criteria must contain exactly these keys, each pass or fail: fixture_text, "
         "visual_hierarchy, readability, generated_imagery, composite_integrity, "
-        "brand_constraints, text_contrast, cinematic_treatment.",
+        "brand_constraints, text_contrast, cinematic_treatment, subject_scale, "
+        "text_redundancy, asset_sharpness, kit_fidelity.",
         "composite_integrity fails when any placed image reads as a pasted rectangle: "
         "a visible box, panel or seam around it, a background inside it that differs "
         "from the poster background, or a washed-out block where the element sits. "
@@ -133,6 +135,16 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "an edge is deliberate, describe it and fail composite_integrity.",
         "generated_imagery fails when imagery is absent, or so dark, faint or "
         "low-contrast that the poster would read as flat colour without it.",
+        "subject_scale fails when focal subjects are small or soft against large "
+        "empty areas, especially when the composition leaves a substantial dead "
+        "middle or lower third.",
+        "text_redundancy fails when the same fixture, matchup, date, venue, or "
+        "other information is stated twice in materially duplicated text blocks.",
+        "asset_sharpness fails when placed imagery is visibly blurry, soft, pixelated, "
+        "upscaled, or cartoonish where photographic realism was requested.",
+        "kit_fidelity fails when approved research facts describe kit colours and "
+        "the visible figures contradict those colours; compare the image to the "
+        "approved facts, not to invented palette names.",
         "text_contrast fails when any required text block is low-contrast against "
         "its immediate background, including a title or team name that becomes "
         "difficult to read because its colour is too close to the background. "
@@ -1905,11 +1917,13 @@ class DockerSandboxDispatcher:
         ]
         assert self.model_provider is not None
         compliance_reask = False
+        review_routes = (VISION_ROUTE, VISION_FALLBACK_ROUTE)
+        route_index = 0
         prompt_messages = persisted_messages
         while True:
             try:
                 completion = await self.model_provider.agent_completion(
-                    messages, VISION_ROUTE
+                    messages, review_routes[route_index]
                 )
             except ModelTransportError as exc:
                 raise VisualReviewInconclusive(
@@ -1954,6 +1968,20 @@ class DockerSandboxDispatcher:
                 parse_error = exc
             else:
                 break
+            if route_index == 0:
+                route_index = 1
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The primary vision response was empty or structurally "
+                            "unparseable. Return one complete JSON verdict through "
+                            "the independent fallback route."
+                        ),
+                    }
+                )
+                prompt_messages = [*persisted_messages, *messages[2:]]
+                continue
             if compliance_reask:
                 raise parse_error
             compliance_reask = True
@@ -3472,6 +3500,10 @@ def _parse_visual_verdict(value: object, image_digest: str) -> dict[str, object]
         "brand_constraints",
         "text_contrast",
         "cinematic_treatment",
+        "subject_scale",
+        "text_redundancy",
+        "asset_sharpness",
+        "kit_fidelity",
     )
     if not isinstance(value, dict):
         raise VisualReviewInconclusive("visual critique returned a non-object verdict")
@@ -3490,9 +3522,9 @@ def _parse_visual_verdict(value: object, image_digest: str) -> dict[str, object]
         raise VisualReviewInconclusive("visual critique image digest did not match")
     observations = value.get("observations")
     observation_names = (
+        "imagery_edges",
         "background",
         "imagery",
-        "imagery_edges",
         "text_blocks",
         "colour_use",
     )
@@ -3801,7 +3833,14 @@ def _model_system_prompt(
             "visible depth separation between foreground subjects and the background, "
             "and atmosphere such as haze, light spill, particles, or grain. A flat "
             "colour wash or gradient is not enough, and every text block must maintain "
-            "clear contrast against its immediate background. "
+            "clear contrast against its immediate background. Make the focal figures "
+            "large enough to carry the composition; do not leave a dead middle third. "
+            "Do not repeat the same matchup or fixture information in multiple title "
+            "blocks. Use sharp, photographic-looking generated assets rather than "
+            "small cartoon figures, and never scale an asset beyond the dimensions "
+            "reported by image_manifest.resolved.json; request a larger asset instead. "
+            "When research states kit colours, make the visible figures match those "
+            "colours exactly and do not substitute invented panels or accents. "
             f"The coder output ceiling is {CODER_MAX_OUTPUT_TOKENS} tokens; split "
             "large file writes across multiple tool calls rather than emitting one "
             "enormous tool call. Create an out/index.html entry that references and "
