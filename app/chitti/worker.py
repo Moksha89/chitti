@@ -87,6 +87,8 @@ IDENTICAL_TOOL_FAILURE_LIMIT = 3
 REQUIRED_GATE_COMMANDS = ("build", "test", "export")
 VISUAL_REVIEW_MAX_CYCLES = 4
 VISUAL_REVIEW_SPEND_CAP_USD = 0.20
+MODEL_TOKEN_BUDGET = 1_000_000
+MODEL_SPEND_BUDGET_USD = 1.50
 
 
 class RunBudgetExceeded(RuntimeError):
@@ -152,6 +154,10 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "empty areas, especially when the composition leaves a substantial dead "
         "middle or lower third. Treat an empty lower third occupying roughly a "
         "quarter or more of the canvas as substantial and fail it every time. "
+        "Estimate the unused lower-third percentage and the visible subject height "
+        "in your observations; use those measurements consistently rather than "
+        "changing the verdict for the same image digest. If the digest is unchanged, "
+        "the criterion verdict must be unchanged. "
         "Fail when the focal figures occupy only a minor "
         "portion of the canvas rather than carrying the composition; estimate "
         "their visible height and reject figures that are plainly undersized. "
@@ -549,9 +555,9 @@ class WorkerLimits:
     shm_size: str = "256m"
     model_iterations: int = 40
     model_tool_calls: int = MODEL_TOOL_CALL_BUDGET
-    model_tokens: int = 500000
+    model_tokens: int = MODEL_TOKEN_BUDGET
     model_write_bytes: int = 2 * 1024 * 1024
-    model_spend_usd: float = 0.75
+    model_spend_usd: float = MODEL_SPEND_BUDGET_USD
     image_spend_usd: float = 0.10
     image_request_count: int = 12
     run_timeout_seconds: int = 7200
@@ -596,9 +602,11 @@ class WorkerLimits:
             model_tool_calls=int(
                 cast(int, values.get("model_tool_calls", MODEL_TOOL_CALL_BUDGET))
             ),
-            model_tokens=int(cast(int, values.get("model_tokens", 500000))),
+            model_tokens=int(cast(int, values.get("model_tokens", MODEL_TOKEN_BUDGET))),
             model_write_bytes=int(cast(int, values.get("model_write_bytes", 2 * 1024 * 1024))),
-            model_spend_usd=float(cast(float, values.get("model_spend_usd", 0.75))),
+            model_spend_usd=float(
+                cast(float, values.get("model_spend_usd", MODEL_SPEND_BUDGET_USD))
+            ),
             image_spend_usd=float(cast(float, values.get("image_spend_usd", 0.10))),
             image_request_count=int(cast(int, values.get("image_request_count", 12))),
             run_timeout_seconds=int(cast(int, values.get("run_timeout_seconds", 7200))),
@@ -3910,6 +3918,28 @@ def _model_system_prompt(
         profile_data = getattr(profile, "__dict__", {})
         manifest = "\n".join(available_font_families()) or "(empty)"
         approved = poster_config(job_config or {})
+        india_player = "Suryakumar Yadav"
+        pakistan_player = "Babar Azam"
+        research_facts = approved.get("research_facts", {})
+        if isinstance(research_facts, dict):
+            squads = research_facts.get("squads", [])
+            if isinstance(squads, list):
+                for item in squads:
+                    if not isinstance(item, dict):
+                        continue
+                    key = str(item.get("key", "")).casefold()
+                    value = str(item.get("value", "")).strip()
+                    if key.startswith("india_squad_") and value:
+                        india_player = value
+                        break
+                for item in squads:
+                    if not isinstance(item, dict):
+                        continue
+                    key = str(item.get("key", "")).casefold()
+                    value = str(item.get("value", "")).strip()
+                    if key.startswith("pakistan_squad_") and value:
+                        pakistan_player = value
+                        break
         color_values = []
         for color in getattr(profile, "brand_colors", ()):
             label, value = split_brand_color(str(color))
@@ -3957,12 +3987,27 @@ def _model_system_prompt(
             "reported by image_manifest.resolved.json; request a larger asset instead. "
             "When research states kit colours, make the visible figures match those "
             "colours exactly and do not substitute invented panels or accents. "
+            f"Request a full-body photographic real likeness of {india_player} for "
+            "India and make that jersey predominantly rich blue with striking orange "
+            "panels; explicitly exclude white, cream, and orange-dominant jerseys. "
+            f"Request a full-body photographic real likeness of {pakistan_player} "
+            "for Pakistan and make that kit predominantly traditional light green; "
+            "exclude generic European-looking faces and white- or black-dominant "
+            "kits. Use only researched player names and do not invent appearance "
+            "facts or fabricated marks. "
             "Research descriptions are design inputs, not poster copy: render only "
             "fixture facts as text—teams, competition, date, time, and venue. Never "
             "print descriptive kit values such as 'RICH BLUE & ORANGE' or "
             "'TRADITIONAL LIGHT GREEN' under a team name. State the matchup only "
             "once; 'INDIA PAKISTAN' and 'India v Pakistan' are duplicate matchup "
             "copy even when capitalization or separators differ. "
+            "Repair findings are targeted: a kit_fidelity finding must regenerate "
+            "the named subject image through generate-images because CSS and layout "
+            "cannot change jersey pixels. A likeness or asset_sharpness finding must "
+            "regenerate the named subject asset. Subject-scale, cinematic, and "
+            "typography findings should preserve subjects that passed imagery "
+            "criteria and change composition or styling instead of regenerating all "
+            "figures. "
             f"The coder output ceiling is {CODER_MAX_OUTPUT_TOKENS} tokens; split "
             "large file writes across multiple tool calls rather than emitting one "
             "enormous tool call. Create an out/index.html entry that references and "
@@ -4016,9 +4061,13 @@ def _model_system_prompt(
             "image budget is "
             f"{WorkerLimits().image_request_count} requests and "
             f"${WorkerLimits().image_spend_usd:.2f}; cache hits do not rebill. "
+            f"The run model budget is {WorkerLimits().model_tokens} tokens and "
+            f"${WorkerLimits().model_spend_usd:.2f}; keep repairs concise so the "
+            "four-cycle visual loop fits inside those caps. "
             "When research states kit colours, copy each approved kit-colour "
-            "description literally into that figure's image_manifest prompt; do not "
-            "paraphrase or invert it. Request plain unbranded kits with no sponsor "
+            "description literally into that figure's image_manifest prompt, then "
+            "apply the concrete dominant-colour and exclusion directions above; do "
+            "not paraphrase or invert it. Request plain unbranded kits with no sponsor "
             "marks, board logos, crests, badges, or trophies. Undeclared local "
             "assets, remote URLs, data URLs, and runtime fetches "
             "are refused. Never write workflow JSON or provider credentials.\n"
