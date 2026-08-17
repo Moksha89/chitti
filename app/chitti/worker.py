@@ -1721,7 +1721,7 @@ class DockerSandboxDispatcher:
         if tool == "visual_critique":
             if not policy.is_poster:
                 raise ValueError("visual critique is only available to poster jobs")
-            if route != CODER_ROUTE:
+            if route not in CODER_ROUTES:
                 raise ValueError("only the coder route may request visual critique")
             if visual_state is None:
                 raise ValueError("visual critique state was not initialized")
@@ -1737,8 +1737,8 @@ class DockerSandboxDispatcher:
                 job_config,
             )
         if tool == "write_file":
-            if route != CODER_ROUTE:
-                raise ValueError("reviewer route cannot write files")
+            if route not in CODER_ROUTES:
+                raise ValueError("only a coder route may write files")
             if (
                 policy.is_poster
                 and visual_state is not None
