@@ -515,7 +515,9 @@ def _reset_file_write_counters(
     total: int,
     per_file: dict[str, int],
 ) -> tuple[int, dict[str, int]]:
-    if not _run_command_was_executed(tool, arguments):
+    if tool != "capture_screenshot" and not _run_command_was_executed(
+        tool, arguments
+    ):
         return total, per_file
     return 0, {}
 
@@ -4058,6 +4060,11 @@ def _model_system_prompt(
             "background plates are exempt from that subject rule and should be "
             "judged against the final canvas using cropping, background-size cover, "
             "or layout treatment. "
+            "Use a fixed-canvas layout contract: reserve a title band at the top, "
+            "a subject band occupying the lower two-thirds with figures meeting "
+            "the title and fixture zone, and a footer band inside the canvas for "
+            "the venue. Keep every band within the 1080x1350 canvas; never position "
+            "the footer below the canvas and trim it into view. "
             "image budget is "
             f"{WorkerLimits().image_request_count} requests and "
             f"${WorkerLimits().image_spend_usd:.2f}; cache hits do not rebill. "
