@@ -16,16 +16,7 @@ REVIEWER_ROUTE = "reviewer"
 BULK_ROUTE = "bulk"
 VISION_ROUTE = "vision"
 DEPLOYMENT_GATEWAY_ROUTES = frozenset(
-    {
-        "chitti-chat",
-        "planner",
-        CODER_ROUTE,
-        "coder-fallback",
-        REVIEWER_ROUTE,
-        BULK_ROUTE,
-        VISION_ROUTE,
-        "vision-fallback",
-    }
+    {"chitti-chat", "planner", CODER_ROUTE, REVIEWER_ROUTE, BULK_ROUTE, VISION_ROUTE}
 )
 REQUIRED_GATEWAY_ROUTES = frozenset(
     {CODER_ROUTE, REVIEWER_ROUTE, BULK_ROUTE, VISION_ROUTE}
