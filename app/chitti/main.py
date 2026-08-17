@@ -88,6 +88,7 @@ from .research import (
     discover_sources,
     fetch_source,
     package_by_id,
+    snapshot_by_id,
 )
 from .run_context import RunContextError, build_run_evidence
 from .run_status import TERMINAL_RUN_STATUSES
@@ -1413,6 +1414,26 @@ async def discover_research_sources(request: Request) -> dict[str, object]:
         query=str(payload.get("query", "")).strip() or None,
     )
     return {"sources": [source.__dict__ for source in results]}
+
+
+@app.get("/research-sources/{snapshot_id}")
+async def get_research_source(
+    snapshot_id: int, request: Request
+) -> dict[str, object]:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        raise HTTPException(status_code=401, detail="authentication required")
+    async with request.app.state.database.sessions() as db_session:
+        snapshot = await snapshot_by_id(db_session, snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="research source not found")
+    return {
+        "id": snapshot.id,
+        "url": snapshot.url,
+        "retrieved_at": snapshot.retrieved_at.isoformat(),
+        "content_digest": snapshot.content_digest,
+        "byte_length": len(snapshot.content),
+    }
 
 
 @app.post("/research-packages/{package_id}/approve")
