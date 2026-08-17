@@ -1635,7 +1635,7 @@ class DockerSandboxDispatcher:
             _validate_screenshot_request(
                 policy, route_value, width, height, scale, job_config
             )
-            if policy.is_poster:
+            if policy.is_poster and visual_state is not None:
                 _, _, operation_index = await self._execute_model_tool(
                     run_id,
                     task_id,
@@ -1813,7 +1813,8 @@ class DockerSandboxDispatcher:
         image_digest = hashlib.sha256(image).hexdigest()
         artifact = str(poster_config(job_config)["artifact"])
         source_path = workspace / "out" / artifact
-        if visual_state["source_digest"] != hashlib.sha256(
+        source_digest = visual_state.get("source_digest")
+        if source_digest is not None and source_digest != hashlib.sha256(
             source_path.read_bytes()
         ).hexdigest():
             raise VisualReviewInconclusive(
