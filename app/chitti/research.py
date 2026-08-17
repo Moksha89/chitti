@@ -71,7 +71,9 @@ async def fetch_source(
 ) -> int:
     retrieved_at = datetime.now(UTC)
     async with httpx.AsyncClient(
-        follow_redirects=True, timeout=timeout_seconds
+        follow_redirects=True,
+        timeout=timeout_seconds,
+        headers={"User-Agent": "ChittiResearch/1.0"},
     ) as client:
         response = await client.get(url)
         response.raise_for_status()
