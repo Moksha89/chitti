@@ -25,7 +25,7 @@ model_list:
       budget_duration: 1d
   - model_name: coder-fallback
     litellm_params:
-      model: openrouter/google/gemini-2.5-flash
+      model: openrouter/deepseek/deepseek-chat-v3-0324
       api_base: https://openrouter.ai/api/v1
       api_key: os.environ/OPENROUTER_API_KEY
       input_cost_per_token: 0.0000014
