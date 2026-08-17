@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import shlex
 import shutil
 import subprocess
@@ -113,14 +114,16 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "evidence_limitations.",
         "observations must be an object with exactly these keys, each a plain-language "
         "description of what the image actually shows: background, imagery, "
-        "imagery_edges, text_blocks, colour_use. imagery_edges must state, for every "
-        "placed photographic or illustrated element, whether its boundary is a visible "
-        "straight edge, panel or rectangle against the surrounding design, and where "
-        "in the frame that edge is. If you cannot see a placed element at all, say so "
-        "there.",
+        "imagery_edges, text_blocks, colour_use. imagery_edges must describe, for "
+        "every placed photographic or illustrated element, only boundaries visibly "
+        "present against the surrounding design. Distinguish a visible seam, halo, "
+        "background rectangle or panel from an intentional crop at the canvas edge; "
+        "do not call a clean subject contour or canvas crop a straight edge. State "
+        "where a real boundary is visible, or explicitly say no visible boundary "
+        "exists.",
         "criteria must contain exactly these keys, each pass or fail: fixture_text, "
         "visual_hierarchy, readability, generated_imagery, composite_integrity, "
-        "brand_constraints.",
+        "brand_constraints, text_contrast, cinematic_treatment.",
         "composite_integrity fails when any placed image reads as a pasted rectangle: "
         "a visible box, panel or seam around it, a background inside it that differs "
         "from the poster background, or a washed-out block where the element sits. "
@@ -129,6 +132,19 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "an edge is deliberate, describe it and fail composite_integrity.",
         "generated_imagery fails when imagery is absent, or so dark, faint or "
         "low-contrast that the poster would read as flat colour without it.",
+        "text_contrast fails when any required text block is low-contrast against "
+        "its immediate background, including a title or team name that becomes "
+        "difficult to read because its colour is too close to the background. "
+        "Judge every text block, not only the smallest text.",
+        "cinematic_treatment fails when the composition is flat or evenly lit and "
+        "lacks visible directional or rim lighting, foreground/background depth "
+        "separation, and atmospheric treatment such as haze, light spill, particles "
+        "or grain. A dark colour wash or gradient alone is not cinematic treatment.",
+        "brand_constraints must judge the likeness policy stated in the poster brief: "
+        "generic figures are the default when the brief is silent; real likenesses "
+        "are permitted only when the brief explicitly permits them. Fabricated board "
+        "logos and fabricated trophy imagery remain prohibited regardless of likeness "
+        "policy.",
         "verdict must be pass or fail, and must be fail if any criterion is fail. "
         "image_sha256 must exactly match the supplied digest. findings must be a list "
         "of objects with criterion, issue and action fields; every failed criterion "
@@ -147,6 +163,31 @@ class VisualState(TypedDict):
     accounted_cost: float
     accounted_tokens: int
     last_failed_digest: str | None
+
+
+def _poster_likeness_policy(brief: str) -> str:
+    normalized = brief.lower()
+    if re.search(
+        r"\b(?:no|without|not)\s+(?:real\s+)?(?:player|players|likeness|faces?|kits?)\b",
+        normalized,
+    ):
+        return (
+            "Likeness policy: generic figures are required; real player likenesses "
+            "are not permitted by this brief."
+        )
+    if re.search(
+        r"\breal\s+(?:players?|likeness(?:es)?|faces?|kits?)\b",
+        normalized,
+    ):
+        return (
+            "Likeness policy: this brief explicitly permits real player likenesses, "
+            "real kits, and real faces. Do not fail brand constraints merely because "
+            "the figures look like real players."
+        )
+    return (
+        "Likeness policy: the brief is silent, so use generic figures and do not "
+        "introduce real player likenesses."
+    )
 
 
 class GateEvidenceContradiction(ModelProgressError):
@@ -1124,6 +1165,11 @@ class DockerSandboxDispatcher:
                                     elif tool == "visual_critique":
                                         if result_text.startswith("VISUAL_REVIEW_PASS"):
                                             completed_commands.add("visual-review")
+                                            await self._task_event(
+                                                run_id, task.id, "passed",
+                                                result_text[19:2019],
+                                            )
+                                            done = True
                                         else:
                                             completed_commands.discard("visual-review")
                                     elif tool == "write_file":
@@ -1335,6 +1381,10 @@ class DockerSandboxDispatcher:
                     elif tool == "visual_critique":
                         if result_text.startswith("VISUAL_REVIEW_PASS"):
                             completed_commands.add("visual-review")
+                            await self._task_event(
+                                run_id, task.id, "passed", result_text[19:2019]
+                            )
+                            done = True
                         else:
                             completed_commands.discard("visual-review")
                     elif tool == "write_file":
@@ -1745,6 +1795,7 @@ class DockerSandboxDispatcher:
             else {}
         )
         profile = json.dumps(profile_fields)
+        likeness_policy = _poster_likeness_policy(brief)
         review_instruction = VISUAL_REVIEW_INSTRUCTION
         messages: list[dict[str, object]] = [
             {"role": "system", "content": review_instruction},
@@ -1758,6 +1809,7 @@ class DockerSandboxDispatcher:
                             f"IMAGE SHA-256: {image_digest}\n"
                             f"IMAGE DIMENSIONS: {width}x{height}\n"
                             f"GENERATED ASSET COUNT: {generated_asset_count}\n"
+                            f"{likeness_policy}\n"
                             "Judge this exact captured PNG against the brief."
                         ),
                     },
@@ -1784,6 +1836,7 @@ class DockerSandboxDispatcher:
                     f"IMAGE BYTE SIZE: {len(image)}\n"
                     f"IMAGE DIMENSIONS: {width}x{height}\n"
                     f"GENERATED ASSET COUNT: {generated_asset_count}\n"
+                    f"{likeness_policy}\n"
                     "The PNG bytes were sent ephemerally and are not stored in this prompt."
                 ),
             },
@@ -3354,6 +3407,8 @@ def _parse_visual_verdict(value: object, image_digest: str) -> dict[str, object]
         "generated_imagery",
         "composite_integrity",
         "brand_constraints",
+        "text_contrast",
+        "cinematic_treatment",
     )
     if not isinstance(value, dict):
         raise VisualReviewInconclusive("visual critique returned a non-object verdict")
@@ -3657,6 +3712,15 @@ def _model_system_prompt(
             "The owner brand profile is "
             "authoritative and must be reflected exactly; do not invent colours, voice, "
             "audience, or typography. Create the declared artifact under out/. "
+            "Use generic figures by default when the poster brief does not explicitly "
+            "permit real likenesses. If the brief explicitly permits real players, "
+            "real kits, or real faces, follow that owner decision; fabricated board "
+            "logos and fabricated trophies remain prohibited in all cases. "
+            "Treat cinematic treatment as required: use directional or rim lighting, "
+            "visible depth separation between foreground subjects and the background, "
+            "and atmosphere such as haze, light spill, particles, or grain. A flat "
+            "colour wash or gradient is not enough, and every text block must maintain "
+            "clear contrast against its immediate background. "
             f"The coder output ceiling is {CODER_MAX_OUTPUT_TOKENS} tokens; split "
             "large file writes across multiple tool calls rather than emitting one "
             "enormous tool call. Create an out/index.html entry that references and "

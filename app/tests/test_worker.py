@@ -21,6 +21,7 @@ from chitti.worker import (
     WorkerLimits,
     _model_tool_progress_detail,
     _parse_visual_verdict,
+    _poster_likeness_policy,
     _task_done_checks,
     fixed_operations,
 )
@@ -68,7 +69,7 @@ def _visual_verdict(digest: str, verdict: str = "pass") -> str:
             "observations": {
                 "background": "A dark background.",
                 "imagery": "A generated image is visible.",
-                "imagery_edges": "No visible rectangular edges surround the generated image.",
+                "imagery_edges": "No visible boundary surrounds the generated image.",
                 "text_blocks": "Fixture text is visible.",
                 "colour_use": "Brand colours are visible.",
             },
@@ -80,6 +81,8 @@ def _visual_verdict(digest: str, verdict: str = "pass") -> str:
                 "generated_imagery": "pass",
                 "composite_integrity": "pass",
                 "brand_constraints": "pass",
+                "text_contrast": "pass",
+                "cinematic_treatment": "pass",
             },
             "findings": (
                 []
@@ -112,6 +115,16 @@ def test_visual_verdict_is_digest_bound_and_strict() -> None:
     del malformed["criteria"]
     with pytest.raises(VisualReviewInconclusive, match="incomplete"):
         _parse_visual_verdict(malformed, digest)
+
+
+def test_poster_likeness_policy_defaults_and_explicit_owner_choice() -> None:
+    assert "generic figures" in _poster_likeness_policy("Design a cricket poster.")
+    assert "not permitted" in _poster_likeness_policy(
+        "Use no real players in this poster."
+    )
+    assert "explicitly permits" in _poster_likeness_policy(
+        "Use real players, real kits and real faces."
+    )
 
 
 def test_visual_verdict_accepts_string_evidence_limitation() -> None:
@@ -218,6 +231,7 @@ async def test_visual_critique_persists_reference_without_base64_and_rebinds_dig
     assert "Inter" in prompts[0]
     assert "1080x1350" in prompts[0]
     assert "real player likenesses" in prompts[0]
+    assert "generic figures" in prompts[0]
     assert "private audience" not in prompts[0]
     assert "private voice" not in prompts[0]
     assert state["cycles"] == 2
