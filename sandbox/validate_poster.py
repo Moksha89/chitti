@@ -32,7 +32,7 @@ def _validate_asset_scale(source: str, dimensions: dict[str, tuple[int, int]]) -
         requested: dict[str, int] = {}
         for name in ("width", "height"):
             value = re.search(
-                rf"\b{name}\s*=\s*[\"'](\d+)(?:px)?[\"']",
+                rf"(?<![\w-]){name}\s*=\s*[\"'](\d+)(?:px)?[\"']",
                 attributes,
                 re.IGNORECASE,
             )
@@ -42,7 +42,9 @@ def _validate_asset_scale(source: str, dimensions: dict[str, tuple[int, int]]) -
         if style:
             for name in ("width", "height"):
                 value = re.search(
-                    rf"\b{name}\s*:\s*(\d+)px", style.group(1), re.IGNORECASE
+                    rf"(?<![\w-]){name}\s*:\s*(\d+)px",
+                    style.group(1),
+                    re.IGNORECASE,
                 )
                 if value:
                     requested[name] = int(value.group(1))

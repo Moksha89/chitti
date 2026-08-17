@@ -103,6 +103,14 @@ def test_height_only_asset_placement_rejects_oversize_height() -> None:
         )
 
 
+def test_max_width_and_min_height_are_not_placements() -> None:
+    MODULE._validate_asset_scale(
+        '<img src="generated/figure.png" '
+        'style="max-width: 1200px; min-height: 1200px">',
+        {"generated/figure.png": (768, 1024)},
+    )
+
+
 def test_undeclared_relative_raster_asset_is_refused() -> None:
     with pytest.raises(SystemExit, match="remote URL or runtime fetch"):
         MODULE.validate_poster_source(

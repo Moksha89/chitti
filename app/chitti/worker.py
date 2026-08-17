@@ -191,6 +191,7 @@ class VisualState(TypedDict):
     last_failed_digest: str | None
     source_digest: str | None
     review_passed: bool
+    review_task_id: str | None
 
 
 def _poster_likeness_policy(brief: str) -> str:
@@ -866,6 +867,7 @@ class DockerSandboxDispatcher:
             "last_failed_digest": None,
             "source_digest": None,
             "review_passed": False,
+            "review_task_id": None,
         }
         visual_brief = "\n".join(
             [revision.document.title]
@@ -1642,8 +1644,11 @@ class DockerSandboxDispatcher:
         if tool == "write_file":
             if route != CODER_ROUTE:
                 raise ValueError("reviewer route cannot write files")
-            if policy.is_poster and visual_state is not None and visual_state.get(
-                "review_passed", False
+            if (
+                policy.is_poster
+                and visual_state is not None
+                and visual_state.get("review_passed", False)
+                and visual_state.get("review_task_id") == task_id
             ):
                 raise ValueError(
                     "poster workspace cannot be edited after a passing visual critique"
@@ -1849,7 +1854,7 @@ class DockerSandboxDispatcher:
         if source_digest is not None and source_digest != hashlib.sha256(
             source_path.read_bytes()
         ).hexdigest():
-            raise VisualReviewInconclusive(
+            raise ValueError(
                 "visual critique requires a fresh capture after the poster source "
                 "changed; run poster-export and capture_screenshot again"
             )
@@ -2050,6 +2055,7 @@ class DockerSandboxDispatcher:
             task_id=task_id,
         )
         visual_state["review_passed"] = True
+        visual_state["review_task_id"] = task_id
         return "VISUAL_REVIEW_PASS\n" + json.dumps(parsed), 0, iteration
 
     async def _review_run(
