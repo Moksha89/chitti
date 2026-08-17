@@ -83,8 +83,8 @@ MODEL_TOOL_CALL_BUDGET = 240
 MAX_FILE_WRITES_WITHOUT_COMMAND = 24
 IDENTICAL_TOOL_FAILURE_LIMIT = 3
 REQUIRED_GATE_COMMANDS = ("build", "test", "export")
-VISUAL_REVIEW_MAX_CYCLES = 2
-VISUAL_REVIEW_SPEND_CAP_USD = 0.10
+VISUAL_REVIEW_MAX_CYCLES = 4
+VISUAL_REVIEW_SPEND_CAP_USD = 0.20
 
 
 class RunBudgetExceeded(RuntimeError):
@@ -139,7 +139,11 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "empty areas, especially when the composition leaves a substantial dead "
         "middle or lower third. Fail when the focal figures occupy only a minor "
         "portion of the canvas rather than carrying the composition; estimate "
-        "their visible height and reject figures that are plainly undersized.",
+        "their visible height and reject figures that are plainly undersized. "
+        "Fail when a subject floats in mid-air, is cropped across the body with "
+        "a visible hard edge, lacks full-body grounding with feet, or leaves a "
+        "large empty middle band. Subjects should be anchored to the lower "
+        "composition beneath a defined title and fixture-information zone.",
         "text_redundancy fails when the same fixture, matchup, date, venue, or "
         "other information is stated twice in materially duplicated text blocks. "
         "Treat case, punctuation, separators, and a versus marker as irrelevant: "
@@ -531,8 +535,8 @@ class WorkerLimits:
     model_tokens: int = 500000
     model_write_bytes: int = 2 * 1024 * 1024
     model_spend_usd: float = 0.75
-    image_spend_usd: float = 0.05
-    image_request_count: int = 6
+    image_spend_usd: float = 0.10
+    image_request_count: int = 12
     run_timeout_seconds: int = 7200
 
     def as_json(self) -> dict[str, object]:
@@ -578,8 +582,8 @@ class WorkerLimits:
             model_tokens=int(cast(int, values.get("model_tokens", 500000))),
             model_write_bytes=int(cast(int, values.get("model_write_bytes", 2 * 1024 * 1024))),
             model_spend_usd=float(cast(float, values.get("model_spend_usd", 0.75))),
-            image_spend_usd=float(cast(float, values.get("image_spend_usd", 0.05))),
-            image_request_count=int(cast(int, values.get("image_request_count", 6))),
+            image_spend_usd=float(cast(float, values.get("image_spend_usd", 0.10))),
+            image_request_count=int(cast(int, values.get("image_request_count", 12))),
             run_timeout_seconds=int(cast(int, values.get("run_timeout_seconds", 7200))),
         )
 
@@ -3904,7 +3908,10 @@ def _model_system_prompt(
             "generated asset width and height must each be between 64 and 1024 "
             "pixels; choose the largest useful source aspect ratio the endpoint "
             "supports for each subject. The approved 1080x1350 size is the final composed poster "
-            "canvas. Subject figures must not be enlarged beyond their resolved "
+            "canvas. Subject figures must be full-body with visible feet, anchored "
+            "to the lower composition beneath a defined title and fixture-information "
+            "zone; do not float portraits in open space or crop a figure across the "
+            "body with a hard edge. Subject figures must not be enlarged beyond their resolved "
             "generated pixels; request a larger subject asset instead. Full-bleed "
             "background plates are exempt from that subject rule and should be "
             "judged against the final canvas using cropping, background-size cover, "
@@ -3912,7 +3919,11 @@ def _model_system_prompt(
             "image budget is "
             f"{WorkerLimits().image_request_count} requests and "
             f"${WorkerLimits().image_spend_usd:.2f}; cache hits do not rebill. "
-            "Undeclared local assets, remote URLs, data URLs, and runtime fetches "
+            "When research states kit colours, copy each approved kit-colour "
+            "description literally into that figure's image_manifest prompt; do not "
+            "paraphrase or invert it. Request plain unbranded kits with no sponsor "
+            "marks, board logos, crests, badges, or trophies. Undeclared local "
+            "assets, remote URLs, data URLs, and runtime fetches "
             "are refused. Never write workflow JSON or provider credentials.\n"
             "The out/ directory is the publishable export only: keep it limited "
             "to the approved HTML artifact, its index entry, CSS/SVG, and "

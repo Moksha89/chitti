@@ -131,6 +131,13 @@ def poster_config_within_ceiling(
             f"approved {approved_config['artifact']}"
         )
     if (
+        "research_package_id" in approved_config
+        and "research_package_id" not in requested_config
+    ):
+        raise ValueError(
+            "approved poster research package is missing from the run configuration"
+        )
+    if (
         requested_width > approved_width
         or requested_height > approved_height
         or requested_scale > approved_scale

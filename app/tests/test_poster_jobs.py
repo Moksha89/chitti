@@ -89,6 +89,21 @@ def test_run_config_preserves_approved_research_context() -> None:
     assert result["research_facts"] == approved["research_facts"]
 
 
+def test_run_config_refuses_missing_approved_research_package() -> None:
+    approved = {
+        "artifact": "poster.html",
+        "width": 1080,
+        "height": 1350,
+        "scale": 1,
+        "research_package_id": 4,
+    }
+    with pytest.raises(ValueError, match="research package is missing"):
+        poster_config_within_ceiling(
+            {"artifact": "poster.html", "width": 1080, "height": 1350, "scale": 1},
+            approved,
+        )
+
+
 def test_poster_prompts_require_brand_and_honest_visual_review() -> None:
     prompt = _model_system_prompt(
         POSTER_POLICY,
@@ -109,6 +124,8 @@ def test_poster_prompts_require_brand_and_honest_visual_review() -> None:
     assert "between 64 and 1024 pixels" in prompt
     assert "1080x1350" in prompt
     assert "useful source aspect ratio" in prompt
+    assert "full-body with visible feet" in prompt
+    assert "plain unbranded kits" in prompt
     assert "cinematic treatment as required" in prompt
     assert "every text block must maintain clear contrast" in prompt
     assert "generic figures by default" in prompt
