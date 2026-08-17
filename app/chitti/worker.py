@@ -1630,13 +1630,11 @@ class DockerSandboxDispatcher:
         if tool == "write_file":
             if route != CODER_ROUTE:
                 raise ValueError("reviewer route cannot write files")
-            if (
-                policy.is_poster
-                and visual_state is not None
-                and visual_state.get("review_passed", False)
+            if policy.is_poster and visual_state is not None and visual_state.get(
+                "review_passed", False
             ):
                 raise ValueError(
-                    "poster source cannot be edited after a passing visual critique"
+                    "poster workspace cannot be edited after a passing visual critique"
                 )
             path = _confined_path(workspace, str(arguments.get("path", "")))
             content = str(arguments.get("content", ""))
