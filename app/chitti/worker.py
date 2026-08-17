@@ -1309,16 +1309,25 @@ class DockerSandboxDispatcher:
                             ),
                         )
                         if failures >= 2 and route == CODER_ROUTE:
-                            route = REVIEWER_ROUTE
-                            messages = _reviewer_diagnosis_messages(
-                                task.title, task.description,
-                                completion.tool_calls[0].name, batch_failure,
-                            )
-                            await self._event(
-                                run_id, "model_route_switched",
-                                "switched to reviewer after two failures on the same task",
-                                task_id=task.id,
-                            )
+                            if "model response was not valid JSON" in batch_failure:
+                                route = CODER_FALLBACK_ROUTE
+                                await self._event(
+                                    run_id,
+                                    "model_route_switched",
+                                    "switched to coder fallback after two malformed responses",
+                                    task_id=task.id,
+                                )
+                            else:
+                                route = REVIEWER_ROUTE
+                                messages = _reviewer_diagnosis_messages(
+                                    task.title, task.description,
+                                    completion.tool_calls[0].name, batch_failure,
+                                )
+                                await self._event(
+                                    run_id, "model_route_switched",
+                                    "switched to reviewer after two failures on the same task",
+                                    task_id=task.id,
+                                )
                             continue
                     elif batch_completed:
                         if batch_workspace_changed:
@@ -1486,15 +1495,24 @@ class DockerSandboxDispatcher:
                     )
                     await record_nonproductive(result_text)
                     if failures >= 2 and route == CODER_ROUTE:
-                        route = REVIEWER_ROUTE
-                        messages = _reviewer_diagnosis_messages(
-                            task.title, task.description, tool, result_text
-                        )
-                        await self._event(
-                            run_id, "model_route_switched",
-                            "switched to reviewer after two failures on the same task",
-                            task_id=task.id,
-                        )
+                        if "model response was not valid JSON" in result_text:
+                            route = CODER_FALLBACK_ROUTE
+                            await self._event(
+                                run_id,
+                                "model_route_switched",
+                                "switched to coder fallback after two malformed responses",
+                                task_id=task.id,
+                            )
+                        else:
+                            route = REVIEWER_ROUTE
+                            messages = _reviewer_diagnosis_messages(
+                                task.title, task.description, tool, result_text
+                            )
+                            await self._event(
+                                run_id, "model_route_switched",
+                                "switched to reviewer after two failures on the same task",
+                                task_id=task.id,
+                            )
                         continue
                 messages.extend(
                     _tool_exchange(completion, result_text[:16000], native_call)
