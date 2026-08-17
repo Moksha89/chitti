@@ -38,6 +38,7 @@ POSTER_LAYOUT_SCRIPT = """() => {
     right: viewportWidth,
     bottom: viewportHeight,
   };
+  const labels = [];
   for (const element of candidates) {
     const rect = element.getBoundingClientRect();
     if (!rect.width && !rect.height) continue;
@@ -45,6 +46,12 @@ POSTER_LAYOUT_SCRIPT = """() => {
     bounds.top = Math.min(bounds.top, rect.top);
     bounds.right = Math.max(bounds.right, rect.right);
     bounds.bottom = Math.max(bounds.bottom, rect.bottom);
+    labels.push(
+      element.getAttribute("data-name") ||
+      element.id ||
+      (typeof element.className === "string" ? element.className : "") ||
+      element.tagName.toLowerCase(),
+    );
   }
   const horizontal = Math.max(
     0,
@@ -69,7 +76,7 @@ POSTER_LAYOUT_SCRIPT = """() => {
       kind: "poster-overflow",
       axis: "horizontal",
       overflow: amount,
-      message: `poster overflow: horizontal by ${amount} CSS pixels`,
+      message: `poster overflow: horizontal by ${amount} CSS pixels in ${labels.join(", ")}`,
     });
   }
   if (vertical > tolerance) {
@@ -77,7 +84,7 @@ POSTER_LAYOUT_SCRIPT = """() => {
     errors.push({
       kind: "poster-overflow",
       axis: "vertical",
-      message: `poster overflow: vertical by ${amount} CSS pixels`,
+      message: `poster overflow: vertical by ${amount} CSS pixels in ${labels.join(", ")}`,
       overflow: amount,
     });
   }

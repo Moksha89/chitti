@@ -1058,6 +1058,30 @@ class DockerSandboxDispatcher:
                         run_id, task.id, iteration, route, failure,
                         prompt=json.dumps(messages, separators=(",", ":")),
                     )
+                    if (
+                        isinstance(exc, ModelProviderError)
+                        and exc.failure_class == "http 429"
+                        and route == CODER_ROUTE
+                    ):
+                        route = CODER_FALLBACK_ROUTE
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "TOOL FAILURE: coder route returned sustained "
+                                    "HTTP 429 capacity responses; continue using "
+                                    "the independent coder fallback route."
+                                ),
+                            }
+                        )
+                        await self._event(
+                            run_id,
+                            "model_route_switched",
+                            "switched to coder fallback after sustained HTTP 429 responses",
+                            task_id=task.id,
+                        )
+                        await compact_history()
+                        continue
                     await self._event(
                         run_id, "model_tool_failed",
                         detail[:1000],
