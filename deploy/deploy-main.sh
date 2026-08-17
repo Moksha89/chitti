@@ -138,6 +138,10 @@ assert_process_setting_forwarded() {
 git -c safe.directory="${INSTALL_DIR}" fetch --quiet origin "${REMOTE_BRANCH}"
 git -c safe.directory="${INSTALL_DIR}" checkout --quiet --detach "origin/${REMOTE_BRANCH}"
 
+# Do not let the runner perform startup maintenance while the application
+# containers and database grants are being reconciled.
+systemctl stop "${RUNNER_UNIT}" 2>/dev/null || true
+
 mapfile -t matte_model_digests < <(
   sed -nE \
     's/.*echo "([[:xdigit:]]{64})  \/app\/models\/u2net\.onnx".*/\1/p' \

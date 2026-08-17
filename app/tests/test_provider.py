@@ -694,7 +694,7 @@ def test_agent_completion_exhausted_retries_name_class_and_attempts(monkeypatch)
 def test_gateway_config_has_bounded_single_attempt_timeout() -> None:
     config = Path(__file__).parents[2] / "litellm" / "config.yaml"
     text = config.read_text()
-    assert "request_timeout: 600" in text
+    assert "request_timeout: 60" in text
     assert "num_retries: 0" in text
 
 

@@ -25,9 +25,9 @@ model_list:
       budget_duration: 1d
   - model_name: coder-fallback
     litellm_params:
-      model: glm-4.5
-      api_base: os.environ/GLM_API_BASE
-      api_key: os.environ/GLM_CODING_API_KEY
+      model: openrouter/deepseek/deepseek-chat-v3-0324
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
       input_cost_per_token: 0.0000014
       output_cost_per_token: 0.0000044
       cache_read_input_token_cost: 0.00000026
@@ -58,9 +58,9 @@ model_list:
       budget_duration: 1d
   - model_name: vision-fallback
     litellm_params:
-      model: glm-4.6v-flashx
-      api_base: os.environ/GLM_API_BASE
-      api_key: os.environ/GLM_CODING_API_KEY
+      model: openrouter/google/gemini-2.5-flash
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
       input_cost_per_token: 0.00000004
       output_cost_per_token: 0.0000004
       max_budget: 1
@@ -68,7 +68,9 @@ model_list:
 
 litellm_settings:
   drop_params: true
-  request_timeout: 600
+  # Keep one primary timeout plus one fallback timeout within Chitti's
+  # 150-second client request bound.
+  request_timeout: 60
   # Chitti owns bounded retry classification and accounting per model call.
   num_retries: 0
   json_logs: true

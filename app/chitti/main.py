@@ -85,7 +85,10 @@ from .research import (
     ResearchPackageSource,
     approve_package,
     create_package,
+    discover_sources,
+    fetch_source,
     package_by_id,
+    snapshot_by_id,
 )
 from .run_context import RunContextError, build_run_evidence
 from .run_status import TERMINAL_RUN_STATUSES
@@ -1379,6 +1382,61 @@ async def create_research_package(request: Request) -> dict[str, object]:
     return {"id": package_id, "approved": False}
 
 
+@app.post("/research-sources/fetch")
+async def fetch_research_source(request: Request) -> dict[str, object]:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        raise HTTPException(status_code=401, detail="authentication required")
+    _, session = result
+    require_csrf(request, session, request.headers.get("X-CSRF-Token", ""))
+    payload = await request.json()
+    url = str(payload.get("url", "")).strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="source URL is required")
+    async with request.app.state.database.sessions() as db_session:
+        snapshot_id = await fetch_source(db_session, url)
+        await db_session.commit()
+    return {"id": snapshot_id}
+
+
+@app.post("/research-sources/discover")
+async def discover_research_sources(request: Request) -> dict[str, object]:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        raise HTTPException(status_code=401, detail="authentication required")
+    _, session = result
+    require_csrf(request, session, request.headers.get("X-CSRF-Token", ""))
+    payload = await request.json()
+    urls = [str(item).strip() for item in payload.get("urls", []) if str(item).strip()]
+    results = await discover_sources(
+        urls,
+        brave_api_key=os.environ.get("BRAVE_SEARCH_API_KEY"),
+        openrouter_api_key=os.environ.get("OPENROUTER_API_KEY"),
+        query=str(payload.get("query", "")).strip() or None,
+    )
+    return {"sources": [source.__dict__ for source in results]}
+
+
+@app.get("/research-sources/{snapshot_id}")
+async def get_research_source(
+    snapshot_id: int, request: Request
+) -> dict[str, object]:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        raise HTTPException(status_code=401, detail="authentication required")
+    async with request.app.state.database.sessions() as db_session:
+        snapshot = await snapshot_by_id(db_session, snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="research source not found")
+    return {
+        "id": snapshot.id,
+        "url": snapshot.url,
+        "retrieved_at": snapshot.retrieved_at.isoformat(),
+        "content_digest": snapshot.content_digest,
+        "byte_length": len(snapshot.content),
+    }
+
+
 @app.post("/research-packages/{package_id}/approve")
 async def approve_research_package(
     package_id: int, request: Request
@@ -1393,7 +1451,7 @@ async def approve_research_package(
         package = await package_by_id(db_session, package_id, namespace)
         if package is None:
             raise HTTPException(status_code=404, detail="research package not found")
-        await approve_package(db_session, package_id, session.username)
+        await approve_package(db_session, package_id, str(session.username))
         await db_session.commit()
     return {"id": package_id, "approved": True}
 
