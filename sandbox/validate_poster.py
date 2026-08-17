@@ -19,13 +19,19 @@ def _split_brand_color(value: str) -> tuple[str | None, str]:
     return None, candidate
 
 
-def _validate_asset_scale(source: str, dimensions: dict[str, tuple[int, int]]) -> None:
+def _validate_asset_scale(
+    source: str,
+    dimensions: dict[str, tuple[int, int]],
+    subject_paths: set[str] | None = None,
+) -> None:
     for match in re.finditer(r"<img\b([^>]+)>", source, re.IGNORECASE):
         attributes = match.group(1)
         src_match = re.search(r"\bsrc\s*=\s*[\"']([^\"']+)", attributes, re.IGNORECASE)
         if src_match is None:
             continue
         relative = src_match.group(1).replace("\\", "/").lstrip("./")
+        if subject_paths is not None and relative not in subject_paths:
+            continue
         actual = dimensions.get(relative)
         if actual is None:
             continue
@@ -55,19 +61,18 @@ def _validate_asset_scale(source: str, dimensions: dict[str, tuple[int, int]]) -
             raise SystemExit(
                 f"poster places generated asset above its pixels: {relative}; "
                 f"generated {actual[0]}x{actual[1]}, requested {requested}; "
-                "request a larger generated asset instead"
+                "this refusal applies to subject assets; request a larger generated "
+                "subject asset instead"
             )
 
 
 def _contains_declared_value(source: str, value: str) -> bool:
     _, value = _split_brand_color(value)
-    if value.casefold() in source.casefold():
+    normalized_value = re.sub(r"\s+", "", value).casefold()
+    normalized_source = re.sub(r"\s+", "", source).casefold()
+    if normalized_value in normalized_source:
         return True
-    tokens = [token for token in re.split(r"[^A-Za-z0-9]+", value) if token]
-    if not tokens:
-        return False
-    pattern = r"[^A-Za-z0-9]+".join(re.escape(token) for token in tokens)
-    return re.search(pattern, source, flags=re.IGNORECASE) is not None
+    return False
 
 
 def _first_line_containing(source: str, value: str) -> int | None:
@@ -222,11 +227,18 @@ def main() -> None:
                 and isinstance(item.get("width"), int)
                 and isinstance(item.get("height"), int)
             }
+            subject_paths = {
+                str(item["path"]).replace("\\", "/").lstrip("./")
+                for item in resolved.get("images", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("path"), str)
+                and "background" not in str(item.get("purpose", "")).casefold()
+            }
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
             raise SystemExit("poster resolved image manifest is invalid") from exc
     validate_export_assets(Path("/workspace/out"), declared_assets)
     source = path.read_text(encoding="utf-8", errors="replace")
-    _validate_asset_scale(source, dimensions)
+    _validate_asset_scale(source, dimensions, subject_paths)
     available = {
         line.strip().casefold()
         for line in Path("/opt/available_fonts.txt").read_text().splitlines()

@@ -1648,10 +1648,11 @@ class DockerSandboxDispatcher:
                 policy.is_poster
                 and visual_state is not None
                 and visual_state.get("review_passed", False)
-                and visual_state.get("review_task_id") == task_id
             ):
                 raise ValueError(
-                    "poster workspace cannot be edited after a passing visual critique"
+                    "poster workspace is frozen after a passing visual critique; "
+                    "run poster-export and capture_screenshot to deliberately start "
+                    "a new repair cycle before editing"
                 )
             path = _confined_path(workspace, str(arguments.get("path", "")))
             content = str(arguments.get("content", ""))
@@ -1810,6 +1811,9 @@ class DockerSandboxDispatcher:
                 await self._verify_poster_assets(
                     run_id, workspace, operation, operation_index, stdout
                 )
+                if visual_state is not None:
+                    visual_state["review_passed"] = False
+                    visual_state["review_task_id"] = None
             await self._operation(
                 run_id, operation, operation_index, status, stdout, stderr,
                 result.returncode, datetime.now(UTC),
@@ -3899,9 +3903,11 @@ def _model_system_prompt(
             "The cutout field is opt-in per image; omit it for background plates. "
             "generated asset width and height must each be between 64 and 1024 "
             "pixels. The approved 1080x1350 size is the final composed poster "
-            "canvas, not a generated asset size; choose a useful source aspect "
-            "ratio within the ceiling and compose it upward with cropping, "
-            "scaling, or layout. "
+            "canvas. Subject figures must not be enlarged beyond their resolved "
+            "generated pixels; request a larger subject asset instead. Full-bleed "
+            "background plates are exempt from that subject rule and should be "
+            "judged against the final canvas using cropping, background-size cover, "
+            "or layout treatment. "
             "image budget is "
             f"{WorkerLimits().image_request_count} requests and "
             f"${WorkerLimits().image_spend_usd:.2f}; cache hits do not rebill. "

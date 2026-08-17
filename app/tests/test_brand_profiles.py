@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.postgres import PostgresContainer
 
+from chitti.brand_colors import validate_brand_color
 from chitti.brand_profiles import (
     available_font_families,
     get_brand_profile,
@@ -126,3 +127,15 @@ def test_font_manifest_is_the_sandbox_image_source_of_truth() -> None:
         for line in manifest.read_text().splitlines()
         if line.strip()
     }
+
+
+def test_brand_color_rejects_invalid_hex_length() -> None:
+    with pytest.raises(ValueError):
+        validate_brand_color("#12345")
+
+
+def test_brand_color_accepts_only_supported_renderable_forms() -> None:
+    assert validate_brand_color("#1234") == "#1234"
+    assert validate_brand_color("rgb(1, 2, 3)") == "rgb(1, 2, 3)"
+    with pytest.raises(ValueError):
+        validate_brand_color("crimson")
