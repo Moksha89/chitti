@@ -282,7 +282,7 @@ if [[ -n "${missing_gateway_routes}" ]]; then
   exit 1
 fi
 echo "Gateway loaded-route assertions passed."
-for gateway_route in chitti-chat planner coder reviewer bulk vision; do
+for gateway_route in chitti-chat planner coder coder-fallback reviewer bulk vision vision-fallback; do
   gateway_probe="$(
     curl --fail --silent --show-error --max-time 30 \
       -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \

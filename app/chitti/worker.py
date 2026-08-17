@@ -141,8 +141,9 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "separation, and atmospheric treatment such as haze, light spill, particles "
         "or grain. A dark colour wash or gradient alone is not cinematic treatment.",
         "brand_constraints must judge the likeness policy stated in the poster brief: "
-        "generic figures are the default when the brief is silent; real likenesses "
-        "are permitted only when the brief explicitly permits them. Fabricated board "
+        "the policy is an owner decision carried in the run configuration. Generic "
+        "figures are the default; real likenesses are permitted only when the "
+        "recorded policy says so. Fabricated board "
         "logos and fabricated trophy imagery remain prohibited regardless of likeness "
         "policy.",
         "verdict must be pass or fail, and must be fail if any criterion is fail. "
@@ -1607,6 +1608,7 @@ class DockerSandboxDispatcher:
                 visual_state,
                 visual_brief,
                 brand_profile,
+                job_config,
             )
         if tool == "write_file":
             if route != CODER_ROUTE:
@@ -1768,7 +1770,9 @@ class DockerSandboxDispatcher:
         visual_state: VisualState,
         brief: str,
         brand_profile: BrandProfile | None,
+        job_config: dict[str, object] | None = None,
     ) -> tuple[str, int, int]:
+        job_config = job_config or {}
         if visual_state["cycles"] >= VISUAL_REVIEW_MAX_CYCLES:
             raise VisualReviewInconclusive(
                 f"visual review exceeded {VISUAL_REVIEW_MAX_CYCLES} critique cycles"
@@ -1795,7 +1799,15 @@ class DockerSandboxDispatcher:
             else {}
         )
         profile = json.dumps(profile_fields)
-        likeness_policy = _poster_likeness_policy(brief)
+        job_config = job_config or {}
+        likeness_policy = (
+            "Likeness policy: real player likenesses, real kits, and real faces "
+            "are permitted by the owner."
+            if job_config.get("likeness_policy") == "real_likeness_permitted"
+            else "Likeness policy: use generic figures; real player likenesses, "
+            "real kits, and real faces are not permitted."
+        )
+        research_facts = job_config.get("research_facts")
         review_instruction = VISUAL_REVIEW_INSTRUCTION
         messages: list[dict[str, object]] = [
             {"role": "system", "content": review_instruction},
@@ -1809,6 +1821,11 @@ class DockerSandboxDispatcher:
                             f"IMAGE SHA-256: {image_digest}\n"
                             f"IMAGE DIMENSIONS: {width}x{height}\n"
                             f"GENERATED ASSET COUNT: {generated_asset_count}\n"
+                            f"APPROVED RESEARCH FACTS:\n"
+                            f"{json.dumps(research_facts, sort_keys=True)}\n"
+                            "When approved research facts are supplied, judge "
+                            "fixture_text against those facts exactly; do not use "
+                            "the prose brief as a substitute source of truth.\n"
                             f"{likeness_policy}\n"
                             "Judge this exact captured PNG against the brief."
                         ),
@@ -3712,10 +3729,20 @@ def _model_system_prompt(
             "The owner brand profile is "
             "authoritative and must be reflected exactly; do not invent colours, voice, "
             "audience, or typography. Create the declared artifact under out/. "
-            "Use generic figures by default when the poster brief does not explicitly "
-            "permit real likenesses. If the brief explicitly permits real players, "
-            "real kits, or real faces, follow that owner decision; fabricated board "
+            f"The recorded owner likeness policy is "
+            f"{approved['likeness_policy']}; generic figures by default, and "
+            "follow the recorded policy exactly. "
+            "Fabricated board "
             "logos and fabricated trophies remain prohibited in all cases. "
+            + (
+                "The approved research package facts are authoritative; use them "
+                "for all fixture, team, squad, kit-colour, and venue text and do "
+                "not invent replacements:\n"
+                f"{json.dumps(approved.get('research_facts', {}), sort_keys=True)}\n"
+                if approved.get("research_facts")
+                else ""
+            )
+            +
             "Treat cinematic treatment as required: use directional or rim lighting, "
             "visible depth separation between foreground subjects and the background, "
             "and atmosphere such as haze, light spill, particles, or grain. A flat "

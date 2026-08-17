@@ -80,6 +80,13 @@ from .previews import manifest_from_json, safe_preview_file
 from .project_state import ProjectState
 from .provider import FakeProvider, LiteLLMProvider
 from .reminders import cancel_reminder, create_reminder, recent_reminders
+from .research import (
+    ResearchPackageDocument,
+    ResearchPackageSource,
+    approve_package,
+    create_package,
+    package_by_id,
+)
 from .run_context import RunContextError, build_run_evidence
 from .run_status import TERMINAL_RUN_STATUSES
 from .runner_health import recent_runner_health
@@ -1342,6 +1349,80 @@ async def approve_plan(revision_id: int, request: Request) -> RedirectResponse:
     return RedirectResponse("/", status_code=303)
 
 
+@app.post("/research-packages")
+async def create_research_package(request: Request) -> dict[str, object]:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        raise HTTPException(status_code=401, detail="authentication required")
+    _, session = result
+    require_csrf(request, session, request.headers.get("X-CSRF-Token", ""))
+    payload = await request.json()
+    try:
+        title = str(payload["title"])
+        facts = ResearchPackageDocument.model_validate(payload["facts"])
+        sources = [
+            ResearchPackageSource.model_validate(item)
+            for item in payload.get("sources", [])
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="invalid research package") from exc
+    namespace = requested_namespace(request, str(payload.get("namespace", "")) or None)
+    async with request.app.state.database.sessions() as db_session:
+        try:
+            package_id = await create_package(
+                db_session, title, facts, sources, namespace
+            )
+            await db_session.commit()
+        except Exception:
+            await db_session.rollback()
+            raise
+    return {"id": package_id, "approved": False}
+
+
+@app.post("/research-packages/{package_id}/approve")
+async def approve_research_package(
+    package_id: int, request: Request
+) -> dict[str, object]:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        raise HTTPException(status_code=401, detail="authentication required")
+    _, session = result
+    require_csrf(request, session, request.headers.get("X-CSRF-Token", ""))
+    async with request.app.state.database.sessions() as db_session:
+        namespace = requested_namespace(request)
+        package = await package_by_id(db_session, package_id, namespace)
+        if package is None:
+            raise HTTPException(status_code=404, detail="research package not found")
+        await approve_package(db_session, package_id, session.username)
+        await db_session.commit()
+    return {"id": package_id, "approved": True}
+
+
+@app.get("/research-packages/{package_id}")
+async def get_research_package(
+    package_id: int, request: Request
+) -> dict[str, object]:
+    result = browser_session(request)
+    if isinstance(result, RedirectResponse):
+        raise HTTPException(status_code=401, detail="authentication required")
+    namespace = requested_namespace(request)
+    async with request.app.state.database.sessions() as db_session:
+        package = await package_by_id(db_session, package_id, namespace)
+    if package is None:
+        raise HTTPException(status_code=404, detail="research package not found")
+    return {
+        "id": package.id,
+        "namespace": package.namespace,
+        "title": package.title,
+        "facts": package.facts.model_dump(mode="json"),
+        "sources": [source.model_dump(mode="json") for source in package.sources],
+        "content_digest": package.content_digest,
+        "approved": package.approved,
+        "approved_by": package.approved_by,
+        "approved_at": package.approved_at,
+    }
+
+
 @app.get("/plans/{revision_id}", response_class=HTMLResponse, response_model=None)
 async def plan_page(revision_id: int, request: Request) -> HTMLResponse | RedirectResponse:
     result = browser_session(request)
@@ -1553,6 +1634,12 @@ async def start_run(revision_id: int, request: Request) -> RedirectResponse:
             "width": str(form.get("poster_width", approved["width"])),
             "height": str(form.get("poster_height", approved["height"])),
             "scale": str(form.get("poster_scale", approved["scale"])),
+            "likeness_policy": approved.get("likeness_policy", "generic_figures"),
+            **(
+                {"research_package_id": approved["research_package_id"]}
+                if "research_package_id" in approved
+                else {}
+            ),
         }
         try:
             job_config = poster_config_within_ceiling(raw_config, approved)

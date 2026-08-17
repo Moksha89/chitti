@@ -23,6 +23,16 @@ model_list:
       cache_read_input_token_cost: 0.00000026
       max_budget: 5
       budget_duration: 1d
+  - model_name: coder-fallback
+    litellm_params:
+      model: glm-4.5
+      api_base: os.environ/GLM_API_BASE
+      api_key: os.environ/GLM_CODING_API_KEY
+      input_cost_per_token: 0.0000014
+      output_cost_per_token: 0.0000044
+      cache_read_input_token_cost: 0.00000026
+      max_budget: 5
+      budget_duration: 1d
   - model_name: reviewer
     litellm_params:
       model: os.environ/GLM_LITELLM_MODEL
@@ -40,6 +50,15 @@ model_list:
   - model_name: vision
     litellm_params:
       model: openai/glm-4.6v-flashx
+      api_base: os.environ/GLM_API_BASE
+      api_key: os.environ/GLM_CODING_API_KEY
+      input_cost_per_token: 0.00000004
+      output_cost_per_token: 0.0000004
+      max_budget: 1
+      budget_duration: 1d
+  - model_name: vision-fallback
+    litellm_params:
+      model: glm-4.6v-flashx
       api_base: os.environ/GLM_API_BASE
       api_key: os.environ/GLM_CODING_API_KEY
       input_cost_per_token: 0.00000004
@@ -68,6 +87,9 @@ litellm_settings:
 
 router_settings:
   routing_strategy: simple-shuffle
+  fallbacks:
+    - coder: [coder-fallback]
+    - vision: [vision-fallback]
   provider_budget_config:
     openai:
       budget_limit: 25

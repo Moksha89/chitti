@@ -174,7 +174,11 @@ def test_agent_completion_records_native_tool_calls_and_request_schema(monkeypat
 
     assert completion.content == ""
     assert completion.finish_reason == "length"
-    assert completion.message_fields == ("reasoning_content", "tool_calls")
+    assert completion.message_fields == (
+        "reasoning_content",
+        "tool_calls",
+        "gateway_served_model=openai/glm-5.2",
+    )
     assert completion.tool_calls == (
         ModelToolCall(id="call-1", name="list_files", arguments={"path": "."}),
     )
@@ -407,7 +411,10 @@ def test_output_ceiling_malformed_tool_call_continues_without_retry(monkeypatch)
     assert calls == 1
     assert completion.finish_reason == "length"
     assert completion.tool_calls == ()
-    assert completion.message_fields == ("response_failure_class=output limit",)
+    assert completion.message_fields == (
+        "response_failure_class=output limit",
+        "gateway_served_model=glm-5.2",
+    )
     assert "response_exception=ValueError" in completion.response_diagnostics[0]
 
 
