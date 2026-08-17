@@ -81,6 +81,7 @@ def test_gateway_preflight_uses_models_endpoint_and_both_routes(monkeypatch) -> 
                 {"id": "chitti-chat"},
                 {"id": "planner"},
                 {"id": "coder"},
+                {"id": "coder-fallback"},
                     {"id": "reviewer"},
                     {"id": "bulk"},
                     {"id": VISION_ROUTE},
@@ -117,6 +118,7 @@ def test_gateway_preflight_uses_models_endpoint_and_both_routes(monkeypatch) -> 
     assert [call[1]["json"]["model"] for call in calls[1:]] == [
         "bulk",
         "coder",
+        "coder-fallback",
         "reviewer",
         "vision",
         "vision-fallback",

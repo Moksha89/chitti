@@ -48,8 +48,10 @@ from .plans import (
 )
 from .previews import copy_export, remove_preview
 from .provider import (
+    CODER_FALLBACK_ROUTE,
     CODER_MAX_OUTPUT_TOKENS,
     CODER_ROUTE,
+    CODER_ROUTES,
     REVIEWER_ROUTE,
     VISION_FALLBACK_ROUTE,
     VISION_ROUTE,
@@ -1039,8 +1041,8 @@ class DockerSandboxDispatcher:
                     completion = await self.model_provider.agent_completion(
                         messages,
                         route,
-                        tools=model_tool_schemas() if route == CODER_ROUTE else None,
-                        tool_choice="required" if route == CODER_ROUTE else None,
+                        tools=model_tool_schemas() if route in CODER_ROUTES else None,
+                        tool_choice="required" if route in CODER_ROUTES else None,
                     )
                 except Exception as exc:
                     if self._is_cancelled(run_id):
@@ -1078,6 +1080,14 @@ class DockerSandboxDispatcher:
                 if response_failure is not None:
                     detail = response_failure
                     await record_nonproductive(detail)
+                    if failures >= 2 and route == CODER_ROUTE:
+                        route = CODER_FALLBACK_ROUTE
+                        await self._event(
+                            run_id,
+                            "model_route_switched",
+                            "switched to coder fallback after two malformed responses",
+                            task_id=task.id,
+                        )
                     messages.extend(
                         _tool_rejection_exchange(completion, f"TOOL FAILURE: {detail}")
                     )

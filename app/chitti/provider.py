@@ -12,6 +12,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 CODER_ROUTE = "coder"
+CODER_FALLBACK_ROUTE = "coder-fallback"
 REVIEWER_ROUTE = "reviewer"
 BULK_ROUTE = "bulk"
 VISION_ROUTE = "vision"
@@ -21,6 +22,7 @@ DEPLOYMENT_GATEWAY_ROUTES = frozenset(
         "chitti-chat",
         "planner",
         CODER_ROUTE,
+        CODER_FALLBACK_ROUTE,
         REVIEWER_ROUTE,
         BULK_ROUTE,
         VISION_ROUTE,
@@ -28,8 +30,16 @@ DEPLOYMENT_GATEWAY_ROUTES = frozenset(
     }
 )
 REQUIRED_GATEWAY_ROUTES = frozenset(
-    {CODER_ROUTE, REVIEWER_ROUTE, BULK_ROUTE, VISION_ROUTE, VISION_FALLBACK_ROUTE}
+    {
+        CODER_ROUTE,
+        CODER_FALLBACK_ROUTE,
+        REVIEWER_ROUTE,
+        BULK_ROUTE,
+        VISION_ROUTE,
+        VISION_FALLBACK_ROUTE,
+    }
 )
+CODER_ROUTES = frozenset({CODER_ROUTE, CODER_FALLBACK_ROUTE})
 VISION_ROUTES = frozenset({VISION_ROUTE, VISION_FALLBACK_ROUTE})
 CODER_MAX_OUTPUT_TOKENS = 32768
 REVIEWER_MAX_OUTPUT_TOKENS = 4096
