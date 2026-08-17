@@ -68,7 +68,9 @@ model_list:
 
 litellm_settings:
   drop_params: true
-  request_timeout: 600
+  # Keep one primary timeout plus one fallback timeout within Chitti's
+  # 150-second client request bound.
+  request_timeout: 60
   # Chitti owns bounded retry classification and accounting per model call.
   num_retries: 0
   json_logs: true
