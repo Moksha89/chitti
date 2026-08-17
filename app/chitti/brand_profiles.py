@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .brand_colors import validate_brand_color
 from .memory import normalize_namespace
 from .namespaces import SHARED_NAMESPACE
 from .runner_access import application_only_sql, runner_sql
@@ -92,6 +93,8 @@ def validate_profile(
     colors = _clean_list(brand_colors, "brand colours")
     if any(len(color) > 64 for color in colors):
         raise ValueError("brand colours must be 64 characters or fewer")
+    for color in colors:
+        validate_brand_color(color)
     formats = _clean_list(poster_formats, "poster and social formats")
     if len(audience.strip()) == 0 or len(voice.strip()) == 0:
         raise ValueError("audience and voice are required")

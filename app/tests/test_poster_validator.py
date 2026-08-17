@@ -51,11 +51,11 @@ def test_network_refusal_names_source_line_and_offline_alternative() -> None:
 
 
 def test_missing_colour_error_separates_declared_colours() -> None:
-    with pytest.raises(SystemExit, match="TRIAL TEAL, TRIAL GOLD.*CSS variable"):
+    with pytest.raises(SystemExit, match="TRIAL TEAL: #0EA5A8, TRIAL GOLD: #D4AF37"):
         MODULE.validate_poster_source(
-            "body { color: TRIAL TEAL; }",
+            "body { color: #0ea5a8; }",
             {"freesans"},
-            colors=("TRIAL TEAL", "TRIAL GOLD"),
+            colors=("TRIAL TEAL: #0EA5A8", "TRIAL GOLD: #D4AF37"),
         )
 
 
@@ -64,7 +64,7 @@ def test_css_variable_brand_value_is_recognized() -> None:
         ":root { --trial-teal: #00a; --trial-gold: #fc0; }"
         "body { font-family: FreeSans; }",
         {"freesans"},
-        colors=("TRIAL TEAL", "TRIAL GOLD"),
+        colors=("TRIAL TEAL: #00a", "TRIAL GOLD: #fc0"),
         font="FreeSans",
     )
 
@@ -72,9 +72,9 @@ def test_css_variable_brand_value_is_recognized() -> None:
 def test_missing_font_error_names_offline_remediation() -> None:
     with pytest.raises(SystemExit, match=r"font-family: FreeSans"):
         MODULE.validate_poster_source(
-            "body { color: TRIAL TEAL; }",
+            "body { color: #0ea5a8; }",
             {"freesans"},
-            colors=("TRIAL TEAL",),
+            colors=("TRIAL TEAL: #0EA5A8",),
             font="FreeSans",
         )
 

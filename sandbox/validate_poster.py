@@ -3,8 +3,24 @@ import os
 import re
 from pathlib import Path
 
+_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{3,8}$")
+_FUNCTIONAL_COLOR = re.compile(
+    r"^(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color)\([^()]+\)$",
+    re.IGNORECASE,
+)
+
+
+def _split_brand_color(value: str) -> tuple[str | None, str]:
+    candidate = value.strip()
+    for separator in ("=", ":"):
+        if separator in candidate:
+            label, color = candidate.split(separator, 1)
+            return label.strip() or None, color.strip()
+    return None, candidate
+
 
 def _contains_declared_value(source: str, value: str) -> bool:
+    _, value = _split_brand_color(value)
     if value.casefold() in source.casefold():
         return True
     tokens = [token for token in re.split(r"[^A-Za-z0-9]+", value) if token]
@@ -89,12 +105,14 @@ def validate_poster_source(
                     f"poster source uses a font outside the offline manifest: {family}"
                 )
     for color in colors:
-        if not _contains_declared_value(source, color):
+        _, value = _split_brand_color(color)
+        if not _contains_declared_value(source, value):
             declared = ", ".join(colors)
             raise SystemExit(
                 "poster source omits declared brand colour: "
-                f"{color} (declared colours: {declared}); add it to a visible "
-                "style or a CSS variable used by the poster"
+                f"{color} (required renderable value: {value}; declared colours: "
+                f"{declared}); add the value to a visible style or a CSS variable "
+                "used by the poster"
             )
     if font and not _contains_declared_value(source, font):
         raise SystemExit(

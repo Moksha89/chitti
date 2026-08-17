@@ -19,6 +19,7 @@ from typing import IO, TYPE_CHECKING, Protocol, TypedDict, cast
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .brand_colors import split_brand_color
 from .brand_profiles import BrandProfile, available_font_families, get_brand_profile
 from .image_generation import (
     ImageBudgetExceeded,
@@ -164,6 +165,7 @@ class VisualState(TypedDict):
     accounted_cost: float
     accounted_tokens: int
     last_failed_digest: str | None
+    source_digest: str | None
 
 
 def _poster_likeness_policy(brief: str) -> str:
@@ -837,6 +839,7 @@ class DockerSandboxDispatcher:
             "accounted_cost": 0.0,
             "accounted_tokens": 0,
             "last_failed_digest": None,
+            "source_digest": None,
         }
         visual_brief = "\n".join(
             [revision.document.title]
@@ -1633,6 +1636,22 @@ class DockerSandboxDispatcher:
                 policy, route_value, width, height, scale, job_config
             )
             if policy.is_poster:
+                _, _, operation_index = await self._execute_model_tool(
+                    run_id,
+                    task_id,
+                    operation_index,
+                    "run_command",
+                    {"name": "poster-export", "args": []},
+                    workspace,
+                    limits,
+                    route,
+                    policy,
+                    job_config,
+                    brand_profile,
+                    visual_state,
+                    visual_brief,
+                )
+            if policy.is_poster:
                 requested = poster_config(
                     {**job_config, "width": width, "height": height, "scale": scale}
                 )
@@ -1679,6 +1698,12 @@ class DockerSandboxDispatcher:
             await self._capture_workspace_artifacts(
                 run_id, workspace, limits, include_diff=False
             )
+            if policy.is_poster and visual_state is not None:
+                artifact = str(poster_config(job_config)["artifact"])
+                source_path = workspace / "out" / artifact
+                visual_state["source_digest"] = hashlib.sha256(
+                    source_path.read_bytes()
+                ).hexdigest()
             return stdout[-4000:] or "screenshots captured in artifacts/", 0, operation_index
         if tool == "run_command":
             name = str(arguments.get("name", ""))
@@ -1786,6 +1811,15 @@ class DockerSandboxDispatcher:
         if len(image) > 5 * 1024 * 1024:
             raise VisualReviewInconclusive("visual critique PNG exceeds provider size limit")
         image_digest = hashlib.sha256(image).hexdigest()
+        artifact = str(poster_config(job_config)["artifact"])
+        source_path = workspace / "out" / artifact
+        if visual_state["source_digest"] != hashlib.sha256(
+            source_path.read_bytes()
+        ).hexdigest():
+            raise VisualReviewInconclusive(
+                "visual critique requires a fresh capture after the poster source "
+                "changed; run poster-export and capture_screenshot again"
+            )
         width, height = _png_dimensions(image)
         generated_asset_count = len(list((workspace / "out" / "generated").glob("*.png")))
         profile_fields: dict[str, object] = (
@@ -3716,6 +3750,10 @@ def _model_system_prompt(
         profile_data = getattr(profile, "__dict__", {})
         manifest = "\n".join(available_font_families()) or "(empty)"
         approved = poster_config(job_config or {})
+        color_values = []
+        for color in getattr(profile, "brand_colors", ()):
+            label, value = split_brand_color(str(color))
+            color_values.append(f"{label}: {value}" if label else value)
         return (
             "You are producing one offline poster artifact, not a website. "
             "Write only HTML, CSS, and SVG; do not use npm, package.json, lockfiles, "
@@ -3726,16 +3764,13 @@ def _model_system_prompt(
             "url(#gradient). Use only "
             "a font family from this supplied sandbox manifest:\n"
             f"{manifest}\n"
-            "The owner brand profile is "
-            "authoritative and must be reflected exactly; do not invent colours, voice, "
-            "audience, or typography. Include every declared brand colour literally "
-            "in the poster source, either in a visible declaration or a CSS variable "
-            "that the poster uses; CSS identifiers may use the equivalent hyphenated "
-            "form. For labels containing spaces, declare them exactly as values in "
-            "the stylesheet before using their visual hex equivalents, for example "
-            "`--trial-teal: TRIAL TEAL; --trial-gold: TRIAL GOLD;`, and use those "
-            "variables in the poster. Include the declared typography in an explicit "
-            "font-family declaration. Create the declared artifact under out/. "
+            "The owner brand profile is authoritative and must be reflected exactly; "
+            "do not invent colours, voice, audience, or typography. The declared "
+            f"browser-renderable brand colours are {json.dumps(color_values)}. "
+            "Use each colour value in visible CSS or a CSS variable used by the "
+            "poster; a label is metadata, not a CSS colour. Include the declared "
+            "typography in an explicit font-family declaration. Create the declared "
+            "artifact under out/. "
             f"The recorded owner likeness policy is "
             f"{approved['likeness_policy']}; generic figures by default, and "
             "follow the recorded policy exactly. "
