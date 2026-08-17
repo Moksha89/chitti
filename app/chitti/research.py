@@ -176,7 +176,15 @@ async def discover_sources(
             )
             response.raise_for_status()
             payload = response.json()
-        citations = payload.get("citations", [])
+        annotations = payload.get("choices", [{}])[0].get(
+            "message", {}
+        ).get("annotations", [])
+        citations = [
+            annotation["url_citation"]["url"]
+            for annotation in annotations
+            if annotation.get("type") == "url_citation"
+            and annotation.get("url_citation", {}).get("url")
+        ]
         return [
             DiscoveredSource(url=str(url), title="", snippet="")
             for url in citations
