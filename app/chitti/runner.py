@@ -666,8 +666,21 @@ async def run_forever() -> None:
                 continue
             try:
                 await execute_run(database, dispatcher, row, provider, runner_id)
-            except Exception:
+            except Exception as exc:
                 logger.exception("worker run failed outside durable event handling")
+                run_id = int(cast(int, row["id"]))
+                try:
+                    if (await latest_status(database, run_id)) not in TERMINAL_RUN_STATUSES:
+                        await record_event(
+                            database,
+                            run_id,
+                            "failed",
+                            f"runner failed outside durable event handling: {str(exc)[:1900]}",
+                        )
+                except Exception:
+                    logger.exception(
+                        "could not record terminal failure for run %s", run_id
+                    )
     finally:
         await database.close()
 

@@ -214,8 +214,8 @@ def test_agent_completion_timeout_is_bounded_above_gateway_timeout(monkeypatch) 
         )
     )
 
-    assert MODEL_GATEWAY_TIMEOUT_SECONDS == 600
-    assert MODEL_CLIENT_TIMEOUT_SECONDS == 660
+    assert MODEL_GATEWAY_TIMEOUT_SECONDS == 120
+    assert MODEL_CLIENT_TIMEOUT_SECONDS == 150
     assert client_timeouts == [MODEL_CLIENT_TIMEOUT_SECONDS]
 
 
