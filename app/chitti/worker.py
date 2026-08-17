@@ -1947,7 +1947,7 @@ class DockerSandboxDispatcher:
                 run_id,
                 task_id,
                 iteration,
-                VISION_ROUTE,
+                review_routes[route_index],
                 completion,
                 kind="visual_critique",
                 prompt=json.dumps(prompt_messages, separators=(",", ":")),

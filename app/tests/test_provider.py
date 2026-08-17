@@ -80,10 +80,11 @@ def test_gateway_preflight_uses_models_endpoint_and_both_routes(monkeypatch) -> 
                 {"id": "chitti-chat"},
                 {"id": "planner"},
                 {"id": "coder"},
-                {"id": "reviewer"},
-                {"id": "bulk"},
-                {"id": VISION_ROUTE},
-            ],
+                    {"id": "reviewer"},
+                    {"id": "bulk"},
+                    {"id": VISION_ROUTE},
+                    {"id": "vision-fallback"},
+                ],
             "choices": [{"message": {"content": "OK"}}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         },
@@ -117,6 +118,7 @@ def test_gateway_preflight_uses_models_endpoint_and_both_routes(monkeypatch) -> 
         "coder",
         "reviewer",
         "vision",
+        "vision-fallback",
     ]
 
 
