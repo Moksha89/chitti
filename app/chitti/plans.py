@@ -7,7 +7,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import text
@@ -143,7 +143,7 @@ async def create_revision(
     job_type = normalize_job_type(job_type)
     normalized_config = poster_config(job_config) if job_type == "poster" else {}
     research_package_id = (
-        int(normalized_config["research_package_id"])
+        int(cast(int, normalized_config["research_package_id"]))
         if "research_package_id" in normalized_config
         else None
     )
