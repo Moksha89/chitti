@@ -1102,6 +1102,13 @@ class DockerSandboxDispatcher:
                 if spent > limits.model_spend_usd:
                     raise RunBudgetExceeded("model spend")
                 response_failure = _model_response_failure(completion)
+                if (
+                    response_failure is None
+                    and route in CODER_ROUTES
+                    and completion.finish_reason == "stop"
+                    and not completion.tool_calls
+                ):
+                    response_failure = "model response was not valid JSON"
                 if response_failure is not None:
                     detail = response_failure
                     if "model response was not valid JSON" in detail:
