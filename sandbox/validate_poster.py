@@ -208,6 +208,7 @@ def main() -> None:
     manifest_path = Path("/workspace/image_manifest.resolved.json")
     declared_assets: set[str] = set()
     dimensions: dict[str, tuple[int, int]] = {}
+    subject_paths: set[str] = set()
     if manifest_path.is_file():
         try:
             resolved = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -232,7 +233,7 @@ def main() -> None:
                 for item in resolved.get("images", [])
                 if isinstance(item, dict)
                 and isinstance(item.get("path"), str)
-                and "background" not in str(item.get("purpose", "")).casefold()
+                and bool(item.get("cutout", False))
             }
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
             raise SystemExit("poster resolved image manifest is invalid") from exc
