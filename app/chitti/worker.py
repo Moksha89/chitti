@@ -906,6 +906,7 @@ class DockerSandboxDispatcher:
             command_outcomes: list[str] = []
             route = CODER_ROUTE
             failures = 0
+            malformed_responses = 0
             messages: list[dict[str, object]] = [
                 {"role": "system", "content": stable},
                 {
@@ -1079,8 +1080,12 @@ class DockerSandboxDispatcher:
                 response_failure = _model_response_failure(completion)
                 if response_failure is not None:
                     detail = response_failure
+                    if "model response was not valid JSON" in detail:
+                        malformed_responses += 1
+                    else:
+                        malformed_responses = 0
                     await record_nonproductive(detail)
-                    if failures >= 2 and route == CODER_ROUTE:
+                    if malformed_responses >= 2 and route == CODER_ROUTE:
                         route = CODER_FALLBACK_ROUTE
                         await self._event(
                             run_id,
@@ -1308,7 +1313,13 @@ class DockerSandboxDispatcher:
                                 batch_workspace_changed and batch_refusal_progress
                             ),
                         )
-                        if failures >= 2 and route == CODER_ROUTE:
+                        if (
+                            "model response was not valid JSON" in batch_failure
+                        ):
+                            malformed_responses += 1
+                        else:
+                            malformed_responses = 0
+                        if malformed_responses >= 2 and route == CODER_ROUTE:
                             if "model response was not valid JSON" in batch_failure:
                                 route = CODER_FALLBACK_ROUTE
                                 await self._event(
@@ -1494,7 +1505,11 @@ class DockerSandboxDispatcher:
                         tool, f"TOOL FAILURE: {tool}: {str(exc)[:1000]}"
                     )
                     await record_nonproductive(result_text)
-                    if failures >= 2 and route == CODER_ROUTE:
+                    if "model response was not valid JSON" in result_text:
+                        malformed_responses += 1
+                    else:
+                        malformed_responses = 0
+                    if malformed_responses >= 2 and route == CODER_ROUTE:
                         if "model response was not valid JSON" in result_text:
                             route = CODER_FALLBACK_ROUTE
                             await self._event(
