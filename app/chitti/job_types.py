@@ -142,4 +142,7 @@ def poster_config_within_ceiling(
             f"approved {approved_width}x{approved_height} "
             f"at scale {approved_scale}"
         )
+    for key in ("research_package_id", "research_facts"):
+        if key in approved_config and key not in requested_config:
+            requested_config[key] = approved_config[key]
     return requested_config

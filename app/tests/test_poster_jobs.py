@@ -13,6 +13,7 @@ from chitti.job_types import (
     WEBSITE_POLICY,
     policy_for,
     poster_config,
+    poster_config_within_ceiling,
 )
 from chitti.worker import (
     WorkerRunManager,
@@ -66,6 +67,26 @@ def test_poster_dimensions_and_scale_are_bounded() -> None:
         poster_config({"width": 1, "height": 1, "scale": 3})
     with pytest.raises(ValueError, match=r"\.html or \.svg"):
         poster_config({"artifact": "poster.png"})
+
+
+def test_run_config_preserves_approved_research_context() -> None:
+    approved = {
+        "artifact": "poster.html",
+        "width": 1080,
+        "height": 1350,
+        "scale": 1,
+        "likeness_policy": "real_likeness_permitted",
+        "research_package_id": 4,
+        "research_facts": {"fixture": [{"value": "15 February 2026"}]},
+    }
+    result = poster_config_within_ceiling(
+        {"artifact": "poster.html", "width": 1080, "height": 1350, "scale": 1,
+         "likeness_policy": "real_likeness_permitted",
+         "research_package_id": 4},
+        approved,
+    )
+    assert result["research_package_id"] == 4
+    assert result["research_facts"] == approved["research_facts"]
 
 
 def test_poster_prompts_require_brand_and_honest_visual_review() -> None:
