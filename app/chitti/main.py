@@ -1411,6 +1411,7 @@ async def discover_research_sources(request: Request) -> dict[str, object]:
     results = await discover_sources(
         urls,
         brave_api_key=os.environ.get("BRAVE_SEARCH_API_KEY"),
+        openrouter_api_key=os.environ.get("OPENROUTER_API_KEY"),
         query=str(payload.get("query", "")).strip() or None,
     )
     return {"sources": [source.__dict__ for source in results]}

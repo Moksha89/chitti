@@ -127,31 +127,69 @@ async def discover_sources(
     urls: list[str],
     *,
     brave_api_key: str | None = None,
+    openrouter_api_key: str | None = None,
     query: str | None = None,
 ) -> list[DiscoveredSource]:
-    if not brave_api_key:
+    if brave_api_key:
+        if not query:
+            raise ValueError("query is required when using Brave Search")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": 10},
+                headers={"X-Subscription-Token": brave_api_key},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        return [
+            DiscoveredSource(
+                url=str(item["url"]),
+                title=str(item.get("title", "")),
+                snippet=str(item.get("description", "")),
+            )
+            for item in payload.get("web", {}).get("results", [])
+            if item.get("url")
+        ]
+    if openrouter_api_key:
+        if not query:
+            raise ValueError("query is required when using OpenRouter Search")
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openrouter_api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://69-197-164-208.sslip.io",
+                    "X-Title": "Chitti source discovery",
+                },
+                json={
+                    "model": "perplexity/sonar-pro-search",
+                    "messages": [{
+                        "role": "user",
+                        "content": (
+                            "Find authoritative sources for this query. Return a "
+                            "brief answer with citations: " + query
+                        ),
+                    }],
+                    "max_tokens": 1200,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        citations = payload.get("citations", [])
+        return [
+            DiscoveredSource(url=str(url), title="", snippet="")
+            for url in citations
+            if url
+        ]
+    if not urls:
         return [
             DiscoveredSource(url=url, title="", snippet="")
             for url in urls
         ]
-    if not query:
-        raise ValueError("query is required when using Brave Search")
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            params={"q": query, "count": 10},
-            headers={"X-Subscription-Token": brave_api_key},
-        )
-        response.raise_for_status()
-        payload = response.json()
     return [
-        DiscoveredSource(
-            url=str(item["url"]),
-            title=str(item.get("title", "")),
-            snippet=str(item.get("description", "")),
-        )
-        for item in payload.get("web", {}).get("results", [])
-        if item.get("url")
+        DiscoveredSource(url=url, title="", snippet="")
+        for url in urls
     ]
 
 
