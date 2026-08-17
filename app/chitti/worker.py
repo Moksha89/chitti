@@ -137,14 +137,18 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "low-contrast that the poster would read as flat colour without it.",
         "subject_scale fails when focal subjects are small or soft against large "
         "empty areas, especially when the composition leaves a substantial dead "
-        "middle or lower third.",
+        "middle or lower third. Fail when the focal figures occupy only a minor "
+        "portion of the canvas rather than carrying the composition; estimate "
+        "their visible height and reject figures that are plainly undersized.",
         "text_redundancy fails when the same fixture, matchup, date, venue, or "
         "other information is stated twice in materially duplicated text blocks. "
         "Treat case, punctuation, separators, and a versus marker as irrelevant: "
         "'INDIA PAKISTAN' and 'India v Pakistan' are the same matchup and must fail "
         "when both are visible.",
         "asset_sharpness fails when placed imagery is visibly blurry, soft, pixelated, "
-        "upscaled, or cartoonish where photographic realism was requested.",
+        "upscaled, illustrated, or cartoonish where photographic realism was "
+        "requested. If the imagery is described as illustrated or cartoonish, fail "
+        "this criterion even if it is not visibly blurry.",
         "kit_fidelity fails when approved research facts describe kit colours and "
         "the visible figures contradict those colours; compare the image to the "
         "approved facts, not to invented palette names.",
