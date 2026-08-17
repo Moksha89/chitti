@@ -51,11 +51,31 @@ def test_network_refusal_names_source_line_and_offline_alternative() -> None:
 
 
 def test_missing_colour_error_separates_declared_colours() -> None:
-    with pytest.raises(SystemExit, match="TRIAL TEAL, TRIAL GOLD"):
+    with pytest.raises(SystemExit, match="TRIAL TEAL: #0EA5A8, TRIAL GOLD: #D4AF37"):
         MODULE.validate_poster_source(
-            "body { color: TRIAL TEAL; }",
+            "body { color: #0ea5a8; }",
             {"freesans"},
-            colors=("TRIAL TEAL", "TRIAL GOLD"),
+            colors=("TRIAL TEAL: #0EA5A8", "TRIAL GOLD: #D4AF37"),
+        )
+
+
+def test_css_variable_brand_value_is_recognized() -> None:
+    MODULE.validate_poster_source(
+        ":root { --trial-teal: #00a; --trial-gold: #fc0; }"
+        "body { font-family: FreeSans; }",
+        {"freesans"},
+        colors=("TRIAL TEAL: #00a", "TRIAL GOLD: #fc0"),
+        font="FreeSans",
+    )
+
+
+def test_missing_font_error_names_offline_remediation() -> None:
+    with pytest.raises(SystemExit, match=r"font-family: FreeSans"):
+        MODULE.validate_poster_source(
+            "body { color: #0ea5a8; }",
+            {"freesans"},
+            colors=("TRIAL TEAL: #0EA5A8",),
+            font="FreeSans",
         )
 
 
@@ -65,6 +85,37 @@ def test_declared_relative_raster_asset_is_allowed() -> None:
         '<style>.hero { background-image: url("generated/stadium.png"); }</style>',
         {"freesans"},
         assets={"generated/stadium.png"},
+    )
+
+
+def test_height_only_asset_placement_uses_height_dimension() -> None:
+    MODULE._validate_asset_scale(
+        '<img src="generated/figure.png" height="1024">',
+        {"generated/figure.png": (768, 1024)},
+    )
+
+
+def test_height_only_asset_placement_rejects_oversize_height() -> None:
+    with pytest.raises(SystemExit, match="above its pixels"):
+        MODULE._validate_asset_scale(
+            '<img src="generated/figure.png" height="1025">',
+            {"generated/figure.png": (768, 1024)},
+        )
+
+
+def test_max_width_and_min_height_are_not_placements() -> None:
+    MODULE._validate_asset_scale(
+        '<img src="generated/figure.png" '
+        'style="max-width: 1200px; min-height: 1200px">',
+        {"generated/figure.png": (768, 1024)},
+    )
+
+
+def test_scale_validation_without_manifest_is_noop() -> None:
+    MODULE._validate_asset_scale(
+        '<img src="generated/figure.png" width="2000">',
+        {},
+        set(),
     )
 
 

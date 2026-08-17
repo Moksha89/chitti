@@ -15,12 +15,22 @@ CODER_ROUTE = "coder"
 REVIEWER_ROUTE = "reviewer"
 BULK_ROUTE = "bulk"
 VISION_ROUTE = "vision"
+VISION_FALLBACK_ROUTE = "vision-fallback"
 DEPLOYMENT_GATEWAY_ROUTES = frozenset(
-    {"chitti-chat", "planner", CODER_ROUTE, REVIEWER_ROUTE, BULK_ROUTE, VISION_ROUTE}
+    {
+        "chitti-chat",
+        "planner",
+        CODER_ROUTE,
+        REVIEWER_ROUTE,
+        BULK_ROUTE,
+        VISION_ROUTE,
+        VISION_FALLBACK_ROUTE,
+    }
 )
 REQUIRED_GATEWAY_ROUTES = frozenset(
-    {CODER_ROUTE, REVIEWER_ROUTE, BULK_ROUTE, VISION_ROUTE}
+    {CODER_ROUTE, REVIEWER_ROUTE, BULK_ROUTE, VISION_ROUTE, VISION_FALLBACK_ROUTE}
 )
+VISION_ROUTES = frozenset({VISION_ROUTE, VISION_FALLBACK_ROUTE})
 CODER_MAX_OUTPUT_TOKENS = 32768
 REVIEWER_MAX_OUTPUT_TOKENS = 4096
 # The rubric requires five prose observations, six criteria, findings, and a
@@ -435,7 +445,7 @@ class LiteLLMProvider:
                 REVIEWER_MAX_OUTPUT_TOKENS
                 if role == "reviewer"
                 else VISION_MAX_OUTPUT_TOKENS
-                if role == VISION_ROUTE
+                if role in VISION_ROUTES
                 else CODER_MAX_OUTPUT_TOKENS
             ),
         }
@@ -629,7 +639,7 @@ class LiteLLMProvider:
             )
             raw_cost = body.get("cost", response.headers.get("x-litellm-response-cost"))
             if raw_cost is None:
-                if role != VISION_ROUTE:
+                if role not in VISION_ROUTES:
                     cost = 0.0
                 elif prompt_tokens + completion_tokens < 1:
                     raise ModelCostConfigurationError(
@@ -649,7 +659,7 @@ class LiteLLMProvider:
                         "gateway response contained invalid model cost",
                         failure_class="cost configuration",
                     ) from exc
-            if role == VISION_ROUTE and cost <= 0:
+            if role in VISION_ROUTES and cost <= 0:
                 raise ModelCostConfigurationError(
                     "vision response did not include usable model cost",
                     failure_class="cost configuration",

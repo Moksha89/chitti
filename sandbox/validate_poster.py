@@ -3,6 +3,84 @@ import os
 import re
 from pathlib import Path
 
+_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{3,8}$")
+_FUNCTIONAL_COLOR = re.compile(
+    r"^(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color)\([^()]+\)$",
+    re.IGNORECASE,
+)
+
+
+def _split_brand_color(value: str) -> tuple[str | None, str]:
+    candidate = value.strip()
+    for separator in ("=", ":"):
+        if separator in candidate:
+            label, color = candidate.split(separator, 1)
+            return label.strip() or None, color.strip()
+    return None, candidate
+
+
+def _validate_asset_scale(
+    source: str,
+    dimensions: dict[str, tuple[int, int]],
+    subject_paths: set[str] | None = None,
+) -> None:
+    for match in re.finditer(r"<img\b([^>]+)>", source, re.IGNORECASE):
+        attributes = match.group(1)
+        src_match = re.search(r"\bsrc\s*=\s*[\"']([^\"']+)", attributes, re.IGNORECASE)
+        if src_match is None:
+            continue
+        relative = src_match.group(1).replace("\\", "/").lstrip("./")
+        if subject_paths is not None and relative not in subject_paths:
+            continue
+        actual = dimensions.get(relative)
+        if actual is None:
+            continue
+        requested: dict[str, int] = {}
+        for name in ("width", "height"):
+            value = re.search(
+                rf"(?<![\w-]){name}\s*=\s*[\"'](\d+)(?:px)?[\"']",
+                attributes,
+                re.IGNORECASE,
+            )
+            if value:
+                requested[name] = int(value.group(1))
+        style = re.search(r"\bstyle\s*=\s*[\"']([^\"']+)", attributes, re.IGNORECASE)
+        if style:
+            for name in ("width", "height"):
+                value = re.search(
+                    rf"(?<![\w-]){name}\s*:\s*(\d+)px",
+                    style.group(1),
+                    re.IGNORECASE,
+                )
+                if value:
+                    requested[name] = int(value.group(1))
+        limits = {"width": actual[0], "height": actual[1]}
+        if requested and any(
+            requested[name] > limits[name] for name in requested
+        ):
+            raise SystemExit(
+                f"poster places generated asset above its pixels: {relative}; "
+                f"generated {actual[0]}x{actual[1]}, requested {requested}; "
+                "this refusal applies to subject assets; request a larger generated "
+                "subject asset instead"
+            )
+
+
+def _contains_declared_value(source: str, value: str) -> bool:
+    _, value = _split_brand_color(value)
+    normalized_value = re.sub(r"\s+", "", value).casefold()
+    normalized_source = re.sub(r"\s+", "", source).casefold()
+    if normalized_value in normalized_source:
+        return True
+    return False
+
+
+def _first_line_containing(source: str, value: str) -> int | None:
+    for number, line in enumerate(source.splitlines(), start=1):
+        if _contains_declared_value(line, value):
+            return number
+    return None
+
 
 def validate_poster_source(
     source: str,
@@ -72,14 +150,20 @@ def validate_poster_source(
                     f"poster source uses a font outside the offline manifest: {family}"
                 )
     for color in colors:
-        if color.casefold() not in source.casefold():
+        _, value = _split_brand_color(color)
+        if not _contains_declared_value(source, value):
             declared = ", ".join(colors)
             raise SystemExit(
                 "poster source omits declared brand colour: "
-                f"{color} (declared colours: {declared})"
+                f"{color} (required renderable value: {value}; declared colours: "
+                f"{declared}); add the value to a visible style or a CSS variable "
+                "used by the poster"
             )
-    if font and font.casefold() not in source.casefold():
-        raise SystemExit(f"poster source omits declared sandbox font: {font}")
+    if font and not _contains_declared_value(source, font):
+        raise SystemExit(
+            f"poster source omits declared sandbox font: {font}; add "
+            f"`font-family: {font}` to the poster stylesheet"
+        )
 
 
 def validate_export_assets(export_root: Path, declared_assets: set[str]) -> None:
@@ -123,6 +207,8 @@ def main() -> None:
         raise SystemExit("poster artifact must be HTML or SVG")
     manifest_path = Path("/workspace/image_manifest.resolved.json")
     declared_assets: set[str] = set()
+    dimensions: dict[str, tuple[int, int]] = {}
+    subject_paths: set[str] = set()
     if manifest_path.is_file():
         try:
             resolved = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -131,10 +217,29 @@ def main() -> None:
                 for item in resolved.get("images", [])
                 if isinstance(item, dict) and isinstance(item.get("path"), str)
             }
-        except (OSError, json.JSONDecodeError, KeyError, TypeError):
-            raise SystemExit("poster resolved image manifest is invalid")
+            dimensions = {
+                str(item["path"]).replace("\\", "/").lstrip("./"): (
+                    int(item["width"]),
+                    int(item["height"]),
+                )
+                for item in resolved.get("images", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("path"), str)
+                and isinstance(item.get("width"), int)
+                and isinstance(item.get("height"), int)
+            }
+            subject_paths = {
+                str(item["path"]).replace("\\", "/").lstrip("./")
+                for item in resolved.get("images", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("path"), str)
+                and bool(item.get("cutout", False))
+            }
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise SystemExit("poster resolved image manifest is invalid") from exc
     validate_export_assets(Path("/workspace/out"), declared_assets)
     source = path.read_text(encoding="utf-8", errors="replace")
+    _validate_asset_scale(source, dimensions, subject_paths)
     available = {
         line.strip().casefold()
         for line in Path("/opt/available_fonts.txt").read_text().splitlines()

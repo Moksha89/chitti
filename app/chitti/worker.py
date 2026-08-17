@@ -19,6 +19,7 @@ from typing import IO, TYPE_CHECKING, Protocol, TypedDict, cast
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .brand_colors import split_brand_color
 from .brand_profiles import BrandProfile, available_font_families, get_brand_profile
 from .image_generation import (
     ImageBudgetExceeded,
@@ -50,6 +51,7 @@ from .provider import (
     CODER_MAX_OUTPUT_TOKENS,
     CODER_ROUTE,
     REVIEWER_ROUTE,
+    VISION_FALLBACK_ROUTE,
     VISION_ROUTE,
     ModelCompletion,
     ModelProvider,
@@ -113,8 +115,8 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "observations, verdict, image_sha256, criteria, findings, summary, "
         "evidence_limitations.",
         "observations must be an object with exactly these keys, each a plain-language "
-        "description of what the image actually shows: background, imagery, "
-        "imagery_edges, text_blocks, colour_use. imagery_edges must describe, for "
+        "description of what the image actually shows: imagery_edges, background, "
+        "imagery, text_blocks, colour_use. imagery_edges must describe, for "
         "every placed photographic or illustrated element, only boundaries visibly "
         "present against the surrounding design. Distinguish a visible seam, halo, "
         "background rectangle or panel from an intentional crop at the canvas edge; "
@@ -123,7 +125,8 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "exists.",
         "criteria must contain exactly these keys, each pass or fail: fixture_text, "
         "visual_hierarchy, readability, generated_imagery, composite_integrity, "
-        "brand_constraints, text_contrast, cinematic_treatment.",
+        "brand_constraints, text_contrast, cinematic_treatment, subject_scale, "
+        "text_redundancy, asset_sharpness, kit_fidelity, research_copy.",
         "composite_integrity fails when any placed image reads as a pasted rectangle: "
         "a visible box, panel or seam around it, a background inside it that differs "
         "from the poster background, or a washed-out block where the element sits. "
@@ -132,6 +135,28 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "an edge is deliberate, describe it and fail composite_integrity.",
         "generated_imagery fails when imagery is absent, or so dark, faint or "
         "low-contrast that the poster would read as flat colour without it.",
+        "subject_scale fails when focal subjects are small or soft against large "
+        "empty areas, especially when the composition leaves a substantial dead "
+        "middle or lower third. Fail when the focal figures occupy only a minor "
+        "portion of the canvas rather than carrying the composition; estimate "
+        "their visible height and reject figures that are plainly undersized.",
+        "text_redundancy fails when the same fixture, matchup, date, venue, or "
+        "other information is stated twice in materially duplicated text blocks. "
+        "Treat case, punctuation, separators, and a versus marker as irrelevant: "
+        "'INDIA PAKISTAN' and 'India v Pakistan' are the same matchup and must fail "
+        "when both are visible.",
+        "asset_sharpness fails when placed imagery is visibly blurry, soft, pixelated, "
+        "upscaled, illustrated, or cartoonish where photographic realism was "
+        "requested. If the imagery is described as illustrated or cartoonish, fail "
+        "this criterion even if it is not visibly blurry.",
+        "kit_fidelity fails when approved research facts describe kit colours and "
+        "the visible figures contradict those colours; compare the image to the "
+        "approved facts, not to invented palette names.",
+        "research_copy fails when a descriptive research value such as 'rich blue "
+        "foundation with striking orange panels' or 'traditional light green "
+        "colour scheme' is rendered as visible poster copy. Research descriptions "
+        "may guide imagery and styling, but only fixture facts—teams, competition, "
+        "date, time, and venue—may appear as text.",
         "text_contrast fails when any required text block is low-contrast against "
         "its immediate background, including a title or team name that becomes "
         "difficult to read because its colour is too close to the background. "
@@ -164,6 +189,9 @@ class VisualState(TypedDict):
     accounted_cost: float
     accounted_tokens: int
     last_failed_digest: str | None
+    source_digest: str | None
+    review_passed: bool
+    review_task_id: str | None
 
 
 def _poster_likeness_policy(brief: str) -> str:
@@ -837,6 +865,9 @@ class DockerSandboxDispatcher:
             "accounted_cost": 0.0,
             "accounted_tokens": 0,
             "last_failed_digest": None,
+            "source_digest": None,
+            "review_passed": False,
+            "review_task_id": None,
         }
         visual_brief = "\n".join(
             [revision.document.title]
@@ -1613,6 +1644,16 @@ class DockerSandboxDispatcher:
         if tool == "write_file":
             if route != CODER_ROUTE:
                 raise ValueError("reviewer route cannot write files")
+            if (
+                policy.is_poster
+                and visual_state is not None
+                and visual_state.get("review_passed", False)
+            ):
+                raise ValueError(
+                    "poster workspace is frozen after a passing visual critique; "
+                    "run poster-export and capture_screenshot to deliberately start "
+                    "a new repair cycle before editing"
+                )
             path = _confined_path(workspace, str(arguments.get("path", "")))
             content = str(arguments.get("content", ""))
             encoded = content.encode()
@@ -1632,6 +1673,22 @@ class DockerSandboxDispatcher:
             _validate_screenshot_request(
                 policy, route_value, width, height, scale, job_config
             )
+            if policy.is_poster and visual_state is not None:
+                _, _, operation_index = await self._execute_model_tool(
+                    run_id,
+                    task_id,
+                    operation_index,
+                    "run_command",
+                    {"name": "poster-export", "args": []},
+                    workspace,
+                    limits,
+                    route,
+                    policy,
+                    job_config,
+                    brand_profile,
+                    visual_state,
+                    visual_brief,
+                )
             if policy.is_poster:
                 requested = poster_config(
                     {**job_config, "width": width, "height": height, "scale": scale}
@@ -1679,6 +1736,12 @@ class DockerSandboxDispatcher:
             await self._capture_workspace_artifacts(
                 run_id, workspace, limits, include_diff=False
             )
+            if policy.is_poster and visual_state is not None:
+                artifact = str(poster_config(job_config)["artifact"])
+                source_path = workspace / "out" / artifact
+                visual_state["source_digest"] = hashlib.sha256(
+                    source_path.read_bytes()
+                ).hexdigest()
             return stdout[-4000:] or "screenshots captured in artifacts/", 0, operation_index
         if tool == "run_command":
             name = str(arguments.get("name", ""))
@@ -1748,6 +1811,9 @@ class DockerSandboxDispatcher:
                 await self._verify_poster_assets(
                     run_id, workspace, operation, operation_index, stdout
                 )
+                if visual_state is not None:
+                    visual_state["review_passed"] = False
+                    visual_state["review_task_id"] = None
             await self._operation(
                 run_id, operation, operation_index, status, stdout, stderr,
                 result.returncode, datetime.now(UTC),
@@ -1786,6 +1852,16 @@ class DockerSandboxDispatcher:
         if len(image) > 5 * 1024 * 1024:
             raise VisualReviewInconclusive("visual critique PNG exceeds provider size limit")
         image_digest = hashlib.sha256(image).hexdigest()
+        artifact = str(poster_config(job_config)["artifact"])
+        source_path = workspace / "out" / artifact
+        source_digest = visual_state.get("source_digest")
+        if source_digest is not None and source_digest != hashlib.sha256(
+            source_path.read_bytes()
+        ).hexdigest():
+            raise ValueError(
+                "visual critique requires a fresh capture after the poster source "
+                "changed; run poster-export and capture_screenshot again"
+            )
         width, height = _png_dimensions(image)
         generated_asset_count = len(list((workspace / "out" / "generated").glob("*.png")))
         profile_fields: dict[str, object] = (
@@ -1860,11 +1936,13 @@ class DockerSandboxDispatcher:
         ]
         assert self.model_provider is not None
         compliance_reask = False
+        review_routes = (VISION_ROUTE, VISION_FALLBACK_ROUTE)
+        route_index = 0
         prompt_messages = persisted_messages
         while True:
             try:
                 completion = await self.model_provider.agent_completion(
-                    messages, VISION_ROUTE
+                    messages, review_routes[route_index]
                 )
             except ModelTransportError as exc:
                 raise VisualReviewInconclusive(
@@ -1882,7 +1960,7 @@ class DockerSandboxDispatcher:
                 run_id,
                 task_id,
                 iteration,
-                VISION_ROUTE,
+                review_routes[route_index],
                 completion,
                 kind="visual_critique",
                 prompt=json.dumps(prompt_messages, separators=(",", ":")),
@@ -1909,6 +1987,20 @@ class DockerSandboxDispatcher:
                 parse_error = exc
             else:
                 break
+            if route_index == 0:
+                route_index = 1
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The primary vision response was empty or structurally "
+                            "unparseable. Return one complete JSON verdict through "
+                            "the independent fallback route."
+                        ),
+                    }
+                )
+                prompt_messages = [*persisted_messages, *messages[2:]]
+                continue
             if compliance_reask:
                 raise parse_error
             compliance_reask = True
@@ -1966,6 +2058,8 @@ class DockerSandboxDispatcher:
             json.dumps(parsed, separators=(",", ":"))[:4000],
             task_id=task_id,
         )
+        visual_state["review_passed"] = True
+        visual_state["review_task_id"] = task_id
         return "VISUAL_REVIEW_PASS\n" + json.dumps(parsed), 0, iteration
 
     async def _review_run(
@@ -3426,6 +3520,11 @@ def _parse_visual_verdict(value: object, image_digest: str) -> dict[str, object]
         "brand_constraints",
         "text_contrast",
         "cinematic_treatment",
+        "subject_scale",
+        "text_redundancy",
+        "asset_sharpness",
+        "kit_fidelity",
+        "research_copy",
     )
     if not isinstance(value, dict):
         raise VisualReviewInconclusive("visual critique returned a non-object verdict")
@@ -3444,9 +3543,9 @@ def _parse_visual_verdict(value: object, image_digest: str) -> dict[str, object]
         raise VisualReviewInconclusive("visual critique image digest did not match")
     observations = value.get("observations")
     observation_names = (
+        "imagery_edges",
         "background",
         "imagery",
-        "imagery_edges",
         "text_blocks",
         "colour_use",
     )
@@ -3716,6 +3815,10 @@ def _model_system_prompt(
         profile_data = getattr(profile, "__dict__", {})
         manifest = "\n".join(available_font_families()) or "(empty)"
         approved = poster_config(job_config or {})
+        color_values = []
+        for color in getattr(profile, "brand_colors", ()):
+            label, value = split_brand_color(str(color))
+            color_values.append(f"{label}: {value}" if label else value)
         return (
             "You are producing one offline poster artifact, not a website. "
             "Write only HTML, CSS, and SVG; do not use npm, package.json, lockfiles, "
@@ -3726,9 +3829,13 @@ def _model_system_prompt(
             "url(#gradient). Use only "
             "a font family from this supplied sandbox manifest:\n"
             f"{manifest}\n"
-            "The owner brand profile is "
-            "authoritative and must be reflected exactly; do not invent colours, voice, "
-            "audience, or typography. Create the declared artifact under out/. "
+            "The owner brand profile is authoritative and must be reflected exactly; "
+            "do not invent colours, voice, audience, or typography. The declared "
+            f"browser-renderable brand colours are {json.dumps(color_values)}. "
+            "Use each colour value in visible CSS or a CSS variable used by the "
+            "poster; a label is metadata, not a CSS colour. Include the declared "
+            "typography in an explicit font-family declaration. Create the declared "
+            "artifact under out/. "
             f"The recorded owner likeness policy is "
             f"{approved['likeness_policy']}; generic figures by default, and "
             "follow the recorded policy exactly. "
@@ -3747,7 +3854,20 @@ def _model_system_prompt(
             "visible depth separation between foreground subjects and the background, "
             "and atmosphere such as haze, light spill, particles, or grain. A flat "
             "colour wash or gradient is not enough, and every text block must maintain "
-            "clear contrast against its immediate background. "
+            "clear contrast against its immediate background. Make the focal figures "
+            "large enough to carry the composition; do not leave a dead middle third. "
+            "Do not repeat the same matchup or fixture information in multiple title "
+            "blocks. Use sharp, photographic-looking generated assets rather than "
+            "small cartoon figures, and never scale an asset beyond the dimensions "
+            "reported by image_manifest.resolved.json; request a larger asset instead. "
+            "When research states kit colours, make the visible figures match those "
+            "colours exactly and do not substitute invented panels or accents. "
+            "Research descriptions are design inputs, not poster copy: render only "
+            "fixture facts as text—teams, competition, date, time, and venue. Never "
+            "print descriptive kit values such as 'RICH BLUE & ORANGE' or "
+            "'TRADITIONAL LIGHT GREEN' under a team name. State the matchup only "
+            "once; 'INDIA PAKISTAN' and 'India v Pakistan' are duplicate matchup "
+            "copy even when capitalization or separators differ. "
             f"The coder output ceiling is {CODER_MAX_OUTPUT_TOKENS} tokens; split "
             "large file writes across multiple tool calls rather than emitting one "
             "enormous tool call. Create an out/index.html entry that references and "
@@ -3783,9 +3903,11 @@ def _model_system_prompt(
             "The cutout field is opt-in per image; omit it for background plates. "
             "generated asset width and height must each be between 64 and 1024 "
             "pixels. The approved 1080x1350 size is the final composed poster "
-            "canvas, not a generated asset size; choose a useful source aspect "
-            "ratio within the ceiling and compose it upward with cropping, "
-            "scaling, or layout. "
+            "canvas. Subject figures must not be enlarged beyond their resolved "
+            "generated pixels; request a larger subject asset instead. Full-bleed "
+            "background plates are exempt from that subject rule and should be "
+            "judged against the final canvas using cropping, background-size cover, "
+            "or layout treatment. "
             "image budget is "
             f"{WorkerLimits().image_request_count} requests and "
             f"${WorkerLimits().image_spend_usd:.2f}; cache hits do not rebill. "

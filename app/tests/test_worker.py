@@ -81,8 +81,13 @@ def _visual_verdict(digest: str, verdict: str = "pass") -> str:
                 "generated_imagery": "pass",
                 "composite_integrity": "pass",
                 "brand_constraints": "pass",
-                "text_contrast": "pass",
-                "cinematic_treatment": "pass",
+            "text_contrast": "pass",
+            "cinematic_treatment": "pass",
+            "subject_scale": "pass",
+            "text_redundancy": "pass",
+            "asset_sharpness": "pass",
+            "kit_fidelity": "pass",
+            "research_copy": "pass",
             },
             "findings": (
                 []
