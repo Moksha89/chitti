@@ -76,6 +76,12 @@ def validate_export_assets(export_root: Path, declared_assets: set[str]) -> None
         if not output.is_file():
             continue
         if output.suffix.lower() not in allowed_extensions:
+            if output.name in {"image_manifest.json", "image_manifest.resolved.json"}:
+                raise SystemExit(
+                    f"poster export contains {output.name} in out/; keep the "
+                    "image manifest at the workspace root "
+                    f"(/workspace/{output.name}), not in out/"
+                )
             raise SystemExit(
                 f"poster export contains a non-publishable file at "
                 f"'{relative}'; remove it from out/ or move working notes to "

@@ -3,6 +3,7 @@ import argparse
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 from pathlib import Path
 
 
@@ -163,6 +164,17 @@ def capture(
         playwright_factory = sync_playwright
     server = _serve_export(workspace)
     try:
+        if artifact is not None:
+            artifact_path = workspace / "out" / artifact
+            if (
+                not artifact
+                or ".." in artifact_path.relative_to(workspace / "out").parts
+                or not artifact_path.is_file()
+            ):
+                raise RuntimeError(
+                    "poster capture requires the declared artifact to exist: "
+                    f"{artifact}"
+                )
         deadline = time.monotonic() + 30
         browser_errors = []
         with playwright_factory() as playwright:
@@ -207,7 +219,29 @@ def capture(
                             f"static export server exited before capture: {output[-2000:]}"
                         )
                     try:
-                        page.goto("http://127.0.0.1:3000", wait_until="domcontentloaded")
+                        target = (
+                            f"/{quote(artifact, safe='/')}"
+                            if artifact is not None
+                            else "/"
+                        )
+                        response = page.goto(
+                            f"http://127.0.0.1:3000{target}",
+                            wait_until="domcontentloaded",
+                        )
+                        if artifact is not None and response is not None:
+                            status = response.status
+                            if status != 200:
+                                browser_errors.append(
+                                    {
+                                        "kind": "poster-artifact",
+                                        "name": name,
+                                        "status": status,
+                                        "message": (
+                                            "declared poster artifact did not render "
+                                            f"successfully: {artifact} returned HTTP {status}"
+                                        ),
+                                    }
+                                )
                         page.wait_for_timeout(2000)
                         body_text = page.locator("body").inner_text()
                         if "Application error:" in body_text:
@@ -271,10 +305,11 @@ if __name__ == "__main__":
     parser.add_argument("--height", type=int)
     parser.add_argument("--scale", type=int, default=1)
     parser.add_argument("--poster", action="store_true")
+    parser.add_argument("--artifact")
     args = parser.parse_args()
     capture(
         width=args.width if args.poster else None,
         height=args.height if args.poster else None,
         scale=args.scale,
-        artifact="poster.png" if args.poster else None,
+        artifact=args.artifact if args.poster else None,
     )

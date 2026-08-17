@@ -294,17 +294,41 @@ def test_repeated_failures_survive_inspection_until_failure_limit() -> None:
 def test_identical_tool_failures_warn_then_stop() -> None:
     from chitti.worker import _identical_tool_failure_detail
 
-    detail, failure, count = _identical_tool_failure_detail(
-        "T1", "run_command", "same failure", None, 0
+    failures: dict[tuple[str, str], int] = {}
+    detail, count = _identical_tool_failure_detail(
+        "T1", "run_command", "same failure", failures
     )
-    assert (detail, failure, count) == ("same failure", ("run_command", "same failure"), 1)
-    detail, failure, count = _identical_tool_failure_detail(
-        "T1", "run_command", "same failure", failure, count
+    assert (detail, failures[("run_command", "same failure")], count) == (
+        "same failure",
+        1,
+        1,
+    )
+    detail, count = _identical_tool_failure_detail(
+        "T1", "run_command", "same failure", failures
     )
     assert "repeating it once more" in detail
-    with pytest.raises(RuntimeError, match="consecutive identical"):
+    with pytest.raises(RuntimeError, match="identical failures"):
         _identical_tool_failure_detail(
-            "T1", "run_command", "same failure", failure, count
+            "T1", "run_command", "same failure", failures
+        )
+
+
+def test_identical_tool_failures_count_across_interleaved_failures() -> None:
+    from chitti.worker import _identical_tool_failure_detail
+
+    failures: dict[tuple[str, str], int] = {}
+    for tool, detail in (
+        ("run_command", "same failure"),
+        ("read_file", "different failure"),
+        ("run_command", "same failure"),
+        ("list_files", "another failure"),
+    ):
+        _, _ = _identical_tool_failure_detail(
+            "T1", tool, detail, failures
+        )
+    with pytest.raises(RuntimeError, match="identical failures"):
+        _identical_tool_failure_detail(
+            "T1", "run_command", "same failure", failures
         )
 
 

@@ -84,6 +84,13 @@ def test_export_notes_name_relative_path_and_artifacts_remedy(tmp_path: Path) ->
         MODULE.validate_export_assets(tmp_path, set())
 
 
+def test_export_manifest_in_out_names_workspace_root_remedy(tmp_path: Path) -> None:
+    output = tmp_path / "image_manifest.json"
+    output.write_text("{}")
+    with pytest.raises(SystemExit, match=r"/workspace/image_manifest.json"):
+        MODULE.validate_export_assets(tmp_path, set())
+
+
 def test_export_raster_refusal_names_manifest_remedy(tmp_path: Path) -> None:
     output = tmp_path / "generated" / "figure.png"
     output.parent.mkdir()

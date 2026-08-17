@@ -660,6 +660,48 @@ if [[ "${live_migration}" != "${expected_migration}" ]]; then
     "expected ${expected_migration}" >&2
   exit 1
 fi
+expected_run_event_statuses="$(
+  docker run --rm --entrypoint python "${runner_image}" -c '
+import json
+from chitti.run_status import RUN_EVENT_STATUSES
+print(json.dumps(sorted(RUN_EVENT_STATUSES), separators=(",", ":")))
+'
+)"
+docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
+  -v "expected_run_event_statuses=${expected_run_event_statuses}" \
+  -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<'SQL' >/dev/null
+CREATE TEMP TABLE expected_run_event_status_values(status text);
+INSERT INTO expected_run_event_status_values(status)
+SELECT value
+FROM json_array_elements_text(:'expected_run_event_statuses'::json);
+DO $$
+DECLARE
+  expected_statuses text;
+  live_statuses text;
+BEGIN
+  SELECT string_agg(status, E'\n' ORDER BY status)
+  INTO expected_statuses
+  FROM expected_run_event_status_values;
+  SELECT string_agg(captures[1], E'\n' ORDER BY captures[1])
+  INTO live_statuses
+  FROM (
+    SELECT regexp_matches(
+      pg_get_constraintdef(oid), '''([^'']+)''', 'g'
+    ) AS captures
+    FROM pg_constraint
+    WHERE conname = 'worker_run_event_status_ck'
+      AND conrelid = 'worker_run_events'::regclass
+  ) AS constraint_statuses;
+  IF live_statuses IS DISTINCT FROM expected_statuses THEN
+    RAISE EXCEPTION
+      'run-event status contract drift: expected %, live %',
+      COALESCE(expected_statuses, '<empty>'),
+      COALESCE(live_statuses, '<empty>');
+  END IF;
+END
+$$;
+SQL
+echo "Run-event status contract full-set proof passed."
 docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 \
   -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<'SQL' >/dev/null
 DO $$

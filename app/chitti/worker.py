@@ -5,6 +5,8 @@ import base64
 import hashlib
 import json
 import logging
+import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -55,6 +57,7 @@ from .provider import (
     ModelToolCall,
     ModelTransportError,
 )
+from .run_status import validate_run_event_status
 from .runner_access import application_only_sql, runner_sql
 from .settings import get_settings
 
@@ -111,14 +114,16 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "evidence_limitations.",
         "observations must be an object with exactly these keys, each a plain-language "
         "description of what the image actually shows: background, imagery, "
-        "imagery_edges, text_blocks, colour_use. imagery_edges must state, for every "
-        "placed photographic or illustrated element, whether its boundary is a visible "
-        "straight edge, panel or rectangle against the surrounding design, and where "
-        "in the frame that edge is. If you cannot see a placed element at all, say so "
-        "there.",
+        "imagery_edges, text_blocks, colour_use. imagery_edges must describe, for "
+        "every placed photographic or illustrated element, only boundaries visibly "
+        "present against the surrounding design. Distinguish a visible seam, halo, "
+        "background rectangle or panel from an intentional crop at the canvas edge; "
+        "do not call a clean subject contour or canvas crop a straight edge. State "
+        "where a real boundary is visible, or explicitly say no visible boundary "
+        "exists.",
         "criteria must contain exactly these keys, each pass or fail: fixture_text, "
         "visual_hierarchy, readability, generated_imagery, composite_integrity, "
-        "brand_constraints.",
+        "brand_constraints, text_contrast, cinematic_treatment.",
         "composite_integrity fails when any placed image reads as a pasted rectangle: "
         "a visible box, panel or seam around it, a background inside it that differs "
         "from the poster background, or a washed-out block where the element sits. "
@@ -127,6 +132,19 @@ VISUAL_REVIEW_INSTRUCTION = "\n\n".join(
         "an edge is deliberate, describe it and fail composite_integrity.",
         "generated_imagery fails when imagery is absent, or so dark, faint or "
         "low-contrast that the poster would read as flat colour without it.",
+        "text_contrast fails when any required text block is low-contrast against "
+        "its immediate background, including a title or team name that becomes "
+        "difficult to read because its colour is too close to the background. "
+        "Judge every text block, not only the smallest text.",
+        "cinematic_treatment fails when the composition is flat or evenly lit and "
+        "lacks visible directional or rim lighting, foreground/background depth "
+        "separation, and atmospheric treatment such as haze, light spill, particles "
+        "or grain. A dark colour wash or gradient alone is not cinematic treatment.",
+        "brand_constraints must judge the likeness policy stated in the poster brief: "
+        "generic figures are the default when the brief is silent; real likenesses "
+        "are permitted only when the brief explicitly permits them. Fabricated board "
+        "logos and fabricated trophy imagery remain prohibited regardless of likeness "
+        "policy.",
         "verdict must be pass or fail, and must be fail if any criterion is fail. "
         "image_sha256 must exactly match the supplied digest. findings must be a list "
         "of objects with criterion, issue and action fields; every failed criterion "
@@ -145,6 +163,31 @@ class VisualState(TypedDict):
     accounted_cost: float
     accounted_tokens: int
     last_failed_digest: str | None
+
+
+def _poster_likeness_policy(brief: str) -> str:
+    normalized = brief.lower()
+    if re.search(
+        r"\b(?:no|without|not)\s+(?:real\s+)?(?:player|players|likeness|faces?|kits?)\b",
+        normalized,
+    ):
+        return (
+            "Likeness policy: generic figures are required; real player likenesses "
+            "are not permitted by this brief."
+        )
+    if re.search(
+        r"\breal\s+(?:players?|likeness(?:es)?|faces?|kits?)\b",
+        normalized,
+    ):
+        return (
+            "Likeness policy: this brief explicitly permits real player likenesses, "
+            "real kits, and real faces. Do not fail brand constraints merely because "
+            "the figures look like real players."
+        )
+    return (
+        "Likeness policy: the brief is silent, so use generic figures and do not "
+        "introduce real player likenesses."
+    )
 
 
 class GateEvidenceContradiction(ModelProgressError):
@@ -221,22 +264,22 @@ def _identical_tool_failure_detail(
     task_id: str,
     tool: str,
     detail: str,
-    last_failure: tuple[str, str] | None,
-    consecutive_failures: int,
-) -> tuple[str, tuple[str, str], int]:
+    failure_counts: dict[tuple[str, str], int],
+) -> tuple[str, int]:
     failure = (tool, detail)
-    count = consecutive_failures + 1 if failure == last_failure else 1
+    count = failure_counts.get(failure, 0) + 1
+    failure_counts[failure] = count
     if count >= IDENTICAL_TOOL_FAILURE_LIMIT:
         raise ModelProgressError(
-            f"task {task_id} stopped after {count} consecutive identical "
+            f"task {task_id} stopped after {count} identical "
             f"failures from {tool}: {detail}"
         )
     if count == IDENTICAL_TOOL_FAILURE_LIMIT - 1:
         detail = (
             f"{detail} This identical failure has occurred {count} "
-            "consecutive times; repeating it once more will end the run."
+            "times in this run; repeating it once more will end the run."
         )
-    return detail, failure, count
+    return detail, count
 
 
 def _remember_progress_ledger(
@@ -918,30 +961,29 @@ class DockerSandboxDispatcher:
                             f"{command} ({'passed' if succeeded else 'failed'})",
                         )
 
-            last_tool_failure: tuple[str, str] | None = None
-            consecutive_tool_failures = 0
+            tool_failure_counts: dict[tuple[str, str], int] = {}
 
             def repeated_tool_failure_detail(
-                tool: str, detail: str, task_id: str = task.id
+                tool: str,
+                detail: str,
+                task_id: str = task.id,
+                failure_counts: dict[tuple[str, str], int] = tool_failure_counts,
             ) -> str:
-                nonlocal last_tool_failure, consecutive_tool_failures
                 (
                     detail,
-                    last_tool_failure,
-                    consecutive_tool_failures,
+                    _count,
                 ) = _identical_tool_failure_detail(
                     task_id,
                     tool,
                     detail,
-                    last_tool_failure,
-                    consecutive_tool_failures,
+                    failure_counts,
                 )
                 return detail
 
-            def reset_tool_failure_streak() -> None:
-                nonlocal last_tool_failure, consecutive_tool_failures
-                last_tool_failure = None
-                consecutive_tool_failures = 0
+            def reset_tool_failure_streak(
+                failure_counts: dict[tuple[str, str], int] = tool_failure_counts,
+            ) -> None:
+                failure_counts.clear()
 
             for iteration in range(1, limits.model_iterations + 1):
                 self._raise_if_cancelled(run_id)
@@ -1123,6 +1165,11 @@ class DockerSandboxDispatcher:
                                     elif tool == "visual_critique":
                                         if result_text.startswith("VISUAL_REVIEW_PASS"):
                                             completed_commands.add("visual-review")
+                                            await self._task_event(
+                                                run_id, task.id, "passed",
+                                                result_text[19:2019],
+                                            )
+                                            done = True
                                         else:
                                             completed_commands.discard("visual-review")
                                     elif tool == "write_file":
@@ -1334,6 +1381,10 @@ class DockerSandboxDispatcher:
                     elif tool == "visual_critique":
                         if result_text.startswith("VISUAL_REVIEW_PASS"):
                             completed_commands.add("visual-review")
+                            await self._task_event(
+                                run_id, task.id, "passed", result_text[19:2019]
+                            )
+                            done = True
                         else:
                             completed_commands.discard("visual-review")
                     elif tool == "write_file":
@@ -1588,9 +1639,14 @@ class DockerSandboxDispatcher:
                     f"--scale {requested['scale']} "
                 )
                 capture_command = (
+                    "test -f \"out/$CHITTI_POSTER_ARTIFACT\" && "
+                    "if [ \"$CHITTI_POSTER_ARTIFACT\" = \"index.html\" ] || "
+                    "grep -F -- \"$CHITTI_POSTER_ARTIFACT\" out/index.html; then "
                     "python3 /opt/next_screenshot.py "
                     + capture_args
-                    + "--poster"
+                    + f"--poster --artifact {shlex.quote(str(requested['artifact']))}; "
+                    "else echo \"poster capture requires out/index.html to reference "
+                    "the declared artifact $CHITTI_POSTER_ARTIFACT\" >&2; exit 1; fi"
                 )
             else:
                 capture_command = "python3 /opt/next_screenshot.py"
@@ -1739,6 +1795,7 @@ class DockerSandboxDispatcher:
             else {}
         )
         profile = json.dumps(profile_fields)
+        likeness_policy = _poster_likeness_policy(brief)
         review_instruction = VISUAL_REVIEW_INSTRUCTION
         messages: list[dict[str, object]] = [
             {"role": "system", "content": review_instruction},
@@ -1752,6 +1809,7 @@ class DockerSandboxDispatcher:
                             f"IMAGE SHA-256: {image_digest}\n"
                             f"IMAGE DIMENSIONS: {width}x{height}\n"
                             f"GENERATED ASSET COUNT: {generated_asset_count}\n"
+                            f"{likeness_policy}\n"
                             "Judge this exact captured PNG against the brief."
                         ),
                     },
@@ -1778,42 +1836,78 @@ class DockerSandboxDispatcher:
                     f"IMAGE BYTE SIZE: {len(image)}\n"
                     f"IMAGE DIMENSIONS: {width}x{height}\n"
                     f"GENERATED ASSET COUNT: {generated_asset_count}\n"
+                    f"{likeness_policy}\n"
                     "The PNG bytes were sent ephemerally and are not stored in this prompt."
                 ),
             },
         ]
         assert self.model_provider is not None
-        visual_state["cycles"] += 1
-        try:
-            completion = await self.model_provider.agent_completion(messages, VISION_ROUTE)
-        except ModelTransportError as exc:
-            raise VisualReviewInconclusive(
-                f"visual critique provider accounting failed: {exc}"
-            ) from exc
-        visual_state["cost"] += completion.cost_usd
-        visual_state["tokens"] += completion.total_tokens
-        if visual_state["cost"] > VISUAL_REVIEW_SPEND_CAP_USD:
-            raise RunBudgetExceeded("visual model spend")
-        if "data:image" in completion.content.lower() or "base64" in completion.content.lower():
-            raise VisualReviewInconclusive(
-                "visual critique response contained image data"
+        compliance_reask = False
+        prompt_messages = persisted_messages
+        while True:
+            try:
+                completion = await self.model_provider.agent_completion(
+                    messages, VISION_ROUTE
+                )
+            except ModelTransportError as exc:
+                raise VisualReviewInconclusive(
+                    f"visual critique provider accounting failed: {exc}"
+                ) from exc
+            visual_state["cost"] += completion.cost_usd
+            visual_state["tokens"] += completion.total_tokens
+            if visual_state["cost"] > VISUAL_REVIEW_SPEND_CAP_USD:
+                raise RunBudgetExceeded("visual model spend")
+            if "data:image" in completion.content.lower() or "base64" in completion.content.lower():
+                raise VisualReviewInconclusive(
+                    "visual critique response contained image data"
+                )
+            await self._record_model_call(
+                run_id,
+                task_id,
+                iteration,
+                VISION_ROUTE,
+                completion,
+                kind="visual_critique",
+                prompt=json.dumps(prompt_messages, separators=(",", ":")),
             )
-        await self._record_model_call(
-            run_id,
-            task_id,
-            iteration,
-            VISION_ROUTE,
-            completion,
-            kind="visual_critique",
-            prompt=json.dumps(persisted_messages, separators=(",", ":")),
-        )
-        try:
-            verdict = json.loads(completion.content)
-        except json.JSONDecodeError as exc:
-            raise VisualReviewInconclusive(
-                f"visual critique returned invalid JSON: {exc}"
-            ) from exc
-        parsed = _parse_visual_verdict(verdict, image_digest)
+            if completion.finish_reason == "length" or any(
+                item == "response_failure_class=output limit"
+                for item in completion.message_fields
+            ):
+                diagnostics = "; ".join(completion.response_diagnostics) or "none retained"
+                raise VisualReviewInconclusive(
+                    "visual critique response exceeded the output limit before a "
+                    "complete JSON verdict; increase concision and return exactly "
+                    "the required rubric fields; diagnostics: "
+                    f"{diagnostics}"
+                )
+            try:
+                verdict = json.loads(completion.content)
+                parsed = _parse_visual_verdict(verdict, image_digest)
+            except json.JSONDecodeError as exc:
+                parse_error = VisualReviewInconclusive(
+                    f"visual critique returned invalid JSON: {exc}"
+                )
+            except VisualReviewInconclusive as exc:
+                parse_error = exc
+            else:
+                break
+            if compliance_reask:
+                raise parse_error
+            compliance_reask = True
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Your previous visual verdict was structurally non-compliant: "
+                        f"{parse_error}. Re-ask: return exactly one compliant JSON "
+                        "object with every required field, every failed criterion "
+                        "paired with a concrete finding, and no markdown."
+                    ),
+                }
+            )
+            prompt_messages = [*persisted_messages, *messages[2:]]
+        visual_state["cycles"] += 1
         if generated_asset_count == 0 and parsed["verdict"] == "pass":
             parsed = {
                 **parsed,
@@ -2801,6 +2895,7 @@ class DockerSandboxDispatcher:
         self, run_id: int, status: str, detail: str,
         operation_index: int | None = None, task_id: str | None = None,
     ) -> None:
+        validate_run_event_status(status)
         async with self.database.sessions() as session:
             await session.execute(
                 runner_sql(text(
@@ -3312,6 +3407,8 @@ def _parse_visual_verdict(value: object, image_digest: str) -> dict[str, object]
         "generated_imagery",
         "composite_integrity",
         "brand_constraints",
+        "text_contrast",
+        "cinematic_treatment",
     )
     if not isinstance(value, dict):
         raise VisualReviewInconclusive("visual critique returned a non-object verdict")
@@ -3615,10 +3712,21 @@ def _model_system_prompt(
             "The owner brand profile is "
             "authoritative and must be reflected exactly; do not invent colours, voice, "
             "audience, or typography. Create the declared artifact under out/. "
+            "Use generic figures by default when the poster brief does not explicitly "
+            "permit real likenesses. If the brief explicitly permits real players, "
+            "real kits, or real faces, follow that owner decision; fabricated board "
+            "logos and fabricated trophies remain prohibited in all cases. "
+            "Treat cinematic treatment as required: use directional or rim lighting, "
+            "visible depth separation between foreground subjects and the background, "
+            "and atmosphere such as haze, light spill, particles, or grain. A flat "
+            "colour wash or gradient is not enough, and every text block must maintain "
+            "clear contrast against its immediate background. "
             f"The coder output ceiling is {CODER_MAX_OUTPUT_TOKENS} tokens; split "
             "large file writes across multiple tool calls rather than emitting one "
-            "enormous tool call. Create an out/index.html entry that renders it "
-            "for the cage capture. Run "
+            "enormous tool call. Create an out/index.html entry that references and "
+            "renders the declared artifact for the cage capture. The capture opens "
+            "the declared artifact itself, not the directory root; if the declared "
+            "artifact or its index entry is missing, capture is refused. Run "
             "poster-export, then capture_screenshot using exactly the approved poster "
             f"artifact {approved['artifact']} at width {approved['width']}, height "
             f"{approved['height']}, and device scale {approved['scale']}. These "
@@ -3631,7 +3739,8 @@ def _model_system_prompt(
             "inspect source facts and dimensions, not visual quality, which still "
             "requires owner approval.\n"
             "Generated imagery is available through the host-only generate-images "
-            "allowlisted operation. First write image_manifest.json with only these "
+            "allowlisted operation. First write /workspace/image_manifest.json "
+            "(the workspace root, never out/) with only these "
             "fields per image: id, purpose, prompt, negative_prompt, width, height, "
             "optional seed, optional denoise, and optional reference to an existing "
             "generated asset; then run generate-images. The host owns the ComfyUI "
@@ -3811,20 +3920,27 @@ def fixed_operations(
                 (
                     "sh",
                     "-c",
-                    "test -f \"$CHITTI_POSTER_ARTIFACT\"",
+                    "test -f \"out/$CHITTI_POSTER_ARTIFACT\"",
                 ),
             ),
-            FixedOperation(
-                first.id,
-                "browser-preview",
-                (
-                    "sh",
-                    "-c",
-                    "python3 /opt/next_screenshot.py "
-                    f"--width {config['width']} --height {config['height']} "
-                    f"--scale {config['scale']} --poster",
+                FixedOperation(
+                    first.id,
+                    "browser-preview",
+                    (
+                        "sh",
+                        "-c",
+                        "test -f \"out/$CHITTI_POSTER_ARTIFACT\" && "
+                        "if [ \"$CHITTI_POSTER_ARTIFACT\" = \"index.html\" ] || "
+                        "grep -F -- \"$CHITTI_POSTER_ARTIFACT\" out/index.html; then "
+                        "python3 /opt/next_screenshot.py "
+                        f"--width {config['width']} --height {config['height']} "
+                        f"--scale {config['scale']} --poster "
+                        f"--artifact {shlex.quote(str(config['artifact']))}; "
+                        "else echo \"poster capture requires out/index.html to "
+                        "reference the declared artifact $CHITTI_POSTER_ARTIFACT\" "
+                        ">&2; exit 1; fi",
+                    ),
                 ),
-            ),
             FixedOperation(
                 first.id,
                 "git-diff",
