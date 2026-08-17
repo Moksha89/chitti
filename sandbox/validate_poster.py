@@ -4,6 +4,23 @@ import re
 from pathlib import Path
 
 
+def _contains_declared_value(source: str, value: str) -> bool:
+    if value.casefold() in source.casefold():
+        return True
+    tokens = [token for token in re.split(r"[^A-Za-z0-9]+", value) if token]
+    if not tokens:
+        return False
+    pattern = r"[^A-Za-z0-9]+".join(re.escape(token) for token in tokens)
+    return re.search(pattern, source, flags=re.IGNORECASE) is not None
+
+
+def _first_line_containing(source: str, value: str) -> int | None:
+    for number, line in enumerate(source.splitlines(), start=1):
+        if _contains_declared_value(line, value):
+            return number
+    return None
+
+
 def validate_poster_source(
     source: str,
     available: set[str],
@@ -72,14 +89,18 @@ def validate_poster_source(
                     f"poster source uses a font outside the offline manifest: {family}"
                 )
     for color in colors:
-        if color.casefold() not in source.casefold():
+        if not _contains_declared_value(source, color):
             declared = ", ".join(colors)
             raise SystemExit(
                 "poster source omits declared brand colour: "
-                f"{color} (declared colours: {declared})"
+                f"{color} (declared colours: {declared}); add it to a visible "
+                "style or a CSS variable used by the poster"
             )
-    if font and font.casefold() not in source.casefold():
-        raise SystemExit(f"poster source omits declared sandbox font: {font}")
+    if font and not _contains_declared_value(source, font):
+        raise SystemExit(
+            f"poster source omits declared sandbox font: {font}; add "
+            f"`font-family: {font}` to the poster stylesheet"
+        )
 
 
 def validate_export_assets(export_root: Path, declared_assets: set[str]) -> None:
@@ -131,8 +152,8 @@ def main() -> None:
                 for item in resolved.get("images", [])
                 if isinstance(item, dict) and isinstance(item.get("path"), str)
             }
-        except (OSError, json.JSONDecodeError, KeyError, TypeError):
-            raise SystemExit("poster resolved image manifest is invalid")
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise SystemExit("poster resolved image manifest is invalid") from exc
     validate_export_assets(Path("/workspace/out"), declared_assets)
     source = path.read_text(encoding="utf-8", errors="replace")
     available = {
